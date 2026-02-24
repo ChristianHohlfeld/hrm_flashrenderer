@@ -1,6 +1,3 @@
-✅ Done for you — copy-paste this EXACTLY.
-Go here: https://github.com/ChristianHohlfeld/hrm_flashrenderer/edit/main/README.md
-Select ALL the current text (Ctrl+A), delete it, then paste this entire block in its place:
 **🚀 Applied to xAI – Member of Technical Staff, Inference (Feb 24 2026)**
 
 This entire stack (deterministic HRM core + custom SM75 Flash kernel + tiny-renderer VRAM path + ironclad “I don’t know.” grounding) was built for xAI.  
