@@ -8,33 +8,37 @@
 
 ## What This Is
 
-HRM FlashRenderer is a retrieval-augmented generation (RAG) stack built for VRAM-constrained environments. It runs large knowledge bases through a deterministic integer-only retrieval engine and feeds a tightly bounded context into a small local renderer — with zero stochastic elements and no dense matrix multiplication in the retrieval core.
+HRM FlashRenderer is a retrieval-augmented generation (RAG) stack built for VRAM-constrained environments. The retrieval core is fully deterministic and integer-only. A tightly bounded context is passed to a small local renderer — keeping VRAM usage minimal and outputs reproducible.
 
-The result: identical inputs always produce identical outputs, on any machine, without a GPU.
+**Scope of "MatMul-free" and "deterministic":**
+
+> The **HDR/HRM retrieval and routing core** (`hrm_core/`) contains no dense matrix multiplication and no floating-point arithmetic. All operations are bounded integer arithmetic.
+>
+> The **renderer** (LLM inference stage) may use standard matrix operations internally. Determinism of the renderer output is guaranteed only under the CPU path with greedy decoding and a fixed seed; GPU inference may vary across hardware and driver versions.
+
+Formal proofs of retrieval determinism, candidate completeness, and MMR correctness are in [`main.pdf`](main.pdf).
 
 ---
 
-## Core Architecture
+## Core Pipeline
 
 ```
 Query
   ↓
-FNV-1a-64 Signature   (2048 quantised bins, 4-bit, word-trigrams + char-5grams)
+FNV-1a-64 Signature        word-trigrams + char-5grams → 2048 quantised bins (4-bit, 16 levels)
   ↓
-Level-Weighted Router Index   (inverted posting scan, integer scores)
+Level-Weighted Router       inverted posting scan, integer scores, deterministic tie-break
   ↓
-Candidate Fetch   (SQLite snippet store)
+Candidate Fetch             SQLite snippet store
   ↓
-Quantised Overlap Scoring   (min-sum over packed 4-bit bins)
+Quantised Overlap Scoring   min-sum over packed 4-bit bins (integer)
   ↓
-Integer MMR Selection   (λ_num=7, λ_den=10, lexicographic tie-break)
+Integer MMR Selection       λ_num=7 / λ_den=10, lexicographic tie-break
   ↓
-Deterministic Prompt Budget   (binary search on token counts)
+Deterministic Prompt Budget binary search on token counts
   ↓
-Local LLM Renderer   (greedy decoding, 0 VRAM default)
+Local LLM Renderer          greedy decoding; CPU path = 0 VRAM, GPU path optional
 ```
-
-Formal proofs of determinism, candidate completeness, and MMR correctness are in [`main.pdf`](main.pdf).
 
 ---
 
@@ -55,7 +59,6 @@ Formal proofs of determinism, candidate completeness, and MMR correctness are in
 ## Quickstart
 
 ```bash
-# Install
 git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
 cd hrm_flashrenderer
 pip install -r requirements.prod.txt
@@ -74,7 +77,7 @@ hrm-flash generate \
   --max_new_tokens 512
 ```
 
-## Operation Modes
+## Other Operation Modes
 
 **Persistent daemon** (warm model, low latency):
 ```bash
@@ -95,10 +98,24 @@ curl -s http://127.0.0.1:8080/v1/generate -H 'Content-Type: application/json' \
 | Flag | Description |
 |---|---|
 | `--top_k` / `--top_m` / `--k` | Router → candidates → MMR final snippets |
-| `--max_sources` / `--max_chars_per_source` | Source budget |
+| `--max_sources` / `--max_chars_per_source` | Source budget per prompt |
 | `--max_seq_len` / `--reserve_prompt_tokens` | Token budget |
 | `--world` | Tensor-parallel world size (1 / 2 / 3 / 4) |
 | `--local_files_only` | Disable model downloads |
+
+---
+
+## Determinism Scope
+
+| Component | Determinism |
+|---|---|
+| Signature (FNV-1a-64, n-grams) | ✅ Hard — identical output on any conforming platform |
+| Router index (level-weighted scan) | ✅ Hard — integer scores, tie-break by `cid` |
+| Overlap scoring (min-sum, 4-bit) | ✅ Hard — purely integer |
+| MMR selection | ✅ Hard — integer objective, tie-break by `sid` |
+| Prompt budget (binary search) | ✅ Hard — deterministic under fixed tokeniser |
+| Renderer — CPU path (greedy, fixed seed) | ✅ Strong — bit-identical under same model weights |
+| Renderer — GPU path (TP, CUDA) | ⚠️ Best-effort — may vary across hardware/drivers |
 
 ---
 
@@ -115,18 +132,23 @@ curl -s http://127.0.0.1:8080/v1/generate -H 'Content-Type: application/json' \
 
 ## Further Reading
 
-- `docs/INTEGRATION.md` — HTTP, daemon, and embedded HRM integration
-- `hrm_core/README.md` — C++ retrieval core documentation
-- `STACK.md` — Architecture overview
 - [`main.pdf`](main.pdf) — Formal paper with proofs
+- [`THIRD_PARTY.md`](THIRD_PARTY.md) — Third-party component licenses
+- [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — HTTP, daemon, and embedded HRM guide
+- [`hrm_core/README.md`](hrm_core/README.md) — C++ retrieval core documentation
+- [`STACK.md`](STACK.md) — Architecture overview
 
 ---
 
 ## License & Rights
 
 © 2026 Christian Heinrich Hohlfeld. All rights reserved.
-No permission is granted to use, copy, modify, or redistribute this work without prior written consent.
-See [`LICENSE`](LICENSE), [`COPYRIGHT.md`](COPYRIGHT.md), and [`NOTICE`](NOTICE).
+
+The original source code authored by Christian Heinrich Hohlfeld (retrieval core, orchestration, documentation) is proprietary. No permission is granted to use, copy, modify, or redistribute without prior written consent.
+
+Third-party components (PyTorch, Transformers, FastAPI, CUDA, etc.) retain their respective licenses — see [`THIRD_PARTY.md`](THIRD_PARTY.md).
+
+See also: [`LICENSE`](LICENSE) · [`COPYRIGHT.md`](COPYRIGHT.md) · [`NOTICE`](NOTICE)
 
 ---
 
