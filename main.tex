@@ -7,6 +7,7 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage[hidelinks]{hyperref}
+\usepackage{booktabs}
 
 \title{HDR/HRM and Resonant Sparse Attention:\\
 Deterministic Integer Signatures, Resonance Retrieval, and MatMul-Free Sequence Modeling}
@@ -50,26 +51,66 @@ Licensing inquiries: \href{https://christianhohlfeld.com}{christianhohlfeld.com}
 \noindent\rule{\linewidth}{0.4pt}
 
 \begin{abstract}
-We formalize an end-to-end deterministic pipeline built from bounded integer primitives:
-(1) the \emph{Hohlfeld Data Representation} (HDR) method, which encodes ordered datasets via residual vectors
-parameterized by amplitude and phase, with exact reconstruction and uniqueness guarantees;
-(2) an inverted-index \emph{resonance retrieval} scheme (HRM) that enumerates candidates and ranks them
-by deterministic resonance scores with explicit tie-breaking; and
-(3) \emph{Resonant Sparse Attention}, a MatMul-free, float-free, stochastic-free sequence-modeling core that
-replaces dot-product attention and dense linear layers with sparse associative operations on discrete HDR-derived keys
-(bitset intersections and inverted-index overlap).
-We prove end-to-end determinism under fixed preprocessing and tie-breaking, candidate completeness for retrieval,
-and that the proposed training and inference procedures require no dense matrix multiplication.
+We formalize an end-to-end system designed primarily as a \emph{VRAM-reduction layer} for large language models:
+by strictly bounding and intelligently selecting context via deterministic integer-only retrieval,
+it enables running large models at very low VRAM, on commodity and older hardware.
+We call the retrieval component \emph{Hohlfeld Resonance Model} (HRM), grounded in the
+\emph{Hohlfeld Data Representation} (HDR) method.
+The full pipeline consists of:
+(1) HDR-derived integer signatures and resonance retrieval (HRM);
+(2) integer Maximal Marginal Relevance (MMR) selection;
+(3) deterministic prompt budgeting; and
+(4) a local renderer (with optional custom FlashAttention kernel).
+Full determinism of the retrieval core is a strong additional property with formal proofs
+(end-to-end determinism, candidate completeness, MMR correctness).
+Resonant Sparse Attention, a MatMul-free transformer-style extension, is also proposed.
 \end{abstract}
+
+\section{Motivation and Positioning}
+
+Large language model inference imposes two primary VRAM demands:
+(i) static model weights, and (ii) the key-value cache that grows with context length.
+Standard retrieval-augmented generation (RAG) systems typically address (ii) at most,
+and introduce non-determinism through probabilistic vector similarity search.
+
+\textbf{HRM FlashRenderer} addresses \emph{both} VRAM demands by a different mechanism:
+the retrieval core (HRM) strictly bounds the context delivered to the renderer
+using deterministic integer arithmetic, so the renderer itself can be a small,
+CPU-mapped model requiring zero VRAM by default.
+
+\begin{table}[htb]
+\centering
+\caption{Comparison of VRAM-reduction techniques for large language models.}
+\label{tab:comparison}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{3.2cm}p{2.4cm}p{1.6cm}p{2.8cm}p{1.8cm}@{}}
+\toprule
+\textbf{Approach} & \textbf{Primary Goal} & \textbf{VRAM Reduction} & \textbf{Method} & \textbf{Determinism} \\
+\midrule
+\textbf{HRM FlashRenderer (Ours)} & VRAM-low big model inference & Very High & Context bounding + small renderer & High (Bonus) \\
+4-bit/8-bit Quantization & VRAM reduction & High & Weight compression & None \\
+Layer/CPU Offloading & VRAM reduction & High & Partial model on CPU & None \\
+RAG (standard) & Context reduction & Medium & Vector search + chunking & Low \\
+Context Compression & Context reduction & Medium & Token compression & Low \\
+Speculative Decoding & Speed & Low & Draft model & None \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Unlike traditional RAG, HRM FlashRenderer is not merely a retrieval system.
+It is a thin efficiency layer that enables running large models at very low VRAM
+by strictly bounding and intelligently selecting context.
+Full retrieval determinism is a strong additional property of the system, not its sole purpose.
 
 \section{Scope and Non-Negotiable Design Goals}
 This work targets reproducible, machine-checkable behavior.
 The design goals are:
 
 \begin{itemize}
-  \item \textbf{Superdeterminism:} identical inputs yield identical outputs across runs and platforms, under a fixed system version.
-  \item \textbf{Integer-only arithmetic:} bounded integers; no floating point; no stochastic sampling; no probabilistic scoring.
-  \item \textbf{MatMul elimination:} training and inference avoid dense matrix multiplication.
+  \item \textbf{VRAM efficiency:} large models run locally with minimal GPU memory via strict context bounding.
+  \item \textbf{Superdeterminism (retrieval core):} identical inputs yield identical retrieval outputs across runs and platforms.
+  \item \textbf{Integer-only retrieval:} bounded integers; no floating point; no stochastic sampling in the core.
+  \item \textbf{MatMul elimination (retrieval core):} the HRM retrieval avoids dense matrix multiplication entirely.
 \end{itemize}
 
 \begin{remark}
