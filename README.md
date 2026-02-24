@@ -4,6 +4,9 @@
 > Publicly viewable, but no permission is granted to use, copy, modify, or redistribute.
 > Licensing: [christianhohlfeld.com](https://christianhohlfeld.com) · ORCID: [0009-0003-6634-9045](https://orcid.org/0009-0003-6634-9045)
 
+📄 **[Read the Paper → main.pdf](main.pdf)**
+*HDR/HRM and Resonant Sparse Attention: Deterministic Integer Signatures, Resonance Retrieval, and MatMul-Free Sequence Modeling*
+
 ---
 
 ## Original Invention by Christian Heinrich Hohlfeld
@@ -183,11 +186,28 @@ See `main.pdf` for full formal proofs.
 
 ## Legal
 
-All source code, methods, algorithms, and documentation in this repository are the sole intellectual property of **Christian Heinrich Hohlfeld** (Konstanz, Germany).
-See `LICENSE` · `COPYRIGHT.md` · `NOTICE` for full rights details.
+All source code, methods, algorithms, and documentation in this repository are the **sole intellectual property of Christian Heinrich Hohlfeld** (Konstanz, Germany).
+
+**All rights reserved. No license is granted** to use, copy, modify, merge, publish, distribute, sublicense, or sell this work — in whole or in part — without prior explicit written permission from the author.
+
+Any use, reproduction, or distribution must clearly credit the inventor by name. No patent rights or licenses are granted by this notice. For licensing inquiries, contact the author directly.
+
+See `LICENSE` · `COPYRIGHT.md` · `NOTICE` for full terms.
 Third-party dependencies retain their respective licenses.
 
 ---
 
 *This entire system and the underlying architecture are an original invention by Christian Heinrich Hohlfeld.*
 *— Christian Heinrich Hohlfeld, February 2026*
+
+---
+
+**Author**
+
+**Christian Heinrich Hohlfeld**, B.Sc.
+Independent Researcher & Senior Software Engineer
+Konstanz, Germany
+
+🌐 [christianhohlfeld.com](https://christianhohlfeld.com)
+🔬 ORCID: [0009-0003-6634-9045](https://orcid.org/0009-0003-6634-9045)
+💼 [linkedin.com/in/christian-hohlfeld](https://www.linkedin.com/in/christian-hohlfeld/)
