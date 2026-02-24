@@ -1,0 +1,9 @@
+# Core
+torch
+transformers
+safetensors
+
+# Server
+fastapi
+uvicorn
+pydantic

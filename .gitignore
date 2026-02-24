@@ -1,0 +1,10 @@
+# build artifacts
+hrm_core/build/
+model/
+payloads.jsonl
+*.sqlite
+*.bin
+*.jsonl
+*.log
+__pycache__/
+*.pyc
