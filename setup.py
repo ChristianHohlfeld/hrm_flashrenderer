@@ -4,6 +4,9 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 setup(
     name="hrm_flashrenderer",
     version="5.1.0",
+    author="Christian Heinrich Hohlfeld",
+    author_email="contact@christianhohlfeld.com",
+    license="Proprietary",
     packages=find_packages(),
     ext_modules=[
         CUDAExtension(
