@@ -39,7 +39,7 @@ Llama-3.1-8B-Instruct
 --world 2
 --prompt "Your question"
 
-#Disclaimer
+# Disclaimer
 I’m Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
 Full honesty: I’m not a traditional CUDA kernel veteran or ninja.
 What I do really well is guide AI precisely towards my goals — and turn ideas into clean, working, performant code very fast.
