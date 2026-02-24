@@ -9,10 +9,13 @@ This repo contains:
 - `hrm_core/` (C++17): deterministic retrieval core (0 RNG, 0 floats, 0 matrices)
   - builds `router_index.bin` + `index.sqlite`
   - supports one-shot JSON query (`hrm query --prompt "..." --format json`)
-- `renderer/hrm_render.py`: deterministic HRM->LLM pipeline
+- `renderer/hrm_render.py`: deterministic HRM→LLM pipeline
   - uses HRM for routing + MMR selection
   - feeds top snippets into a small local GGUF model (llama.cpp)
   - validates strict JSON + exact quotes; deterministic fallback if invalid
+- `engine/` + `hrm_flash/flash_daemon.py`: persistent TP renderer
+  - GPU path: custom FlashAttention kernel (SM75), CUDA required, world 1/2/3/4
+  - **CPU path**: `--device cpu --world 1` — uses PyTorch fallback attention, no CUDA install needed
 
 ## Build HRM core
 ```bash
@@ -50,3 +53,20 @@ This stack changes the problem:
 Determinism:
 - HRM retrieval is deterministic.
 - Renderer is configured to greedy decoding (temperature=0, top_k=1). CPU-only + fixed seed gives strongest stability.
+
+## CPU-Only Mode
+
+Pass `--device cpu` to any command that uses the TP renderer. No CUDA installation needed.
+
+```bash
+# TP daemon, CPU, world=1 (single process)
+hrm-flash daemon --model /path/to/hf-model --world 1 --device cpu --port 5555
+
+# Direct generate on CPU
+hrm-flash generate --hrm_model ./model --llm_model /path/to/hf-model \
+  --world 1 --device cpu --prompt "..." --max_new_tokens 64
+```
+
+- `pip install -e .` works without NVCC — the CUDA extension is skipped; PyTorch fallback is used automatically.
+- CPU inference is significantly slower than GPU; tune `--max_new_tokens` accordingly.
+- For 0-VRAM operation, prefer the **llama.cpp path** (`renderer/hrm_render.py` with a small GGUF model), which uses no PyTorch at all.

@@ -7,7 +7,7 @@ import torch.distributed as dist
 from .dist_utils import all_reduce_sum
 
 class VocabParallelEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, hidden_size: int):
+    def __init__(self, vocab_size: int, hidden_size: int, device: str = 'cuda'):
         super().__init__()
         world = dist.get_world_size()
         rank = dist.get_rank()
@@ -19,12 +19,12 @@ class VocabParallelEmbedding(nn.Module):
         self.vocab_per_rank = vocab_size // world
         self.vocab_start = rank * self.vocab_per_rank
         self.vocab_end = self.vocab_start + self.vocab_per_rank
-        self.weight = nn.Parameter(torch.empty(self.vocab_per_rank, hidden_size, device='cuda', dtype=torch.float16))
+        self.weight = nn.Parameter(torch.empty(self.vocab_per_rank, hidden_size, device=device, dtype=torch.float16))
         nn.init.normal_(self.weight, std=0.02)
 
     @torch.no_grad()
     def load_from_full(self, full_weight: torch.Tensor):
-        self.weight.copy_(full_weight[self.vocab_start:self.vocab_end].to(device='cuda', dtype=torch.float16))
+        self.weight.copy_(full_weight[self.vocab_start:self.vocab_end].to(device=self.weight.device, dtype=torch.float16))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         ids = input_ids
@@ -36,7 +36,7 @@ class VocabParallelEmbedding(nn.Module):
         return emb
 
 class VocabParallelLMHead(nn.Module):
-    def __init__(self, hidden_size: int, vocab_size: int):
+    def __init__(self, hidden_size: int, vocab_size: int, device: str = 'cuda'):
         super().__init__()
         world = dist.get_world_size()
         rank = dist.get_rank()
@@ -46,12 +46,12 @@ class VocabParallelLMHead(nn.Module):
         self.vocab_per_rank = vocab_size // world
         self.vocab_start = rank * self.vocab_per_rank
         self.vocab_end = self.vocab_start + self.vocab_per_rank
-        self.weight = nn.Parameter(torch.empty(self.vocab_per_rank, hidden_size, device='cuda', dtype=torch.float16))
+        self.weight = nn.Parameter(torch.empty(self.vocab_per_rank, hidden_size, device=device, dtype=torch.float16))
         nn.init.normal_(self.weight, std=0.02)
 
     @torch.no_grad()
     def load_from_full(self, full_weight: torch.Tensor):
-        self.weight.copy_(full_weight[self.vocab_start:self.vocab_end].to(device='cuda', dtype=torch.float16))
+        self.weight.copy_(full_weight[self.vocab_start:self.vocab_end].to(device=self.weight.device, dtype=torch.float16))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x.matmul(self.weight.t())

@@ -30,6 +30,7 @@ class DaemonConfig:
     host: str
     port: int
     authkey: bytes
+    device: str = 'cuda'
 
 
 def _pick_free_port() -> int:
@@ -61,14 +62,15 @@ def _broadcast_tensor(x: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 def _worker(rank: int, cfg: DaemonConfig, master_addr: str, master_port: int):
-    init_dist(rank, cfg.world, master_addr, master_port, local_rank=rank)
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    backend = 'gloo' if cfg.device == 'cpu' else None
+    init_dist(rank, cfg.world, master_addr, master_port, local_rank=rank, backend=backend)
+    device = torch.device(cfg.device) if cfg.device == 'cpu' else torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
 
     # Load tokenizer/config/model once per rank
     config = AutoConfig.from_pretrained(cfg.model_dir, local_files_only=cfg.local_files_only)
     validate_tp_world(config, int(cfg.world))
 
-    model = TPLlamaForCausalLM(config, max_seq_len=int(cfg.max_seq_len)).cuda().eval()
+    model = TPLlamaForCausalLM(config, max_seq_len=int(cfg.max_seq_len), device=cfg.device).to(device).eval()
     loader = WeightLoader(cfg.model_dir)
     model.load_from_loader(loader)
     loader.close()
@@ -187,13 +189,15 @@ def _worker(rank: int, cfg: DaemonConfig, master_addr: str, master_port: int):
 def main():
     ap = argparse.ArgumentParser(prog="hrm-flashd", description="Persistent FlashAttention TP daemon (loads model once).")
     ap.add_argument("--model", required=True, help="Local HF safetensors model dir")
-    ap.add_argument("--world", type=int, choices=[2, 3, 4], required=True)
+    ap.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
     ap.add_argument("--max_seq_len", type=int, default=8192)
     ap.add_argument("--prefill_chunk_size", type=int, default=1024)
     ap.add_argument("--local_files_only", action="store_true")
     ap.add_argument("--host", type=str, default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--authkey", type=str, default="hrmflash")
+    ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                    help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
     args = ap.parse_args()
 
     port = int(args.port) if int(args.port) != 0 else _pick_free_port()
@@ -207,6 +211,7 @@ def main():
         host=str(args.host),
         port=port,
         authkey=str(args.authkey).encode("utf-8"),
+        device=str(args.device),
     )
 
     master_port = _pick_free_port()

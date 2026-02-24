@@ -1,0 +1,6 @@
+[console_scripts]
+flash-append-test = flash_tests.test_append_fast:main
+flash-kernel-test = flash_tests.test_kernel:main
+hrm-flash = hrm_flash.cli:main
+hrm-flash-serve = hrm_flash.serve:main
+hrm-flashd = hrm_flash.flash_daemon:main

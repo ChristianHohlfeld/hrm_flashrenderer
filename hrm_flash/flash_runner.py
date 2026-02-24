@@ -18,6 +18,7 @@ def run_flash_generate(
     max_seq_len: int,
     prefill_chunk_size: int,
     local_files_only: bool,
+    device: str = "cuda",
 ) -> int:
     cmd = [
         sys.executable,
@@ -37,6 +38,7 @@ def run_flash_generate(
         cmd.append("--local_files_only")
     if world is not None:
         cmd += ["--world", str(int(world))]
+    cmd += ["--device", device]
 
     env = os.environ.copy()
     # If running from a repo checkout (not installed), ensure repo root on PYTHONPATH.

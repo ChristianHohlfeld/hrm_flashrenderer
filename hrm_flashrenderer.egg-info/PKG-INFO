@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: hrm_flashrenderer
+Version: 5.1.0
+Author: Christian Heinrich Hohlfeld
+Author-email: contact@christianhohlfeld.com
+License: Proprietary
+License-File: LICENSE
+License-File: NOTICE
+Dynamic: author
+Dynamic: author-email
+Dynamic: license
+Dynamic: license-file

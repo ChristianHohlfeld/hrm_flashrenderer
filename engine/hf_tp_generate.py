@@ -24,7 +24,9 @@ def _pick_free_port() -> int:
 
 
 def _worker_spawn(rank: int, world: int, master_addr: str, master_port: int, args_dict: dict):
-    init_dist(rank, world, master_addr, master_port, local_rank=rank)
+    # pass backend based on device
+    backend = 'gloo' if args_dict.get('device', 'cuda') == 'cpu' else None
+    init_dist(rank, world, master_addr, master_port, local_rank=rank, backend=backend)
     _run_generate(rank, args_dict)
     dist.destroy_process_group()
 
@@ -42,7 +44,8 @@ def _read_prompt(args: dict) -> str:
 
 
 def _run_generate(rank: int, args: dict):
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    device_str = args.get("device", "cuda")
+    device = torch.device(device_str) if device_str == "cpu" else torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
 
     if rank == 0:
         prompt = _read_prompt(args)
@@ -83,7 +86,7 @@ def _run_generate(rank: int, args: dict):
     eos_id = eos_val if eos_val >= 0 else None
 
     config = AutoConfig.from_pretrained(args["model"], local_files_only=bool(args.get("local_files_only", False)))
-    model = TPLlamaForCausalLM(config, max_seq_len=int(args["max_seq_len"])).cuda().eval()
+    model = TPLlamaForCausalLM(config, max_seq_len=int(args["max_seq_len"]), device=device_str).to(device).eval()
 
     loader = WeightLoader(args["model"])
     model.load_from_loader(loader)
@@ -115,7 +118,9 @@ def main():
     ap.add_argument("--max_seq_len", type=int, default=8192)
     ap.add_argument("--prefill_chunk_size", type=int, default=1024)
     ap.add_argument("--local_files_only", action="store_true")
-    ap.add_argument("--world", type=int, choices=[2, 3, 4], default=None, help="If set, spawn processes (no torchrun).")
+    ap.add_argument("--world", type=int, choices=[1, 2, 3, 4], default=None, help="If set, spawn processes (no torchrun).")
+    ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                    help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
 
     args = ap.parse_args()
 
@@ -126,9 +131,12 @@ def main():
         return
 
     port = _pick_free_port()
-    mp.spawn(_worker_spawn, args=(args.world, "127.0.0.1", port, vars(args)), nprocs=args.world, join=True)
+    world = args.world
+    if world is None:
+        world = 1  # CPU fallback
+    backend = 'gloo' if args.device == 'cpu' else None
+    mp.spawn(_worker_spawn, args=(world, "127.0.0.1", port, vars(args)), nprocs=world, join=True)
 
 
 if __name__ == "__main__":
     main()
-

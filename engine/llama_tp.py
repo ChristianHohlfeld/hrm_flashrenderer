@@ -110,7 +110,7 @@ class PagedKVCache:
 class TPLlamaAttention(nn.Module):
     """Llama-style attention with TP and TRUE paged KV."""
 
-    def __init__(self, hidden: int, num_heads: int, num_kv_heads: int, head_dim: int):
+    def __init__(self, hidden: int, num_heads: int, num_kv_heads: int, head_dim: int, device: str = 'cuda'):
         super().__init__()
         self.hidden = int(hidden)
         self.num_heads = int(num_heads)
@@ -124,27 +124,27 @@ class TPLlamaAttention(nn.Module):
         self.world = world
         self.local_heads = self.num_heads // world
 
-        self.q_proj = ColumnParallelLinear(self.hidden, self.num_heads * self.head_dim, bias=False)
+        self.q_proj = ColumnParallelLinear(self.hidden, self.num_heads * self.head_dim, bias=False, device=device)
 
         # KV sharding: replicate if num_kv_heads not divisible by world
         if (self.num_kv_heads % world) == 0:
             self.kv_replicated = False
             self.local_kv_heads = self.num_kv_heads // world
-            self.k_proj = ColumnParallelLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False)
-            self.v_proj = ColumnParallelLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False)
+            self.k_proj = ColumnParallelLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False, device=device)
+            self.v_proj = ColumnParallelLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False, device=device)
             self.kv_head_offset = rank * self.local_kv_heads
         else:
             self.kv_replicated = True
             self.local_kv_heads = self.num_kv_heads
-            self.k_proj = ReplicatedLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False)
-            self.v_proj = ReplicatedLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False)
+            self.k_proj = ReplicatedLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False, device=device)
+            self.v_proj = ReplicatedLinear(self.hidden, self.num_kv_heads * self.head_dim, bias=False, device=device)
             self.kv_head_offset = 0
 
-        self.o_proj = RowParallelLinear(self.num_heads * self.head_dim, self.hidden, bias=False)
+        self.o_proj = RowParallelLinear(self.num_heads * self.head_dim, self.hidden, bias=False, device=device)
 
         # head_map: local query heads -> local kv heads
         rep_global = self.num_heads // self.num_kv_heads
-        hm = torch.empty((self.local_heads,), device="cuda", dtype=torch.int32)
+        hm = torch.empty((self.local_heads,), device=device, dtype=torch.int32)
         for hq in range(self.local_heads):
             gqh = rank * self.local_heads + hq
             gkh = gqh // rep_global
@@ -204,11 +204,11 @@ class TPLlamaAttention(nn.Module):
 
 
 class TPLlamaMLP(nn.Module):
-    def __init__(self, hidden: int, intermediate: int):
+    def __init__(self, hidden: int, intermediate: int, device: str = 'cuda'):
         super().__init__()
-        self.gate = ColumnParallelLinear(hidden, intermediate, bias=False)
-        self.up = ColumnParallelLinear(hidden, intermediate, bias=False)
-        self.down = RowParallelLinear(intermediate, hidden, bias=False)
+        self.gate = ColumnParallelLinear(hidden, intermediate, bias=False, device=device)
+        self.up = ColumnParallelLinear(hidden, intermediate, bias=False, device=device)
+        self.down = RowParallelLinear(intermediate, hidden, bias=False, device=device)
 
     @torch.no_grad()
     def load_from_loader(self, loader, prefix: str):
@@ -221,12 +221,12 @@ class TPLlamaMLP(nn.Module):
 
 
 class TPLlamaBlock(nn.Module):
-    def __init__(self, hidden: int, num_heads: int, num_kv_heads: int, head_dim: int, intermediate: int, eps: float):
+    def __init__(self, hidden: int, num_heads: int, num_kv_heads: int, head_dim: int, intermediate: int, eps: float, device: str = 'cuda'):
         super().__init__()
-        self.n1 = RMSNorm(hidden, eps)
-        self.attn = TPLlamaAttention(hidden, num_heads, num_kv_heads, head_dim)
-        self.n2 = RMSNorm(hidden, eps)
-        self.mlp = TPLlamaMLP(hidden, intermediate)
+        self.n1 = RMSNorm(hidden, eps, device=device)
+        self.attn = TPLlamaAttention(hidden, num_heads, num_kv_heads, head_dim, device=device)
+        self.n2 = RMSNorm(hidden, eps, device=device)
+        self.mlp = TPLlamaMLP(hidden, intermediate, device=device)
 
     @torch.no_grad()
     def load_from_loader(self, loader, prefix: str):
@@ -242,9 +242,10 @@ class TPLlamaBlock(nn.Module):
 
 
 class TPLlamaForCausalLM(nn.Module):
-    def __init__(self, config, max_seq_len: int):
+    def __init__(self, config, max_seq_len: int, device: str = 'cuda'):
         super().__init__()
         self.config = config
+        self.device_str = device
         self.vocab_size = int(config.vocab_size)
         self.hidden = int(config.hidden_size)
         self.num_heads = int(config.num_attention_heads)
@@ -256,15 +257,15 @@ class TPLlamaForCausalLM(nn.Module):
         self.rope_theta = float(getattr(config, "rope_theta", 10000.0))
         self.max_seq_len = int(max_seq_len)
 
-        self.embed = VocabParallelEmbedding(self.vocab_size, self.hidden)
+        self.embed = VocabParallelEmbedding(self.vocab_size, self.hidden, device=device)
         self.blocks = nn.ModuleList([
-            TPLlamaBlock(self.hidden, self.num_heads, self.num_kv_heads, self.head_dim, self.intermediate, self.eps)
+            TPLlamaBlock(self.hidden, self.num_heads, self.num_kv_heads, self.head_dim, self.intermediate, self.eps, device=device)
             for _ in range(self.layers)
         ])
-        self.norm = RMSNorm(self.hidden, self.eps)
-        self.lm_head = VocabParallelLMHead(self.hidden, self.vocab_size)
+        self.norm = RMSNorm(self.hidden, self.eps, device=device)
+        self.lm_head = VocabParallelLMHead(self.hidden, self.vocab_size, device=device)
 
-        self.cos, self.sin = build_rope_cache(self.max_seq_len, self.head_dim, theta=self.rope_theta, device="cuda", dtype=torch.float16)
+        self.cos, self.sin = build_rope_cache(self.max_seq_len, self.head_dim, theta=self.rope_theta, device=device, dtype=torch.float16)
         self.caches: list[PagedKVCache] | None = None
 
     @torch.no_grad()
@@ -291,7 +292,7 @@ class TPLlamaForCausalLM(nn.Module):
         self.caches = []
         for blk in self.blocks:
             kvh = blk.attn.local_kv_heads
-            self.caches.append(PagedKVCache(bsz, kvh, self.head_dim, page_size=page_size, init_pages=init_pages, device="cuda", dtype=torch.float16))
+            self.caches.append(PagedKVCache(bsz, kvh, self.head_dim, page_size=page_size, init_pages=init_pages, device=self.device_str, dtype=torch.float16))
 
     def reset_all_caches(self):
         # reuse allocations across requests (daemon mode)
@@ -372,4 +373,3 @@ def generate_tp(model: TPLlamaForCausalLM, input_ids: torch.Tensor, max_new_toke
         cur_len += 1
 
     return torch.cat(out_ids, dim=1)
-

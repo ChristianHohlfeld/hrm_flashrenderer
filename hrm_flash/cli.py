@@ -18,13 +18,15 @@ def main():
 
     d = sub.add_parser("daemon", help="Start persistent TP FlashAttention daemon (loads renderer once)")
     d.add_argument("--model", required=True, help="Local HF safetensors model dir")
-    d.add_argument("--world", type=int, choices=[2, 3, 4], required=True)
+    d.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
     d.add_argument("--max_seq_len", type=int, default=8192)
     d.add_argument("--prefill_chunk_size", type=int, default=1024)
     d.add_argument("--local_files_only", action="store_true")
     d.add_argument("--host", type=str, default="127.0.0.1")
     d.add_argument("--port", type=int, default=0)
     d.add_argument("--authkey", type=str, default="hrmflash")
+    d.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                   help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
 
     s = sub.add_parser("serve", help="Start HTTP service (HRM retrieval + persistent TP daemon)")
     s.add_argument("--hrm_model", required=True)
@@ -50,7 +52,7 @@ def main():
 
     g.add_argument("--hrm_bin", default=None, help="Path to HRM binary. If omitted: uses HRM_BIN env, PATH, or repo build.")
 
-    g.add_argument("--world", type=int, choices=[2, 3, 4], default=None, help="Tensor parallel world size")
+    g.add_argument("--world", type=int, choices=[1, 2, 3, 4], default=None, help="Tensor parallel world size")
 
     g.add_argument("--top_k", type=int, default=8)
     g.add_argument("--top_m", type=int, default=400)
@@ -69,6 +71,8 @@ def main():
 
     g.add_argument("--print_prompt", action="store_true", help="Print the built renderer prompt and exit")
     g.add_argument("--use_daemon", action="store_true", help="Send to HRM_FLASH_DAEMON instead of spawning renderer")
+    g.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                   help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
 
     args = ap.parse_args()
 
@@ -83,6 +87,9 @@ def main():
             "--port", str(args.port),
             "--authkey", args.authkey,
         ] + (["--local_files_only"] if args.local_files_only else [])
+        if hasattr(args, 'device'):
+            sys.argv.append("--device")
+            sys.argv.append(args.device)
         dmain()
         return
 
@@ -181,6 +188,7 @@ def main():
             max_seq_len=args.max_seq_len,
             prefill_chunk_size=args.prefill_chunk_size,
             local_files_only=bool(args.local_files_only),
+            device=args.device,
         )
         raise SystemExit(code)
 

@@ -9,18 +9,23 @@ def init_dist_env():
     rank = int(os.environ['RANK'])
     world = int(os.environ['WORLD_SIZE'])
     local_rank = int(os.environ.get('LOCAL_RANK', rank))
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world)
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    if backend == 'nccl':
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend, rank=rank, world_size=world)
     return rank, local_rank, world
 
-def init_dist(rank: int, world: int, master_addr: str, master_port: int, local_rank: int | None = None):
+def init_dist(rank: int, world: int, master_addr: str, master_port: int, local_rank: int | None = None, backend: str | None = None):
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = str(master_port)
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world)
     os.environ['LOCAL_RANK'] = str(local_rank if local_rank is not None else rank)
-    torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world)
+    if backend is None:
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    if backend == 'nccl':
+        torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+    dist.init_process_group(backend=backend, rank=rank, world_size=world)
     return dist.get_rank(), int(os.environ['LOCAL_RANK']), dist.get_world_size()
 
 def all_reduce_sum(x: torch.Tensor):

@@ -1,0 +1,135 @@
+# CPU-Only Mode (Minimalinvasiv)
+
+**Ziel:** Das System soll ohne CUDA-Installation laufen. Ein optionaler Flag `--device cpu` (oder Env-Var `HRM_FLASH_DEVICE=cpu`) aktiviert den CPU-Pfad. Standardmäßig bleibt alles unverändert.
+
+---
+
+## Änderungen
+
+### 1. flashattention_custom
+
+#### [MODIFY] [ops.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/flashattention_custom/ops.py)
+
+Lazy-import der CUDA-Extension. Falls nicht gebaut/verfügbar → pure-PyTorch Fallback-Attention.
+
+```diff
+-from . import _ext
++try:
++    from . import _ext as _ext
++    _HAS_EXT = True
++except (ImportError, OSError):
++    _ext = None
++    _HAS_EXT = False
+```
+
+Alle drei Funktionen bekommen einen PyTorch-Fallback (standard scaled-dot-product attention). Die Qualität ist identisch, nur langsamer.
+
+---
+
+### 2. tp
+
+#### [MODIFY] [dist_utils.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/tp/dist_utils.py)
+
+[init_dist](file:///c:/Users/chris/Downloads/hrm_flashrenderer/tp/dist_utils.py#16-25) / [init_dist_env](file:///c:/Users/chris/Downloads/hrm_flashrenderer/tp/dist_utils.py#8-15) bekommen ein `backend` Parameter (default `'nccl'`). Wenn `device == 'cpu'`, wird `backend='gloo'` verwendet. `torch.cuda.set_device()` wird nur aufgerufen wenn CUDA vorhanden.
+
+#### [MODIFY] [norm.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/tp/norm.py)
+
+Hardcoded `device='cuda'` → `device` Parameter (default `'cuda'` für Rückwärtskompatibilität).
+
+#### [MODIFY] [vocab_parallel.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/tp/vocab_parallel.py)
+
+Identisch: `device='cuda'` → `device` Parameter.
+
+#### [MODIFY] [parallel_linear.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/tp/parallel_linear.py)
+
+Identisch: `device='cuda'` → `device` Parameter.
+
+---
+
+### 3. engine
+
+#### [MODIFY] [llama_tp.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/engine/llama_tp.py)
+
+- [PagedKVCache](file:///c:/Users/chris/Downloads/hrm_flashrenderer/engine/llama_tp.py#21-108): `device` bereits als Parameter — bleibt unverändert ✅
+- `TPLlamaForCausalLM.__init__`: übergibt jetzt `device` an alle Submodule
+- [build_rope_cache](file:///c:/Users/chris/Downloads/hrm_flashrenderer/engine/rope.py#6-14): `device` Parameter bereits vorhanden ✅
+- `.cuda()` calls in [hf_tp_generate.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/engine/hf_tp_generate.py): werden durch [to(device)](file:///c:/Users/chris/Downloads/hrm_flashrenderer/hrm_flash/prompt_builder.py#62-66) ersetzt
+
+#### [MODIFY] [hf_tp_generate.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/engine/hf_tp_generate.py)
+
+- Neuer Flag `--device` (default [cuda](file:///c:/Users/chris/Downloads/hrm_flashrenderer/csrc/ext.cpp#9-10), Optionen: [cuda](file:///c:/Users/chris/Downloads/hrm_flashrenderer/csrc/ext.cpp#9-10), `cpu`)
+- `device = torch.device(args.device)` statt hartem `torch.device("cuda", rank)`
+- Bei `--world` und `device=cpu`: `mp.spawn` weiterhin möglich (Gloo backend)
+
+---
+
+### 4. hrm_flash
+
+#### [MODIFY] [flash_daemon.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/hrm_flash/flash_daemon.py)
+
+- Neuer `DaemonConfig.device: str` (default `'cuda'`)
+- Neues Argument `--device cpu`
+- `device = torch.device(cfg.device, rank)` → `device = torch.device(cfg.device) if cfg.device == 'cpu' else torch.device("cuda", rank)`
+
+#### [MODIFY] [cli.py](file:///c:/Users/chris/Downloads\hrm_flashrenderer/hrm_flash/cli.py)
+
+- [generate](file:///c:/Users/chris/Downloads/hrm_flashrenderer/hrm_flash/flash_daemon_client.py#47-60) und [daemon](file:///c:/Users/chris/Downloads/hrm_flashrenderer/hrm_flash/flash_daemon_client.py#20-34) sub-commands bekommen `--device cpu` Flag
+- Wird durchgereicht an `flash_runner` / daemon
+
+#### [MODIFY] [flash_runner.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/hrm_flash/flash_runner.py)
+
+- [run_flash_generate()](file:///c:/Users/chris/Downloads/hrm_flashrenderer/hrm_flash/flash_runner.py#12-71) bekommt `device: str = "cuda"` Parameter
+- Wird als `--device` an `engine.hf_tp_generate` weitergereicht
+
+---
+
+### 5. setup.py
+
+#### [MODIFY] [setup.py](file:///c:/Users/chris/Downloads/hrm_flashrenderer/setup.py)
+
+CUDA-Extension wird nur gebaut wenn `CUDA_HOME` gesetzt **und** `--ext` nicht explizit ausgeschlossen ist:
+
+```diff
+-ext_modules=[CUDAExtension(...)],
++ext_modules=_cuda_ext() if _has_cuda() else [],
+```
+
+Hilfs-Funktion `_has_cuda()` prüft `torch.cuda.is_available()` und ob NVCC vorhanden ist.
+
+---
+
+## Verification Plan
+
+### Automatisch (ohne CUDA-Hardware nötig)
+
+```bash
+# 1. Import-Test: flashattention_custom greift auf Fallback zurück
+cd c:\Users\chris\Downloads\hrm_flashrenderer
+python -c "from flashattention_custom.ops import flash_attn_paged; print('OK')"
+
+# 2. Smoke-Test: HRM Retrieval (kein CUDA benötigt)
+python -c "from hrm_flash.hrm_client import run_hrm_query; print('import OK')"
+
+# 3. setup.py ohne CUDA Extension (kein NVCC nötig)
+# Das sollte ohne Fehler durchlaufen (Extension wird übersprungen):
+python setup.py --version
+```
+
+### Manuell (wenn CPU-Hardware vorhanden, kein GPU)
+
+```bash
+# HRM prep + build bleibt wie gehabt (kein CUDA):
+hrm_core/build/hrm prep --input input.txt --out payloads.jsonl --cluster-size 200
+hrm_core/build/hrm build --payloads payloads.jsonl --outdir model
+
+# CPU-only generate (kleines GGUF Modell):
+hrm-flash generate \
+  --hrm_model ./model \
+  --llm_model /path/to/model.gguf \
+  --prompt "Test" \
+  --device cpu \
+  --max_new_tokens 32
+```
+
+> [!NOTE]
+> Das `--device cpu` Flag mit `--world` (TP) funktioniert via Gloo-Backend, ist aber sehr langsam. Für CPU-Only Betrieb empfiehlt sich `world=1` (kein TP). Das wird in der README dokumentiert.

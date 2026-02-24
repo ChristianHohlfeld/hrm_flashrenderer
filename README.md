@@ -70,26 +70,37 @@ Local LLM Renderer          greedy decoding; CPU path = 0 VRAM, GPU path optiona
 git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
 cd hrm_flashrenderer
 pip install -r requirements.prod.txt
-pip install -e .
+pip install -e .          # CUDA ext only built if NVCC present — works without CUDA too
 make build
 
 # Index a corpus
 hrm_core/build/hrm prep  --input input.txt --out payloads.jsonl --cluster-size 200
 hrm_core/build/hrm build --payloads payloads.jsonl --outdir model
 
-# Generate (CPU-only, 0 VRAM)
+# ─── CPU-only: llama.cpp renderer, 0 VRAM ───────────────────────────────────
 hrm-flash generate \
   --hrm_model ./model \
   --llm_model /path/to/model.gguf \
   --prompt "Your question" \
   --max_new_tokens 512
+
+# ─── GPU / TP-renderer (HF safetensors, CUDA) ───────────────────────────────
+hrm-flash generate \
+  --hrm_model ./model \
+  --llm_model /path/to/hf-model \
+  --prompt "Your question" \
+  --world 2 --device cuda --max_new_tokens 512
 ```
 
 ## Other Operation Modes
 
 **Persistent daemon** (warm model, low latency):
 ```bash
+# GPU path (TP world 2)
 hrm-flash daemon --model /path/to/hf-model --world 2 --port 5555 --local_files_only
+
+# CPU path (world=1, no CUDA)
+hrm-flash daemon --model /path/to/hf-model --world 1 --device cpu --port 5555 --local_files_only
 ```
 
 **HTTP API**:
@@ -108,7 +119,8 @@ curl -s http://127.0.0.1:8080/v1/generate -H 'Content-Type: application/json' \
 | `--top_k` / `--top_m` / `--k` | Router → candidates → MMR final snippets |
 | `--max_sources` / `--max_chars_per_source` | Source budget per prompt |
 | `--max_seq_len` / `--reserve_prompt_tokens` | Token budget |
-| `--world` | Tensor-parallel world size (1 / 2 / 3 / 4) |
+| `--world` | Tensor-parallel world size (**1** / 2 / 3 / 4); `1` = CPU-safe, no TP overhead |
+| `--device` | `cuda` (default) or `cpu` — CPU mode requires no CUDA install |
 | `--local_files_only` | Disable model downloads |
 
 ---
@@ -132,8 +144,10 @@ curl -s http://127.0.0.1:8080/v1/generate -H 'Content-Type: application/json' \
 | Issue | Fix |
 |---|---|
 | HRM binary not found | Run `make build` or set `--hrm_bin` |
+| CUDA extension not built | Normal without NVCC — PyTorch fallback used automatically |
 | CUDA extension build fails | Match CUDA toolkit, NVCC arch (`sm_75`), and PyTorch version |
 | TP world size error | Check model head/shard compatibility with `--world` |
+| CPU-only daemon slow | Expected — use `world=1`; for speed use GPU path |
 | Prompt too long | Reduce `--max_sources`, `--max_chars_per_source`, or `--max_seq_len` |
 
 ---

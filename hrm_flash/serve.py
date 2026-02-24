@@ -51,6 +51,7 @@ class _State:
         self.daemon_addr: FlashDaemonAddr | None = None
         self.daemon_proc: subprocess.Popen | None = None
         self.sem: asyncio.Semaphore | None = None
+        self.device: str = 'cuda'
 
 
 STATE = _State()
@@ -88,6 +89,8 @@ def _start_daemon_if_needed() -> FlashDaemonAddr:
         str(addr.port),
         "--authkey",
         os.environ["HRM_FLASH_AUTHKEY"],
+        "--device",
+        STATE.device,
     ]
     if STATE.local_files_only:
         cmd.append("--local_files_only")
@@ -173,6 +176,8 @@ def main():
 
     ap.add_argument("--hrm_bin", default=None)
     ap.add_argument("--max_concurrent", type=int, default=1)
+    ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
+                    help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
 
     args = ap.parse_args()
 
@@ -188,6 +193,7 @@ def main():
     STATE.reserve_prompt_tokens = int(args.reserve_prompt_tokens)
     STATE.disable_token_budget = bool(args.disable_token_budget)
     STATE.sem = asyncio.Semaphore(max(1, int(args.max_concurrent)))
+    STATE.device = str(args.device)
 
     # Locate HRM binary (only needed if hrm_api not built)
     STATE.hrm_bin = find_hrm_binary(repo_root=STATE.repo_root, explicit=args.hrm_bin)
