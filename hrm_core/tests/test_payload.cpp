@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #include "hrm/payload_jsonl.h"
 #include <fstream>
 #include <stdexcept>
@@ -18,3 +21,4 @@ void test_payload() {
     assert_true(v[0].snippets.size() == 3, "snips size");
     assert_true(v[0].snippets[1].find("line") != std::string::npos, "newline unescape");
 }
+

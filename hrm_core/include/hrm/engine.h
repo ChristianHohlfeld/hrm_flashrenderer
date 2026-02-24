@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #pragma once
 #include "hrm/router_index.h"
 #include "hrm/sqlite_store.h"
@@ -34,3 +37,4 @@ private:
 };
 
 } // namespace hrm
+

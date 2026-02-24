@@ -1,3 +1,6 @@
+﻿# Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+# https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+# ALL RIGHTS RESERVED. No license granted without prior written permission.
 import json
 from pathlib import Path
 
@@ -24,3 +27,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

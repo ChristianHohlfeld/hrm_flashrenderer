@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #include "hrm/engine.h"
 #include "hrm/payload_jsonl.h"
 #include "hrm/sqlite_store.h"
@@ -278,3 +281,4 @@ int main(int argc, char** argv) {
         return 2;
     }
 }
+

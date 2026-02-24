@@ -1,13 +1,15 @@
-% main.tex — pdflatex-friendly, minimal dependencies
-% Copyright (c) 2026 Christian Heinrich Hohlfeld. ALL RIGHTS RESERVED.
-% https://christianhohlfeld.com  ORCID: https://orcid.org/0009-0003-6634-9045
+% main.tex — HDR/HRM and Resonant Sparse Attention
+% Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+% https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+% ALL RIGHTS RESERVED. No license granted without prior written permission.
 \documentclass[11pt,a4paper]{article}
 
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage[hidelinks]{hyperref}
 
-\title{HDR/HRM: Deterministic Integer Signatures, Resonance Retrieval,\\and a MatMul-Free Adapter}
+\title{HDR/HRM and Resonant Sparse Attention:\\
+Deterministic Integer Signatures, Resonance Retrieval, and MatMul-Free Sequence Modeling}
 \author{Christian Heinrich Hohlfeld\\
 Konstanz, Germany\\
 \href{https://christianhohlfeld.com}{christianhohlfeld.com}\\
@@ -33,71 +35,135 @@ ORCID: \href{https://orcid.org/0009-0003-6634-9045}{0009-0003-6634-9045}}
 \newcommand{\Z}{\mathbb{Z}}
 \newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
 \newcommand{\set}[1]{\left\{ #1 \right\}}
-\newcommand{\ang}[1]{\left\langle #1 \right\rangle}
 \newcommand{\defeq}{\mathrel{\mathop:}=}
 
 \begin{document}
 \maketitle
 
-\vspace{-0.5em}
-\noindent
-\textbf{Rights.} \copyright\ 2026 Christian Heinrich Hohlfeld. All rights reserved.
-No license is granted to use, copy, modify, or distribute this work without prior written permission.
+\vspace{-0.4em}
+\noindent\rule{\linewidth}{0.4pt}\\
+\textbf{Rights.}
+\copyright\ 2026 Christian Heinrich Hohlfeld (Konstanz, Germany). \textbf{All rights reserved.}\\
+\emph{No license is granted} to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of this work (including any accompanying software) without prior written permission from the author.\\
+Licensing inquiries: \href{https://christianhohlfeld.com}{christianhohlfeld.com} \quad ORCID: \href{https://orcid.org/0009-0003-6634-9045}{0009-0003-6634-9045}
+\noindent\rule{\linewidth}{0.4pt}
 
 \begin{abstract}
-We formalize a deterministic pipeline built from integer-only primitives:
-(1) a feature extractor and integer signature construction (HDR),
-(2) an inverted index and resonance scoring for retrieval (HRM),
-and (3) a matrix-multiplication-free (MatMul-free) adapter that selects outputs via deterministic
-integer scoring with explicit tie-breaking. We prove end-to-end determinism, candidate completeness,
-and stability properties under corpus extension. We also state correctness conditions under collision-free
-(or collision-detectable) hashing and provide worst-case complexity bounds.
+We formalize an end-to-end deterministic pipeline built from bounded integer primitives:
+(1) the \emph{Hohlfeld Data Representation} (HDR) method, which encodes ordered datasets via residual vectors
+parameterized by amplitude and phase, with exact reconstruction and uniqueness guarantees;
+(2) an inverted-index \emph{resonance retrieval} scheme (HRM) that enumerates candidates and ranks them
+by deterministic resonance scores with explicit tie-breaking; and
+(3) \emph{Resonant Sparse Attention}, a MatMul-free, float-free, stochastic-free sequence-modeling core that
+replaces dot-product attention and dense linear layers with sparse associative operations on discrete HDR-derived keys
+(bitset intersections and inverted-index overlap).
+We prove end-to-end determinism under fixed preprocessing and tie-breaking, candidate completeness for retrieval,
+and that the proposed training and inference procedures require no dense matrix multiplication.
 \end{abstract}
 
-\section{Scope and Design Goals}
-This paper formalizes a reproducible, integer-only retrieval and decision pipeline.
-The goals are:
+\section{Scope and Non-Negotiable Design Goals}
+This work targets reproducible, machine-checkable behavior.
+The design goals are:
+
 \begin{itemize}
-  \item \textbf{Determinism:} identical inputs yield identical outputs across runs.
-  \item \textbf{Integer arithmetic:} no floating point, no stochastic components, no probabilistic sampling.
-  \item \textbf{MatMul-free decision:} no dense matrix multiplication is required for the adapter.
+  \item \textbf{Superdeterminism:} identical inputs yield identical outputs across runs and platforms, under a fixed system version.
+  \item \textbf{Integer-only arithmetic:} bounded integers; no floating point; no stochastic sampling; no probabilistic scoring.
+  \item \textbf{MatMul elimination:} training and inference avoid dense matrix multiplication.
 \end{itemize}
 
-\section{Deterministic Signatures (HDR)}
-Let $\Sigma$ be a finite alphabet and $\Sigma^\ast$ the set of finite sequences.
-
-\begin{definition}[Deterministic feature extractor]
-A feature extractor is a function $E:\Sigma^\ast \to \mathcal{F}^\ast$ mapping an input sequence
-to an \emph{ordered} list of discrete features in a feature universe $\mathcal{F}$.
-\end{definition}
-
-\begin{definition}[Integer key map]
-A key map is a deterministic function $H:\mathcal{F}\to\Z$ producing an integer key for each feature.
-\end{definition}
-
-\begin{assumption}[Deterministic preprocessing]\label{ass:det-pre}
-$E$ and $H$ are fixed and deterministic for a given system version.
-\end{assumption}
-
-\begin{definition}[Signature]
-For $x\in\Sigma^\ast$, define the (multi-)set signature
-\[
-S(x) \defeq \{\, H(f)\ :\ f \in E(x)\,\}.
-\]
-If multiplicities matter, interpret $S(x)$ as a multiset; otherwise as a set.
-\end{definition}
-
 \begin{remark}
-All later properties hold for sets; multisets require standard multiset-intersection definitions.
+This paper does \emph{not} claim that eliminating MatMul automatically yields human-level language understanding.
+It claims that a transformer-style \emph{control structure} (multi-head, multi-layer, context-dependent selection) can be implemented
+via deterministic sparse associative operators derived from HDR, rather than via dot products and dense linear layers.
 \end{remark}
 
-\section{Inverted Index and Resonance Retrieval (HRM)}
-Let the corpus be $D=\{d_1,\dots,d_N\}\subseteq\Sigma^\ast$.
+\section{HDR: Deterministic Residual-Vector Encoding}
+HDR defines a deterministic and proportional framework for encoding an ordered dataset
+$D=\{d_1,d_2,\dots,d_n\}$ as a linked set of residual vectors relative to a reference vector $v_0$.
+Each data point $d_i$ is represented by a residual vector $v_i$ with length (amplitude) $L_i$ and angle (phase) $\theta_i$:
+\begin{equation}\label{eq:hdr_vec}
+v_i \;=\; L_i\bigl(\cos(\theta_i)\hat{\imath} + \sin(\theta_i)\hat{\jmath}\bigr),
+\end{equation}
+with angles distributed deterministically by
+\begin{equation}\label{eq:hdr_theta}
+\theta_i \;=\; \frac{2\pi i}{n}.
+\end{equation}
+HDR further states that the original data can be reconstructed exactly via the cumulative sum of residual vectors:
+\begin{equation}\label{eq:hdr_recon}
+d_i \;=\; v_0 + \sum_{k=1}^{i} v_k.
+\end{equation}
+
+\begin{assumption}[HDR axioms]\label{ass:hdr}
+Equations \eqref{eq:hdr_vec}, \eqref{eq:hdr_theta}, and \eqref{eq:hdr_recon} are applied as specified in the HDR method,
+with a fixed reference vector $v_0$ (typically the zero vector) and a fixed ordering of data points.
+\end{assumption}
+
+\begin{proposition}[Exact reconstruction]\label{prop:hdr_exact}
+Under Assumption~\ref{ass:hdr}, the dataset $D$ is reconstructible exactly from $(v_0,v_1,\dots,v_n)$ by \eqref{eq:hdr_recon}.
+\end{proposition}
+\begin{proof}
+Equation~\eqref{eq:hdr_recon} provides the reconstruction rule. Because it is a deterministic cumulative sum over the residual vectors,
+the reconstructed $d_i$ is uniquely determined for each $i$.
+\end{proof}
+
+\begin{proposition}[Uniqueness (HDR-level)]\label{prop:hdr_unique}
+Under Assumption~\ref{ass:hdr}, uniqueness follows from (i) distinct angular mapping via \eqref{eq:hdr_theta}
+and (ii) proportional length encoding via $L_i$; therefore different ordered datasets induce distinct HDR representations.
+\end{proposition}
+\begin{proof}
+Distinct positions $i$ yield distinct angles by \eqref{eq:hdr_theta}. Given fixed ordering, each residual vector is determined by
+its pair $(L_i,\theta_i)$; changing either magnitude or position changes at least one residual vector, and therefore changes the representation.
+\end{proof}
+
+\section{From HDR to Discrete Resonance Keys}
+To eliminate MatMul in retrieval and sequence selection, we map streaming inputs to \emph{discrete resonance keys}
+that are sparse by construction.
+
+\begin{definition}[Discrete key space]
+Fix $B=2^b$ bins. The discrete phase circle is $\mathbb{Z}_B = \{0,1,\dots,B-1\}$.
+\end{definition}
+
+\begin{definition}[Deterministic key extractor]\label{def:key_extractor}
+A deterministic key extractor is a function
+\[
+P:\Sigma^\ast \to (\mathbb{Z}_B)^\ast
+\]
+that maps an input sequence to an ordered list of bin indices.
+\end{definition}
+
+\begin{assumption}[Fixed integer kernel]\label{ass:kernel}
+$P$ is implemented solely via fixed, bounded integer arithmetic (e.g.\ fixed-window integer convolution and a deterministic
+bin-mapping rule), and its parameters are fixed for a given system version.
+\end{assumption}
+
+\begin{proposition}[Key determinism]\label{prop:key_det}
+Under Assumption~\ref{ass:kernel}, $P(x)$ is deterministic for any $x\in\Sigma^\ast$.
+\end{proposition}
+\begin{proof}
+$P$ is a composition of deterministic integer operations with fixed parameters.
+\end{proof}
+
+\begin{remark}[Representation vs.\ projection]
+HDR as stated in Section~2 provides exact reconstruction at the residual-vector level.
+A discrete key extractor $P$ is a \emph{projection} used for routing/association; it may be lossy by design.
+This work uses HDR to justify deterministic, proportional, ordered encoding; it uses $P$ to obtain sparse, hardware-friendly keys.
+\end{remark}
+
+\section{HRM: Resonance Retrieval by Inverted Index}
+Let the corpus be $D=\{d_1,\dots,d_N\}\subseteq\Sigma^\ast$. We use the discrete keys produced by $P$.
+
+\begin{definition}[Signature set]
+For an item $x$, define a set signature
+\[
+S(x)\defeq \{\,k\in\mathbb{Z}_B : k \text{ occurs in } P(x)\,\}.
+\]
+\end{definition}
 
 \begin{definition}[Posting index]
-Define $B:\Z\to\mathcal{P}(\{1,\dots,N\})$ by
+Define $B:\mathbb{Z}_B\to\mathcal{P}(\{1,\dots,N\})$ by
 \[
-B(k)\defeq \{\, i \in \{1,\dots,N\}\ :\ k \in S(d_i)\,\}.
+B(k)\defeq \{\, i : k\in S(d_i)\,\}.
 \]
 \end{definition}
 
@@ -119,181 +185,176 @@ If $R(q,i)>0$, then $i\in C(q)$.
 \end{lemma}
 \begin{proof}
 $R(q,i)>0$ implies $S(q)\cap S(d_i)\neq\varnothing$, so there exists $k\in S(q)$ with $k\in S(d_i)$.
-Then $i\in B(k)$ by definition, hence $i\in \bigcup_{k\in S(q)}B(k)=C(q)$.
+Then $i\in B(k)$, hence $i\in C(q)$.
 \end{proof}
 
-\begin{definition}[Deterministic Top-$K$ with tie-break]\label{def:topk}
-Fix a total order $\prec$ on item ids (e.g.\ numeric id order).
-Let $\mathrm{TopK}(q)$ be the ordered list of the $K$ ids with largest $R(q,i)$
-computed over $i\in C(q)$, breaking ties by $\prec$.
+\begin{definition}[Deterministic Top-$K$]
+Fix a total order $\prec$ on ids (e.g.\ numeric ascending). Define $\mathrm{TopK}(q)$ as the ordered list of the $K$ ids with
+largest $R(q,i)$ over $i\in C(q)$, breaking ties by $\prec$.
 \end{definition}
 
-\begin{assumption}[Deterministic tie-break]\label{ass:tiebreak}
-The order $\prec$ is fixed and total.
-\end{assumption}
-
-\begin{theorem}[Deterministic retrieval]\label{thm:det-retrieval}
-Under Assumptions~\ref{ass:det-pre} and~\ref{ass:tiebreak}, $\mathrm{TopK}(q)$ is deterministic
-for fixed corpus $D$.
+\begin{theorem}[Deterministic retrieval]\label{thm:retrieval_det}
+Under Assumptions~\ref{ass:kernel} and fixed tie-breaking order $\prec$, $\mathrm{TopK}(q)$ is deterministic.
 \end{theorem}
 \begin{proof}
-By Assumption~\ref{ass:det-pre}, signatures $S(q)$ and $S(d_i)$ are uniquely determined, hence $R(q,i)$ is fixed.
-By Definition~\ref{def:topk}, selection of top scores with a fixed tie-break total order yields a unique list.
+By Proposition~\ref{prop:key_det}, signatures are fixed; therefore all $R(q,i)$ are fixed.
+A deterministic tie-break over a total order yields a unique ranking.
 \end{proof}
 
-\section{Deterministic Rendering}
-Each item id $i$ corresponds to a payload $p_i\in\Sigma^\ast$ (e.g.\ a chunk of text).
+\section{Resonant Sparse Attention: MatMul-Free Transformer-Style Sequence Modeling}
+We now describe a deterministic alternative to dot-product self-attention and dense linear layers.
 
-\begin{definition}[Renderer]
-A renderer is a function $\mathrm{Render}:\Sigma^\ast\times(\Sigma^\ast)^K\to\Sigma^\ast$.
+\subsection{State construction (multi-head, multi-lag, multi-layer)}
+Let a streaming input be tokenized into bytes $\{0,\dots,255\}$.
+A fixed HDR-derived kernel produces, at each step, one bin per head.
+We store the last $L$ bins (lags) for each head and each layer.
+
+\begin{definition}[Layer-head state]
+Fix integers $\mathrm{LAYERS},\mathrm{HEADS},\mathrm{LAGS}$.
+At time $t$, define the state key
+\[
+K_t \in (\mathbb{Z}_B)^{\mathrm{LAYERS}\cdot\mathrm{HEADS}\cdot\mathrm{LAGS}}
+\]
+as the concatenation of all lag bins for all heads and layers.
 \end{definition}
 
-\begin{assumption}[Deterministic renderer]\label{ass:render}
-$\mathrm{Render}$ is deterministic and uses a fixed formatting policy.
+\begin{assumption}[State determinism]\label{ass:state_det}
+Given fixed kernel parameters and fixed token stream, the state sequence $(K_t)$ is deterministic.
 \end{assumption}
 
-\begin{definition}[Context]
-Let $(i_1,\dots,i_K)=\mathrm{TopK}(q)$ and define
+\subsection{Training as set-compilation (no weights, no counts)}
+We \emph{do not} estimate probabilities. We compile an exact transition relation as sets.
+
+\begin{definition}[Next-token relation]
+For each observed transition $K_t \to y_{t+1}$ (next byte),
+store set membership:
 \[
-\mathcal{C}(q)\defeq \mathrm{Render}\bigl(q,\,p_{i_1},\dots,p_{i_K}\bigr).
+\mathrm{NextSet}[K_t] \;\supseteq\; \{y_{t+1}\}.
 \]
 \end{definition}
 
-\begin{theorem}[Deterministic context]\label{thm:det-context}
-Under Assumption~\ref{ass:render}, $\mathcal{C}(q)$ is deterministic given $(q, i_1,\dots,i_K)$.
-\end{theorem}
+\begin{proposition}[Training is MatMul-free]\label{prop:train_nomul}
+Training requires no dense matrix multiplication.
+\end{proposition}
 \begin{proof}
-Fixed inputs into a deterministic function imply a fixed output.
+Each step computes a fixed number of integer-key updates and sets a bit in a 256-bit set.
+No operation of the form $W x$ with dense $W$ is required.
 \end{proof}
 
-\section{MatMul-Free Adapter (Integer-Only Decision)}
-We model a MatMul-free adapter as an integer-only scoring rule.
+\subsection{Inference by sparse associative recall}
+To avoid fragile exact-state lookup, we retrieve a \emph{best matching} memorized state by overlap in discrete key space.
 
-\begin{definition}[Integer feature map]
-Let $\Phi:\Sigma^\ast\to\Z^m$ be deterministic.
+\begin{definition}[Overlap score]
+For query key $K$ and stored key $K^{(j)}$, define
+\[
+\mathrm{Overlap}(K,K^{(j)}) \defeq \#\{p : K[p] = K^{(j)}[p]\},
+\]
+i.e.\ the number of matching components.
 \end{definition}
 
-\begin{definition}[Integer score]
-Fix $w\in\Z^m$. Define
+\begin{definition}[Deterministic best match]
+Choose
 \[
-\mathrm{Score}(x)\defeq \sum_{j=1}^m w_j\cdot \Phi(x)_j.
+j^\star \defeq \arg\max_j \bigl(\mathrm{Overlap}(K,K^{(j)}),\; \prec_{\mathrm{state}}\bigr),
+\]
+with fixed tie-break order $\prec_{\mathrm{state}}$ (e.g.\ smallest id).
+\end{definition}
+
+\begin{definition}[Deterministic token choice]
+Let $A \defeq \mathrm{NextSet}[K^{(j^\star)}]$.
+If $A=\varnothing$, the system halts. Otherwise select a token deterministically from $A$
+by a fixed function of $K$ (e.g.\ select the $k$-th set bit where $k = \sum_p K[p] \bmod \abs{A}$).
+\end{definition}
+
+\begin{theorem}[Inference is MatMul-free]\label{thm:infer_nomul}
+Inference requires no dense matrix multiplication.
+\end{theorem}
+\begin{proof}
+Computing overlaps between discrete keys can be implemented via inverted indices:
+for each component position $p$ and bin value $K[p]$, consult a posting list of states that share that component.
+Scoring increments bounded integer counters; selection over a 256-bit set uses bitwise operations.
+No dense dot products or dense matrix-vector products are required.
+\end{proof}
+
+\begin{theorem}[End-to-end determinism]\label{thm:end2end}
+Under Assumptions~\ref{ass:kernel} and~\ref{ass:state_det}, and fixed tie-break rules,
+training yields a deterministic model; inference yields deterministic outputs for a given prompt.
+\end{theorem}
+\begin{proof}
+All operations are deterministic integer computations with fixed parameters and explicit tie-breaking.
+\end{proof}
+
+\subsection{Complexity (informal bounds)}
+Let $M$ be the number of stored states and $P=\mathrm{LAYERS}\cdot\mathrm{HEADS}\cdot\mathrm{LAGS}$.
+
+\begin{proposition}[Per-token inference cost]\label{prop:cost}
+With an inverted index over $(p,\mathrm{bin})$ pairs, best-match retrieval costs
+$O\!\left(\sum_{p=1}^{P} \abs{\mathrm{Post}(p,K[p])}\right)$ counter increments,
+followed by $O(1)$ operations on a 256-bit set (constant 32-byte scans).
+\end{proposition}
+
+\section{Deterministic Safe Division (Auxiliary Result)}
+Some deterministic pipelines require normalization ratios. If a denominator can be zero,
+a deterministic shift-unshift procedure can be used:
+
+\begin{definition}[Shift-unshift division]\label{def:shiftunshift}
+For real numbers $a,b$ and $\delta>0$, define
+\[
+\mathrm{Div}_\delta(a,b) \defeq \frac{a+\delta}{b+\delta} - \delta.
 \]
 \end{definition}
 
-\begin{definition}[Deterministic selection]\label{def:select}
-Let $\mathcal{Y}$ be a finite candidate set (e.g.\ output symbols, templates, next-token set).
-Fix a total order $\prec_{\mathcal{Y}}$ on $\mathcal{Y}$ for tie-breaking.
-Define
+\begin{proposition}[Ratio preservation]\label{prop:ratio_preserve}
+If $b\neq 0$, then $\mathrm{Div}_\delta(a,b)=\frac{a}{b}$.
+\end{proposition}
+\begin{proof}
 \[
-\mathrm{Select}(x)\defeq \arg\max_{y\in\mathcal{Y}} \bigl(\mathrm{Score}(x\Vert y),\, \prec_{\mathcal{Y}}\bigr),
+\frac{a+\delta}{b+\delta}-\delta
+= \frac{a+\delta - \delta(b+\delta)}{b+\delta}
+= \frac{a+\delta -\delta b -\delta^2}{b+\delta}
+= \frac{a}{b}.
 \]
-where $x\Vert y$ denotes concatenation.
-\end{definition}
+\end{proof}
 
 \begin{remark}
-The score uses only integer addition and multiplication. No sampling or floating-point is required.
+When $b=0$, $\mathrm{Div}_\delta(a,0)=\frac{a+\delta}{\delta}-\delta$ is defined and deterministic for any fixed $\delta>0$.
 \end{remark}
 
-\section{Main Result: End-to-End Determinism}
-\begin{theorem}[End-to-end determinism]\label{thm:end2end}
-Assume \ref{ass:det-pre}, \ref{ass:tiebreak}, and \ref{ass:render}. Assume further that $\Phi,w,\mathcal{Y},\prec_{\mathcal{Y}}$
-are fixed and deterministic. Then
-\[
-\mathrm{Output}(q)\defeq \mathrm{Select}(\mathcal{C}(q))
-\]
-is deterministic for fixed corpus $D$ and payloads $(p_i)$.
-\end{theorem}
-\begin{proof}
-By Theorem~\ref{thm:det-retrieval}, $\mathrm{TopK}(q)$ is deterministic, hence $(i_1,\dots,i_K)$ is fixed.
-By Theorem~\ref{thm:det-context}, $\mathcal{C}(q)$ is fixed.
-Finally, Definition~\ref{def:select} applies a deterministic argmax with deterministic tie-break, yielding a unique output.
-\end{proof}
-
-\begin{proposition}[Idempotence]\label{prop:idempotence}
-For fixed inputs and fixed system version, repeated evaluations return the same output.
-\end{proposition}
-\begin{proof}
-Immediate from Theorem~\ref{thm:end2end}.
-\end{proof}
-
-\section{Correctness Conditions Under Hash Collisions}
-
-\begin{assumption}[Collision-free on observed features]\label{ass:injective}
-On the set of features that occur in the corpus and queries, $H$ is injective.
-\end{assumption}
-
-\begin{proposition}[Exact overlap preservation]\label{prop:overlap}
-Under Assumption~\ref{ass:injective} and set signatures,
-\[
-\abs{S(x)\cap S(y)} = \abs{\{f: f\in E(x)\}\cap \{g: g\in E(y)\}}
-\]
-for all $x,y\in\Sigma^\ast$.
-\end{proposition}
-\begin{proof}
-Injectivity implies $H(f)=H(g)\iff f=g$ on observed features. Therefore hashed-set intersection corresponds
-one-to-one with original-feature intersection, preserving cardinality.
-\end{proof}
-
-\begin{definition}[Collision-detectable keys]\label{def:pairkey}
-Define a collision-detectable key as a pair key $\tilde{H}(f)\defeq (H(f),\,\mathrm{ID}(f))$ where $\mathrm{ID}(f)$
-is a canonical deterministic encoding of the feature (or a second independent deterministic hash).
-\end{definition}
-
-\begin{proposition}[Determinism with collision detection]\label{prop:coll-detect}
-Replacing $H$ by $\tilde{H}$ (Definition~\ref{def:pairkey}) preserves determinism and restores exact overlap
-preservation even when $H$ collides.
-\end{proposition}
-\begin{proof}
-All steps remain deterministic. If two distinct features share $H(f)$, they differ in $\mathrm{ID}(f)$, hence
-$\tilde{H}(f)\neq \tilde{H}(g)$, making collisions impossible in the paired key space.
-\end{proof}
-
-\section{Stability Under Corpus Extension}
-
-\begin{proposition}[Monotone candidate expansion]\label{prop:monotone}
-Let $D'\supseteq D$ extend the corpus by adding new items without changing old ones.
-Then for any query $q$, $C_{D}(q)\subseteq C_{D'}(q)$.
-\end{proposition}
-\begin{proof}
-For each key $k$, the posting list in the extended corpus contains all prior ids plus possibly new ids.
-Taking unions over the same $S(q)$ preserves the subset relation.
-\end{proof}
-
-\section{Complexity Bounds}
-Let $m_x\defeq \abs{S(x)}$ and $m\defeq \max_i m_{d_i}$.
-
-\begin{proposition}[Index build]\label{prop:build}
-Index construction time is $O(\sum_{i=1}^N m_{d_i})$ and storage is $O(\sum_{i=1}^N m_{d_i})$.
-\end{proposition}
-\begin{proof}
-Each item contributes $m_{d_i}$ keys; each key updates one posting list entry.
-\end{proof}
-
-\begin{proposition}[Query]\label{prop:query}
-Candidate enumeration costs $O(\sum_{k\in S(q)} \abs{B(k)})$ in the worst case.
-Scoring costs $O(\abs{C(q)}\cdot m)$ in the uniform bound case.
-\end{proposition}
-
-\section{Implementation Checklist (Non-Normative)}
-To preserve determinism across platforms and runtimes:
-\begin{itemize}
-  \item canonicalize input normalization (byte-level or explicit Unicode normalization),
-  \item never rely on unspecified hash-map iteration order; sort keys before iteration when necessary,
-  \item define tie-break rules for all rankings and keep them versioned,
-  \item pin build flags for any native extensions; avoid nondeterministic kernels.
-\end{itemize}
-
 \section{Conclusion}
-We gave a self-contained formal model for deterministic integer signatures (HDR), resonance retrieval (HRM),
-and a MatMul-free adapter based on integer-only scoring. The main theorems establish end-to-end determinism,
-candidate completeness, stability under corpus extension, and clear correctness conditions under collision-free
-or collision-detectable keys.
+HDR provides a deterministic, proportional residual-vector framework with exact reconstruction and uniqueness at the representation level.
+By introducing a fixed integer key extractor $P$, we obtain sparse discrete resonance keys enabling HRM retrieval and a MatMul-free
+transformer-style sequence core. The resulting training and inference pipelines operate via bounded integer operations and sparse associative recall
+rather than dense matrix multiplication.
+
+\section*{Acknowledgments}
+
+I express heartfelt gratitude to my parents,
+\textbf{Barbara Friderike Hohlfeld and Dr.\ med.\ Siegfried Hohlfeld},
+for their unwavering love, support, and encouragement throughout my life.
+Their belief in my potential has been instrumental in the pursuit of knowledge, innovation, and ideas.
+
+The author also acknowledges the contributions of AI systems (ChatGPT by OpenAI,
+Gemini by Google) in refining the mathematical proof structures, generating supporting proofs,
+comparing textual versions of ideas and document structures,
+and helping to verify method correctness.
+All core ideas, concepts, and mathematical formulations are entirely the author's original creation.
 
 \begin{thebibliography}{9}
-\bibitem{hohlfeldsite}
+
+\bibitem{hdr}
 Christian Heinrich Hohlfeld.
-\newblock Author website and technical notes.
-\newblock \href{https://christianhohlfeld.com}{christianhohlfeld.com}, accessed 2026-02-24.
+\newblock \emph{Hohlfeld Data Representation (HDR): A Deterministic and Proportional Framework for Data Encoding Using Residual Vectors}.
+\newblock December 7, 2024. (Author: Christian Heinrich Hohlfeld, Konstanz, Germany.)
+
+\bibitem{div0}
+Christian Heinrich Hohlfeld.
+\newblock \emph{Rigorous Proof of Deterministic Division by Zero Method: Shift-Unshift}.
+\newblock 2024. (Author: Christian Heinrich Hohlfeld.)
+
+\bibitem{site}
+Christian Heinrich Hohlfeld.
+\newblock Author website: \href{https://christianhohlfeld.com}{christianhohlfeld.com}. Accessed 2026-02-24.
+
 \end{thebibliography}
 
 \end{document}

@@ -1,3 +1,6 @@
+﻿# Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+# https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+# ALL RIGHTS RESERVED. No license granted without prior written permission.
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -61,3 +64,4 @@ class RowParallelLinear(nn.Module):
             y = y + self.bias
         all_reduce_sum(y)
         return y
+

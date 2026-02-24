@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #include "hrm/signature.h"
 #include <cctype>
 #include <string_view>
@@ -116,3 +119,4 @@ std::vector<uint8_t> unpack_qbins_nibbles(const std::vector<uint8_t>& blob) {
 }
 
 } // namespace hrm
+

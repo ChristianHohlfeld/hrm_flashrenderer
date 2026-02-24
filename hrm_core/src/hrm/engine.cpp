@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #include "hrm/engine.h"
 #include "hrm/signature.h"
 #include "hrm/rank.h"
@@ -70,3 +73,4 @@ QueryResult Engine::query(const std::string& prompt, const QueryParams& qp) cons
 }
 
 } // namespace hrm
+

@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 
@@ -111,3 +114,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("start_pos"),
           py::arg("page_size"));
 }
+

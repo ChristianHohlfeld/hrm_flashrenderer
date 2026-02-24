@@ -1,3 +1,6 @@
+﻿# Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+# https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+# ALL RIGHTS RESERVED. No license granted without prior written permission.
 import os
 import torch
 import torch.distributed as dist
@@ -29,3 +32,4 @@ def all_gather_cat(x: torch.Tensor, dim: int):
     xs = [torch.empty_like(x) for _ in range(world)]
     dist.all_gather(xs, x)
     return torch.cat(xs, dim=dim)
+

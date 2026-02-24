@@ -1,3 +1,6 @@
+﻿// Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+// https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+// ALL RIGHTS RESERVED. No license granted without prior written permission.
 #include "hrm/signature.h"
 #include "hrm/common.h"
 #include <stdexcept>
@@ -24,3 +27,4 @@ void test_signature() {
     assert_true(self >= typo, "self >= typo");
     assert_true(typo >= other, "typo >= other (locality)");
 }
+

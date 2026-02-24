@@ -1,3 +1,6 @@
+﻿# Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+# https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+# ALL RIGHTS RESERVED. No license granted without prior written permission.
 import json
 import subprocess
 from dataclasses import dataclass
@@ -81,3 +84,4 @@ def run_hrm_query(
         raise RuntimeError(f"HRM returned invalid JSON: {e}\n--- stdout ---\n{p.stdout.decode('utf-8', errors='replace')}\n--- stderr ---\n{p.stderr.decode('utf-8', errors='replace')}")
 
     return HRMQueryResult(raw=raw)
+

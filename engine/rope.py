@@ -1,3 +1,6 @@
+﻿# Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+# https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
+# ALL RIGHTS RESERVED. No license granted without prior written permission.
 import torch
 
 def build_rope_cache(max_seq_len: int, head_dim: int, theta: float = 10000.0, device: str = "cuda", dtype=torch.float16):
@@ -19,3 +22,4 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions:
     y1 = x1 * c - x2 * s
     y2 = x1 * s + x2 * c
     return torch.cat([y1, y2], dim=-1)
+
