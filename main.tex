@@ -1,0 +1,299 @@
+% main.tex — pdflatex-friendly, minimal dependencies
+% Copyright (c) 2026 Christian Heinrich Hohlfeld. ALL RIGHTS RESERVED.
+% https://christianhohlfeld.com  ORCID: https://orcid.org/0009-0003-6634-9045
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[hidelinks]{hyperref}
+
+\title{HDR/HRM: Deterministic Integer Signatures, Resonance Retrieval,\\and a MatMul-Free Adapter}
+\author{Christian Heinrich Hohlfeld\\
+Konstanz, Germany\\
+\href{https://christianhohlfeld.com}{christianhohlfeld.com}\\
+ORCID: \href{https://orcid.org/0009-0003-6634-9045}{0009-0003-6634-9045}}
+\date{February 24, 2026}
+
+% theorem environments
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{assumption}{Assumption}[section]
+
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}{Proposition}[section]
+\newtheorem{corollary}{Corollary}[section]
+
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+
+% notation
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\set}[1]{\left\{ #1 \right\}}
+\newcommand{\ang}[1]{\left\langle #1 \right\rangle}
+\newcommand{\defeq}{\mathrel{\mathop:}=}
+
+\begin{document}
+\maketitle
+
+\vspace{-0.5em}
+\noindent
+\textbf{Rights.} \copyright\ 2026 Christian Heinrich Hohlfeld. All rights reserved.
+No license is granted to use, copy, modify, or distribute this work without prior written permission.
+
+\begin{abstract}
+We formalize a deterministic pipeline built from integer-only primitives:
+(1) a feature extractor and integer signature construction (HDR),
+(2) an inverted index and resonance scoring for retrieval (HRM),
+and (3) a matrix-multiplication-free (MatMul-free) adapter that selects outputs via deterministic
+integer scoring with explicit tie-breaking. We prove end-to-end determinism, candidate completeness,
+and stability properties under corpus extension. We also state correctness conditions under collision-free
+(or collision-detectable) hashing and provide worst-case complexity bounds.
+\end{abstract}
+
+\section{Scope and Design Goals}
+This paper formalizes a reproducible, integer-only retrieval and decision pipeline.
+The goals are:
+\begin{itemize}
+  \item \textbf{Determinism:} identical inputs yield identical outputs across runs.
+  \item \textbf{Integer arithmetic:} no floating point, no stochastic components, no probabilistic sampling.
+  \item \textbf{MatMul-free decision:} no dense matrix multiplication is required for the adapter.
+\end{itemize}
+
+\section{Deterministic Signatures (HDR)}
+Let $\Sigma$ be a finite alphabet and $\Sigma^\ast$ the set of finite sequences.
+
+\begin{definition}[Deterministic feature extractor]
+A feature extractor is a function $E:\Sigma^\ast \to \mathcal{F}^\ast$ mapping an input sequence
+to an \emph{ordered} list of discrete features in a feature universe $\mathcal{F}$.
+\end{definition}
+
+\begin{definition}[Integer key map]
+A key map is a deterministic function $H:\mathcal{F}\to\Z$ producing an integer key for each feature.
+\end{definition}
+
+\begin{assumption}[Deterministic preprocessing]\label{ass:det-pre}
+$E$ and $H$ are fixed and deterministic for a given system version.
+\end{assumption}
+
+\begin{definition}[Signature]
+For $x\in\Sigma^\ast$, define the (multi-)set signature
+\[
+S(x) \defeq \{\, H(f)\ :\ f \in E(x)\,\}.
+\]
+If multiplicities matter, interpret $S(x)$ as a multiset; otherwise as a set.
+\end{definition}
+
+\begin{remark}
+All later properties hold for sets; multisets require standard multiset-intersection definitions.
+\end{remark}
+
+\section{Inverted Index and Resonance Retrieval (HRM)}
+Let the corpus be $D=\{d_1,\dots,d_N\}\subseteq\Sigma^\ast$.
+
+\begin{definition}[Posting index]
+Define $B:\Z\to\mathcal{P}(\{1,\dots,N\})$ by
+\[
+B(k)\defeq \{\, i \in \{1,\dots,N\}\ :\ k \in S(d_i)\,\}.
+\]
+\end{definition}
+
+\begin{definition}[Resonance score]
+For query $q$ and item $d_i$, define
+\[
+R(q,i)\defeq \abs{S(q)\cap S(d_i)}.
+\]
+\end{definition}
+
+\begin{definition}[Candidate set]
+\[
+C(q)\defeq \bigcup_{k\in S(q)} B(k).
+\]
+\end{definition}
+
+\begin{lemma}[Candidate completeness]\label{lem:candidate}
+If $R(q,i)>0$, then $i\in C(q)$.
+\end{lemma}
+\begin{proof}
+$R(q,i)>0$ implies $S(q)\cap S(d_i)\neq\varnothing$, so there exists $k\in S(q)$ with $k\in S(d_i)$.
+Then $i\in B(k)$ by definition, hence $i\in \bigcup_{k\in S(q)}B(k)=C(q)$.
+\end{proof}
+
+\begin{definition}[Deterministic Top-$K$ with tie-break]\label{def:topk}
+Fix a total order $\prec$ on item ids (e.g.\ numeric id order).
+Let $\mathrm{TopK}(q)$ be the ordered list of the $K$ ids with largest $R(q,i)$
+computed over $i\in C(q)$, breaking ties by $\prec$.
+\end{definition}
+
+\begin{assumption}[Deterministic tie-break]\label{ass:tiebreak}
+The order $\prec$ is fixed and total.
+\end{assumption}
+
+\begin{theorem}[Deterministic retrieval]\label{thm:det-retrieval}
+Under Assumptions~\ref{ass:det-pre} and~\ref{ass:tiebreak}, $\mathrm{TopK}(q)$ is deterministic
+for fixed corpus $D$.
+\end{theorem}
+\begin{proof}
+By Assumption~\ref{ass:det-pre}, signatures $S(q)$ and $S(d_i)$ are uniquely determined, hence $R(q,i)$ is fixed.
+By Definition~\ref{def:topk}, selection of top scores with a fixed tie-break total order yields a unique list.
+\end{proof}
+
+\section{Deterministic Rendering}
+Each item id $i$ corresponds to a payload $p_i\in\Sigma^\ast$ (e.g.\ a chunk of text).
+
+\begin{definition}[Renderer]
+A renderer is a function $\mathrm{Render}:\Sigma^\ast\times(\Sigma^\ast)^K\to\Sigma^\ast$.
+\end{definition}
+
+\begin{assumption}[Deterministic renderer]\label{ass:render}
+$\mathrm{Render}$ is deterministic and uses a fixed formatting policy.
+\end{assumption}
+
+\begin{definition}[Context]
+Let $(i_1,\dots,i_K)=\mathrm{TopK}(q)$ and define
+\[
+\mathcal{C}(q)\defeq \mathrm{Render}\bigl(q,\,p_{i_1},\dots,p_{i_K}\bigr).
+\]
+\end{definition}
+
+\begin{theorem}[Deterministic context]\label{thm:det-context}
+Under Assumption~\ref{ass:render}, $\mathcal{C}(q)$ is deterministic given $(q, i_1,\dots,i_K)$.
+\end{theorem}
+\begin{proof}
+Fixed inputs into a deterministic function imply a fixed output.
+\end{proof}
+
+\section{MatMul-Free Adapter (Integer-Only Decision)}
+We model a MatMul-free adapter as an integer-only scoring rule.
+
+\begin{definition}[Integer feature map]
+Let $\Phi:\Sigma^\ast\to\Z^m$ be deterministic.
+\end{definition}
+
+\begin{definition}[Integer score]
+Fix $w\in\Z^m$. Define
+\[
+\mathrm{Score}(x)\defeq \sum_{j=1}^m w_j\cdot \Phi(x)_j.
+\]
+\end{definition}
+
+\begin{definition}[Deterministic selection]\label{def:select}
+Let $\mathcal{Y}$ be a finite candidate set (e.g.\ output symbols, templates, next-token set).
+Fix a total order $\prec_{\mathcal{Y}}$ on $\mathcal{Y}$ for tie-breaking.
+Define
+\[
+\mathrm{Select}(x)\defeq \arg\max_{y\in\mathcal{Y}} \bigl(\mathrm{Score}(x\Vert y),\, \prec_{\mathcal{Y}}\bigr),
+\]
+where $x\Vert y$ denotes concatenation.
+\end{definition}
+
+\begin{remark}
+The score uses only integer addition and multiplication. No sampling or floating-point is required.
+\end{remark}
+
+\section{Main Result: End-to-End Determinism}
+\begin{theorem}[End-to-end determinism]\label{thm:end2end}
+Assume \ref{ass:det-pre}, \ref{ass:tiebreak}, and \ref{ass:render}. Assume further that $\Phi,w,\mathcal{Y},\prec_{\mathcal{Y}}$
+are fixed and deterministic. Then
+\[
+\mathrm{Output}(q)\defeq \mathrm{Select}(\mathcal{C}(q))
+\]
+is deterministic for fixed corpus $D$ and payloads $(p_i)$.
+\end{theorem}
+\begin{proof}
+By Theorem~\ref{thm:det-retrieval}, $\mathrm{TopK}(q)$ is deterministic, hence $(i_1,\dots,i_K)$ is fixed.
+By Theorem~\ref{thm:det-context}, $\mathcal{C}(q)$ is fixed.
+Finally, Definition~\ref{def:select} applies a deterministic argmax with deterministic tie-break, yielding a unique output.
+\end{proof}
+
+\begin{proposition}[Idempotence]\label{prop:idempotence}
+For fixed inputs and fixed system version, repeated evaluations return the same output.
+\end{proposition}
+\begin{proof}
+Immediate from Theorem~\ref{thm:end2end}.
+\end{proof}
+
+\section{Correctness Conditions Under Hash Collisions}
+
+\begin{assumption}[Collision-free on observed features]\label{ass:injective}
+On the set of features that occur in the corpus and queries, $H$ is injective.
+\end{assumption}
+
+\begin{proposition}[Exact overlap preservation]\label{prop:overlap}
+Under Assumption~\ref{ass:injective} and set signatures,
+\[
+\abs{S(x)\cap S(y)} = \abs{\{f: f\in E(x)\}\cap \{g: g\in E(y)\}}
+\]
+for all $x,y\in\Sigma^\ast$.
+\end{proposition}
+\begin{proof}
+Injectivity implies $H(f)=H(g)\iff f=g$ on observed features. Therefore hashed-set intersection corresponds
+one-to-one with original-feature intersection, preserving cardinality.
+\end{proof}
+
+\begin{definition}[Collision-detectable keys]\label{def:pairkey}
+Define a collision-detectable key as a pair key $\tilde{H}(f)\defeq (H(f),\,\mathrm{ID}(f))$ where $\mathrm{ID}(f)$
+is a canonical deterministic encoding of the feature (or a second independent deterministic hash).
+\end{definition}
+
+\begin{proposition}[Determinism with collision detection]\label{prop:coll-detect}
+Replacing $H$ by $\tilde{H}$ (Definition~\ref{def:pairkey}) preserves determinism and restores exact overlap
+preservation even when $H$ collides.
+\end{proposition}
+\begin{proof}
+All steps remain deterministic. If two distinct features share $H(f)$, they differ in $\mathrm{ID}(f)$, hence
+$\tilde{H}(f)\neq \tilde{H}(g)$, making collisions impossible in the paired key space.
+\end{proof}
+
+\section{Stability Under Corpus Extension}
+
+\begin{proposition}[Monotone candidate expansion]\label{prop:monotone}
+Let $D'\supseteq D$ extend the corpus by adding new items without changing old ones.
+Then for any query $q$, $C_{D}(q)\subseteq C_{D'}(q)$.
+\end{proposition}
+\begin{proof}
+For each key $k$, the posting list in the extended corpus contains all prior ids plus possibly new ids.
+Taking unions over the same $S(q)$ preserves the subset relation.
+\end{proof}
+
+\section{Complexity Bounds}
+Let $m_x\defeq \abs{S(x)}$ and $m\defeq \max_i m_{d_i}$.
+
+\begin{proposition}[Index build]\label{prop:build}
+Index construction time is $O(\sum_{i=1}^N m_{d_i})$ and storage is $O(\sum_{i=1}^N m_{d_i})$.
+\end{proposition}
+\begin{proof}
+Each item contributes $m_{d_i}$ keys; each key updates one posting list entry.
+\end{proof}
+
+\begin{proposition}[Query]\label{prop:query}
+Candidate enumeration costs $O(\sum_{k\in S(q)} \abs{B(k)})$ in the worst case.
+Scoring costs $O(\abs{C(q)}\cdot m)$ in the uniform bound case.
+\end{proposition}
+
+\section{Implementation Checklist (Non-Normative)}
+To preserve determinism across platforms and runtimes:
+\begin{itemize}
+  \item canonicalize input normalization (byte-level or explicit Unicode normalization),
+  \item never rely on unspecified hash-map iteration order; sort keys before iteration when necessary,
+  \item define tie-break rules for all rankings and keep them versioned,
+  \item pin build flags for any native extensions; avoid nondeterministic kernels.
+\end{itemize}
+
+\section{Conclusion}
+We gave a self-contained formal model for deterministic integer signatures (HDR), resonance retrieval (HRM),
+and a MatMul-free adapter based on integer-only scoring. The main theorems establish end-to-end determinism,
+candidate completeness, stability under corpus extension, and clear correctness conditions under collision-free
+or collision-detectable keys.
+
+\begin{thebibliography}{9}
+\bibitem{hohlfeldsite}
+Christian Heinrich Hohlfeld.
+\newblock Author website and technical notes.
+\newblock \href{https://christianhohlfeld.com}{christianhohlfeld.com}, accessed 2026-02-24.
+\end{thebibliography}
+
+\end{document}

@@ -1,11 +1,16 @@
-Copyright (c) 2026 Christian Heinrich Hohlfeld
-All rights reserved.
+Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
+https://christianhohlfeld.com
+ORCID: https://orcid.org/0009-0003-6634-9045
+
+ALL RIGHTS RESERVED.
 
 This source code and all associated files in this repository are proprietary and protected by copyright law.
 
-Permission is not granted to use, copy, modify, merge, publish, distribute, sublicense, sell,
+No permission is granted to use, copy, modify, merge, publish, distribute, sublicense, sell,
 or create derivative works from this software, in whole or in part, without prior written permission
 from the copyright holder.
+
+No patent rights or licenses are granted by this notice.
 
 The software is provided "as is", without warranty of any kind, express or implied, including but not
 limited to the warranties of merchantability, fitness for a particular purpose and noninfringement.
@@ -15,3 +20,5 @@ software or the use or other dealings in the software.
 
 Third-party dependencies and components included or referenced by this repository remain subject to their
 respective licenses.
+
+For licensing inquiries: https://christianhohlfeld.com
