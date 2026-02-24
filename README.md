@@ -1,213 +1,135 @@
 # HRM FlashRenderer
 
-> **⚠️ All Rights Reserved — No License Granted**
-> Publicly viewable, but no permission is granted to use, copy, modify, or redistribute.
-> Licensing: [christianhohlfeld.com](https://christianhohlfeld.com) · ORCID: [0009-0003-6634-9045](https://orcid.org/0009-0003-6634-9045)
+**A superdeterministic hybrid retrieval and rendering system — invented and authored by [Christian Heinrich Hohlfeld](https://christianhohlfeld.com).**
 
-📄 **[Read the Paper → main.pdf](main.pdf)**
-*HDR/HRM and Resonant Sparse Attention: Deterministic Integer Signatures, Resonance Retrieval, and MatMul-Free Sequence Modeling*
+📄 **[Paper: HDR/HRM and Resonant Sparse Attention (PDF)](main.pdf)**
 
 ---
 
-## Original Invention by Christian Heinrich Hohlfeld
+## What This Is
 
-**Christian Heinrich Hohlfeld**, B.Sc.
-Born April 5, 1983, Frankfurt am Main, Germany.
-Software Engineering — Fachhochschule Konstanz & Universität Konstanz.
-[christianhohlfeld.com](https://christianhohlfeld.com)
+HRM FlashRenderer is a retrieval-augmented generation (RAG) stack built for VRAM-constrained environments. It runs large knowledge bases through a deterministic integer-only retrieval engine and feeds a tightly bounded context into a small local renderer — with zero stochastic elements and no dense matrix multiplication in the retrieval core.
 
-**Copyright © 2026 Christian Heinrich Hohlfeld. All rights reserved.**
-
-The underlying architecture, the concept of superdeterministic retrieval (HDR/HRM), and the entire MatMul-free, stochastic-free approach are an **original invention** by Christian Heinrich Hohlfeld.
-Any use, reproduction, modification, or redistribution requires explicit written consent and must clearly credit the inventor by name.
-
-Prior published works by the same author:
-- [Hohlfeld Data Representation (HDR) Method (2024)](https://christianhohlfeld.com/12_07_2024_Hohlfeld_Data_Representation_HDR_Method.pdf)
-- [PhO-Compress: Framework for Optical LLM Context Compression](https://christianhohlfeld.com/Christian_Heinrich_Hohlfeld_Konstanz_PhO-Compress_v2.pdf)
+The result: identical inputs always produce identical outputs, on any machine, without a GPU.
 
 ---
 
-## First Principles
-
-This system rests on the fundamental insight that large knowledge bases do not need to be encoded in stochastic weight matrices. Instead, knowledge can be held in **deterministic, integer-based structures on persistent storage**, while only a minimally-sized, precisely pre-selected context is passed to a highly optimised renderer.
-
-Core principles of this invention:
-
-- **Full determinism guarantee** in retrieval — proven mathematically in `main.pdf`
-- **No MatMul, no floating-point arithmetic** in the retrieval core
-- **No probability estimation, no stochasticity** anywhere in the pipeline
-- **Minimal VRAM** through strict context bounding
-- **Maximum reproducibility**: identical input → identical output, across platforms and runs
-
----
-
-## Architecture
+## Core Architecture
 
 ```
 Query
-  │
-  ▼
-Signature          ← FNV-1a-64, word-trigrams + char-5grams → 2048 quantised bins (4-bit, 16 levels)
-  │
-  ▼
-Router Index       ← Level-weighted inverted posting scan (integer scores only)
-  │
-  ▼
-Candidate Fetch    ← SQLite snippet store
-  │
-  ▼
-Overlap Scoring    ← Quantised min-sum over 2048 packed bins (integer)
-  │
-  ▼
-MMR Selection      ← Integer Maximal Marginal Relevance (λ_num=7, λ_den=10)
-  │
-  ▼
-Prompt Builder     ← Deterministic token-budget fitting via binary search
-  │
-  ▼
-Renderer           ← Local LLM, greedy decoding (temp=0, top-k=1), 0 VRAM default
+  ↓
+FNV-1a-64 Signature   (2048 quantised bins, 4-bit, word-trigrams + char-5grams)
+  ↓
+Level-Weighted Router Index   (inverted posting scan, integer scores)
+  ↓
+Candidate Fetch   (SQLite snippet store)
+  ↓
+Quantised Overlap Scoring   (min-sum over packed 4-bit bins)
+  ↓
+Integer MMR Selection   (λ_num=7, λ_den=10, lexicographic tie-break)
+  ↓
+Deterministic Prompt Budget   (binary search on token counts)
+  ↓
+Local LLM Renderer   (greedy decoding, 0 VRAM default)
 ```
 
-### Components
-
-| Directory | Language | Role |
-|---|---|---|
-| `hrm_core/` | C++17 | **Core invention** — signature, router index, overlap scorer, MMR, CLI |
-| `hrm_flash/` | Python 3.10+ | CLI, HTTP service, daemon, prompt builder |
-| `engine/` | Python | Tensor-parallel HF model generation (world size 2/3/4) |
-| `flashattention_custom/` + `csrc/` | CUDA/C++ | Custom FlashAttention kernel (SM75, WMMA Tensor Cores) |
-| `renderer/` | Python | llama.cpp renderer entrypoints |
-| `tp/` | Python | Tensor-parallel utilities (norm, linear, vocab parallel) |
-| `scripts/` | Shell | Build, serve, bootstrap helpers |
-| `docs/` | Markdown | `INTEGRATION.md` — HTTP, daemon, embedded HRM |
+Formal proofs of determinism, candidate completeness, and MMR correctness are in [`main.pdf`](main.pdf).
 
 ---
 
-## Requirements
+## Repository Layout
 
-- Linux (recommended) or Windows (`compile.bat` included)
-- Python 3.10+
-- CMake + C++17 toolchain for `hrm_core`
-- SQLite3 dev libs
-- CUDA toolkit + NVCC (`sm_75`) for the FlashAttention extension *(optional)*
+| Path | Language | Purpose |
+|---|---|---|
+| `hrm_core/` | C++17 | Retrieval core: signature, router index, overlap scorer, MMR, CLI |
+| `hrm_flash/` | Python 3.10+ | CLI, HTTP API, daemon, prompt builder |
+| `engine/` | Python | Tensor-parallel HF model generation (world size 2/3/4) |
+| `flashattention_custom/` + `csrc/` | CUDA / C++ | Custom FlashAttention kernel (SM75, WMMA Tensor Cores) |
+| `renderer/` | Python | llama.cpp renderer entrypoints |
+| `tp/` | Python | Tensor-parallel utilities |
+| `docs/INTEGRATION.md` | Markdown | HTTP, daemon, and embedded HRM integration guide |
+
+---
+
+## Quickstart
 
 ```bash
-python -m pip install -r requirements.prod.txt
-python -m pip install -r requirements.server.txt
-```
-
-## Installation
-
-```bash
+# Install
 git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
 cd hrm_flashrenderer
+pip install -r requirements.prod.txt
 pip install -e .
 make build
-```
 
-Registered entry points: `hrm-flash`, `hrm-flashd`, `hrm-flash-serve`, `flash-kernel-test`, `flash-append-test`.
-
----
-
-## Minimal End-to-End Example
-
-```bash
-# 1. Prepare payloads
-hrm_core/build/hrm prep --input input.txt --out payloads.jsonl --cluster-size 200
-
-# 2. Build model index
+# Index a corpus
+hrm_core/build/hrm prep  --input input.txt --out payloads.jsonl --cluster-size 200
 hrm_core/build/hrm build --payloads payloads.jsonl --outdir model
 
-# 3. Full pipeline (CPU renderer, 0 VRAM)
+# Generate (CPU-only, 0 VRAM)
 hrm-flash generate \
   --hrm_model ./model \
   --llm_model /path/to/model.gguf \
-  --prompt "Your question here" \
-  --world 2 \
+  --prompt "Your question" \
   --max_new_tokens 512
 ```
 
 ## Operation Modes
 
-**Daemon** (warm model, low latency):
+**Persistent daemon** (warm model, low latency):
 ```bash
 hrm-flash daemon --model /path/to/hf-model --world 2 --port 5555 --local_files_only
 ```
 
 **HTTP API**:
 ```bash
-hrm-flash serve --hrm_model ./model --llm_model /path/to/hf-model --world 2 --port 8080
+hrm-flash serve --hrm_model ./model --llm_model /path/to/hf-model --port 8080
 curl -s http://127.0.0.1:8080/v1/generate -H 'Content-Type: application/json' \
   -d '{"prompt":"...","max_new_tokens":128}'
 ```
 
 ---
 
-## Determinism Guarantees
+## Key Parameters
 
-| Stage | Guarantee |
+| Flag | Description |
 |---|---|
-| Signature | FNV-1a-64, fixed word/char n-gram extraction, no RNG |
-| Router Index | Integer level-weighted scores, ties broken by `cid` ascending |
-| Overlap scoring | Integer min-sum over packed 4-bit bins |
-| MMR | Integer objective, ties broken by `sid` lexicographic order |
-| Prompt budget | Binary search on token counts under a fixed tokeniser |
-| Renderer | Greedy decoding (temp=0), fixed seed, CPU path |
-
-See `main.pdf` for full formal proofs.
-
----
-
-## Key CLI Parameters
-
-| Parameter | Description |
-|---|---|
-| `--top_k` | Router: top chunk clusters |
-| `--top_m` | Candidates passed to MMR (default 400) |
-| `--k` | Final snippets selected by MMR (default 8) |
+| `--top_k` / `--top_m` / `--k` | Router → candidates → MMR final snippets |
 | `--max_sources` / `--max_chars_per_source` | Source budget |
 | `--max_seq_len` / `--reserve_prompt_tokens` | Token budget |
-| `--max_new_tokens` | Max tokens to generate |
-| `--world` | Tensor-parallel world size (1/2/3/4) |
-| `--local_files_only` | Prevent model downloads |
+| `--world` | Tensor-parallel world size (1 / 2 / 3 / 4) |
+| `--local_files_only` | Disable model downloads |
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
+| Issue | Fix |
 |---|---|
-| TP world size error | Check model head/shard compatibility and `--world` |
-| HRM binary not found | Build `hrm_core` or set `--hrm_bin` |
-| CUDA extension build fails | Match CUDA toolkit, NVCC/arch (`sm_75`), PyTorch version |
-| Prompt too long | Reduce `--max_sources`, `--max_chars_per_source`, `--max_seq_len` |
+| HRM binary not found | Run `make build` or set `--hrm_bin` |
+| CUDA extension build fails | Match CUDA toolkit, NVCC arch (`sm_75`), and PyTorch version |
+| TP world size error | Check model head/shard compatibility with `--world` |
+| Prompt too long | Reduce `--max_sources`, `--max_chars_per_source`, or `--max_seq_len` |
 
 ---
 
-## Legal
+## Further Reading
 
-All source code, methods, algorithms, and documentation in this repository are the **sole intellectual property of Christian Heinrich Hohlfeld** (Konstanz, Germany).
-
-**All rights reserved. No license is granted** to use, copy, modify, merge, publish, distribute, sublicense, or sell this work — in whole or in part — without prior explicit written permission from the author.
-
-Any use, reproduction, or distribution must clearly credit the inventor by name. No patent rights or licenses are granted by this notice. For licensing inquiries, contact the author directly.
-
-See `LICENSE` · `COPYRIGHT.md` · `NOTICE` for full terms.
-Third-party dependencies retain their respective licenses.
+- `docs/INTEGRATION.md` — HTTP, daemon, and embedded HRM integration
+- `hrm_core/README.md` — C++ retrieval core documentation
+- `STACK.md` — Architecture overview
+- [`main.pdf`](main.pdf) — Formal paper with proofs
 
 ---
 
-*This entire system and the underlying architecture are an original invention by Christian Heinrich Hohlfeld.*
-*— Christian Heinrich Hohlfeld, February 2026*
+## License & Rights
+
+© 2026 Christian Heinrich Hohlfeld. All rights reserved.
+No permission is granted to use, copy, modify, or redistribute this work without prior written consent.
+See [`LICENSE`](LICENSE), [`COPYRIGHT.md`](COPYRIGHT.md), and [`NOTICE`](NOTICE).
 
 ---
 
-**Author**
+**Christian Heinrich Hohlfeld**, B.Sc. — Independent Researcher & Senior Software Engineer, Konstanz, Germany
 
-**Christian Heinrich Hohlfeld**, B.Sc.
-Independent Researcher & Senior Software Engineer
-Konstanz, Germany
-
-🌐 [christianhohlfeld.com](https://christianhohlfeld.com)
-🔬 ORCID: [0009-0003-6634-9045](https://orcid.org/0009-0003-6634-9045)
-💼 [linkedin.com/in/christian-hohlfeld](https://www.linkedin.com/in/christian-hohlfeld/)
+[christianhohlfeld.com](https://christianhohlfeld.com) · [ORCID 0009-0003-6634-9045](https://orcid.org/0009-0003-6634-9045) · [LinkedIn](https://www.linkedin.com/in/christian-hohlfeld/)
