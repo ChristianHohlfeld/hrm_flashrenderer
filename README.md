@@ -44,7 +44,8 @@ I’m Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
 Full honesty: I’m not a traditional CUDA kernel veteran or ninja.
 What I do really well is guide AI precisely towards my goals — and turn ideas into clean, working, performant code very fast.
 Proof: In just a few days I built & open-sourced
-hrm_flashrenderer → https://github.com/ChristianHohlfeld/hrm_flashrenderer
+hrm_flashrenderer → 
+https://github.com/ChristianHohlfeld/hrm_flashrenderer 
 (including my own SM75 FlashAttention kernel with paged KV + append).
 I want to bring this direct, pragmatic way of working to xAI.
 Ready to relocate to Bay Area / Seattle tomorrow.
