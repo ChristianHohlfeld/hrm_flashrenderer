@@ -1,22 +1,26 @@
 # HRM FlashRenderer
 
-**A superdeterministic hybrid retrieval and rendering system — invented and authored by [Christian Heinrich Hohlfeld](https://christianhohlfeld.com).**
+*Invented and authored by **[Christian Heinrich Hohlfeld](https://christianhohlfeld.com)** · [ORCID 0009-0003-6634-9045](https://orcid.org/0009-0003-6634-9045) · Konstanz, Germany*
 
-📄 **[Paper: HDR/HRM and Resonant Sparse Attention (PDF)](main.pdf)**
+📄 **[Paper → main.pdf](main.pdf)** — HDR/HRM and Resonant Sparse Attention: formal proofs of determinism, candidate completeness, and MMR correctness.
+
+---
+
+## First Principles
+
+Most retrieval-augmented generation systems move two large weights into GPU memory and hope the context fits. This system takes the opposite approach.
+
+Knowledge lives in a deterministic on-disk index. The retrieval core — built entirely on bounded integer arithmetic — selects a tightly bounded context without any floating-point operations, matrix multiplications, or random sampling. Only that context reaches the renderer.
+
+The result is a system where the retrieval decision is **formally provable** and the renderer needs **zero VRAM** by default. Identical queries produce identical results, on any machine, every time — at least for the retrieval layer where it matters most.
 
 ---
 
 ## What This Is
 
-HRM FlashRenderer is a retrieval-augmented generation (RAG) stack built for VRAM-constrained environments. The retrieval core is fully deterministic and integer-only. A tightly bounded context is passed to a small local renderer — keeping VRAM usage minimal and outputs reproducible.
+HRM FlashRenderer is a retrieval-augmented generation (RAG) stack. The `hrm_core/` retrieval engine is integer-only and MatMul-free; a bounded context is passed to a small local renderer that can run CPU-only with zero VRAM.
 
-**Scope of "MatMul-free" and "deterministic":**
-
-> The **HDR/HRM retrieval and routing core** (`hrm_core/`) contains no dense matrix multiplication and no floating-point arithmetic. All operations are bounded integer arithmetic.
->
-> The **renderer** (LLM inference stage) may use standard matrix operations internally. Determinism of the renderer output is guaranteed only under the CPU path with greedy decoding and a fixed seed; GPU inference may vary across hardware and driver versions.
-
-Formal proofs of retrieval determinism, candidate completeness, and MMR correctness are in [`main.pdf`](main.pdf).
+> **Scope note.** "MatMul-free" and "deterministic" apply to the **HDR/HRM retrieval core** (`hrm_core/`). The renderer (LLM inference) may use standard matrix operations; its determinism is guaranteed only on the CPU path with greedy decoding and a fixed seed — GPU inference may vary across hardware and drivers.
 
 ---
 
