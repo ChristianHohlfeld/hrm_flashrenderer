@@ -12,6 +12,29 @@ from hrm_flash.flash_daemon_client import parse_daemon_addr, generate as daemon_
 from hrm_flash.utils import find_hrm_binary, validate_tp_world
 
 
+def _ensure_llm_model(model_str: str, local_files_only: bool = False) -> Path:
+    """Ensure model_str points to a local directory. If not, try HF download."""
+    p = Path(model_str)
+    if p.is_dir():
+        return p.resolve()
+
+    # Not a local dir, try HF Hub download
+    try:
+        from huggingface_hub import snapshot_download
+        print(f"[*] Model '{model_str}' not found locally. Attempting HF Hub download...")
+        # We download config + safetensors.
+        path = snapshot_download(
+            repo_id=model_str,
+            local_files_only=local_files_only,
+            allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt"]
+        )
+        return Path(path).resolve()
+    except Exception as e:
+        if local_files_only:
+            raise SystemExit(f"ERR: Model '{model_str}' not found locally and --local_files_only is set.")
+        raise SystemExit(f"ERR: Failed to resolve/download model '{model_str}': {e}")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="hrm-flash", description="HRM-FlashRenderer v5.1.0 (HRM retrieval + persistent FlashAttention TP renderer)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -116,7 +139,7 @@ def main():
         repo_root = Path(__file__).resolve().parents[1]
         hrm_bin = find_hrm_binary(repo_root=repo_root, explicit=args.hrm_bin)
         hrm_model = Path(args.hrm_model).resolve()
-        llm_model = Path(args.llm_model).resolve()
+        llm_model = _ensure_llm_model(args.llm_model, local_files_only=bool(args.local_files_only))
 
         # Validate TP compatibility early (production behavior: fail fast with clear error)
         if args.world is not None:

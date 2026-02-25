@@ -41,7 +41,11 @@ class WeightLoader:
         self.model_dir = model_dir
         self.index = _find_index(model_dir)
         if self.index is None:
-            raise RuntimeError(f"No safetensors weights found in {model_dir} (need model.safetensors or index.json)")
+            raise RuntimeError(
+                f"No safetensors weights found in {model_dir}.\n"
+                f"Make sure the directory contains 'model.safetensors' or 'model.safetensors.index.json'.\n"
+                f"Note: GGUF models are not supported by hrm-flash generate (use renderer/hrm_render.py instead)."
+            )
         self._open = {}
 
     def _file_for_key(self, key: str) -> str:
