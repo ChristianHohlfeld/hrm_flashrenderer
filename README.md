@@ -3,7 +3,7 @@
 **Applied to xAI - Member of Technical Staff Inference**  
 *February 24, 2026*
 
-This repository is my live portfolio, showcasing a high-performance LLM inference stack. It demonstrates a high-leverage development model: **original architectural concepts and core algorithms, implemented through precision-guided AI orchestration.**
+This repository showcases my **original invention: the HRM (Hash Retrieval Model)**. It demonstrates my capacity for **deep technical innovation**—from the underlying architecture to custom CUDA kernels—implemented through a high-leverage **AI-augmented engineering workflow** for extreme execution speed.
 
 ## Why HRM-Flash?
 
