@@ -102,7 +102,12 @@ hrm_core/build/hrm build --payloads payloads.jsonl --outdir ./model
 ### 2. Run inference
 
 ``` bash
-CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --prompt "Your question"   --n_gpu_layers 50
+CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py \
+   --model ./model \
+   --hrm_bin hrm_core/build/hrm \
+   --llm ./model.gguf \
+   --prompt "Your question" \
+   --n_gpu_layers 50
 ```
 
 If this runs without crashing, your environment is correctly configured.
