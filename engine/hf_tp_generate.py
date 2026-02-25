@@ -101,7 +101,9 @@ def _run_generate(rank: int, args: dict):
     )
 
     if rank == 0:
-        text = tokenizer.decode(out[0].tolist(), skip_special_tokens=True)
+        # Final safety check: ensure all tokens are long before decoding.
+        tokens = out[0].to(device="cpu", dtype=torch.long).tolist()
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
         print(text)
 
 

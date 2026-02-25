@@ -162,15 +162,9 @@ def main():
         # Validate TP compatibility early (production behavior: fail fast with clear error)
         if args.world is not None:
             try:
-                # Ensure torch.types is available for newer transformers versions
-                import torch
-                try:
-                    import torch.types
-                except ImportError:
-                    pass
                 from transformers import AutoConfig
             except ImportError as e:
-                raise SystemExit(f"ERR: transformers or torch is required for --world validation: {e}")
+                raise SystemExit(f"ERR: transformers is required for --world validation: {e}")
             except Exception as e:
                 raise SystemExit(f"ERR: Failed to initialize transformers: {e}")
             cfg = AutoConfig.from_pretrained(str(llm_model), local_files_only=bool(args.local_files_only))
@@ -201,14 +195,9 @@ def main():
         # If sources are empty, budgeting is unnecessary and we'd still want --print_prompt to work.
         if (not args.disable_token_budget) and sources_for_prompt:
             try:
-                import torch
-                try:
-                    import torch.types
-                except ImportError:
-                    pass
                 from transformers import AutoTokenizer
             except ImportError as e:
-                raise SystemExit(f"ERR: transformers or torch is required for token budgeting: {e}")
+                raise SystemExit(f"ERR: transformers is required for token budgeting: {e}")
             except Exception as e:
                 raise SystemExit(f"ERR: Failed to initialize tokenizer: {e}")
             tok = AutoTokenizer.from_pretrained(str(llm_model), local_files_only=bool(args.local_files_only))
@@ -251,4 +240,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

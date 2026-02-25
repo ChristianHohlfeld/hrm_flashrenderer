@@ -332,7 +332,7 @@ def greedy_select_token_distributed(local_logits: torch.Tensor) -> torch.Tensor:
     for b in range(win_idx.numel()):
         dist.broadcast(win_idx[b:b+1], src=int(winner_rank[b].item()))
 
-    return win_idx + winner_rank * local_logits.size(-1)
+    return (win_idx + winner_rank * local_logits.size(-1)).to(torch.long)
 
 
 @torch.no_grad()
@@ -353,7 +353,14 @@ def generate_tp(model: TPLlamaForCausalLM, input_ids: torch.Tensor, max_new_toke
         last = h[:, -1, :]
         cur_len = end
 
-    assert last is not None
+    if last is None:
+        # If T0 is 0 or prefill failed, we still need a 'last' token to start decoding.
+        # This is a safety fallback to prevent crash.
+        if T0 > 0:
+            raise RuntimeError(f"Generation failed: prefill loop did not produce hidden states for T0={T0}")
+        # If T0 is 0, we use a zero tensor or similar as a placeholder, though hrm-flash should prevent T0=0.
+        last = torch.zeros((B, model.hidden), device=input_ids.device, dtype=torch.float16)
+
     out_ids = [input_ids]
 
     # decode
