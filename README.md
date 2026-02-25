@@ -90,8 +90,13 @@ This is the most reliable way to run the system on 2×11GB GPUs.
 ### 1. Build the retrieval index
 
 ``` bash
-hrm_core/build/hrm prep --input your_data.txt --out payloads.jsonl
-hrm_core/build/hrm build --payloads payloads.jsonl --outdir model_index
+# 1. Download example data (Shakespeare + Small LLM)
+curl -L -o input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+curl -L -o model.gguf https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
+
+# 2. Prepare and build the HRM index
+hrm_core/build/hrm prep --input input.txt --out payloads.jsonl --cluster-size 200
+hrm_core/build/hrm build --payloads payloads.jsonl --outdir ./model
 ```
 
 ### 2. Run inference
@@ -135,12 +140,6 @@ This reduces VRAM pressure and allows operation near hardware limits.
 
   PEP 668 externally-managed-environment       Use a virtual environment
                                                (`python3 -m venv .venv`)
-
-  No space left on device                      Check `df -h`
-
-  HRM query failed (code=2)                    Rebuild the index
-
-  Model path does not exist                    Use an absolute path
 
   OOM                                          Reduce `--max_seq_len` or GPU
                                                layers
