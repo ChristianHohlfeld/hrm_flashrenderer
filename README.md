@@ -3,7 +3,7 @@
 **Applied to xAI - Member of Technical Staff Inference**  
 *February 24, 2026*
 
-This repository showcases my **original invention: the HRM (Hash Retrieval Model)**. It demonstrates my capacity for **deep technical innovation**—from the underlying architecture to custom CUDA kernels—implemented through a high-leverage **AI-augmented engineering workflow** for extreme execution speed.
+This repository showcases my **original invention: the HRM (Hash Retrieval Model)**. It demonstrates the underlying architecture and a custom CUDA kernel implemented using Agentic Coding. 
 
 ## Why HRM-Flash?
 
