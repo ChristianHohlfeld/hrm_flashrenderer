@@ -165,9 +165,6 @@ This reduces VRAM pressure and allows operation near hardware limits.
 
   hrm binary not found                         Set `--hrm_bin hrm_core/build/hrm`
                                                
-  `No module named 'torch.types'`              Ensure you are using the virtual 
-                                               environment (`.venv/bin/python`)
-                                               
   GPU Command hangs (`nvidia-smi` hangs)      Kernel/Driver issue. Try a reboot 
                                                or use `--device cpu` for testing
   --------------------------------------------------------------------------------
