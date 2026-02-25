@@ -149,28 +149,6 @@ This reduces VRAM pressure and allows operation near hardware limits.
 
 ------------------------------------------------------------------------
 
-## Troubleshooting
-
-  --------------------------------------------------------------------------------
-  Problem                                      Fix
-  -------------------------------------------- -----------------------------------
-  Could NOT find SQLite3                       `sudo apt install libsqlite3-dev`
-                                               then `make build`
-
-  PEP 668 externally-managed-environment       Use a virtual environment
-                                               (`python3 -m venv .venv`)
-
-  OOM                                          Reduce `--max_seq_len` or GPU
-                                               layers
-
-  hrm binary not found                         Set `--hrm_bin hrm_core/build/hrm`
-                                               
-  GPU Command hangs (`nvidia-smi` hangs)      Kernel/Driver issue. Try a reboot 
-                                               or use `--device cpu` for testing
-  --------------------------------------------------------------------------------
-
-------------------------------------------------------------------------
-
 ## Disclaimer
 
 I'm Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
