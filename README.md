@@ -5,13 +5,13 @@
 
 This repository is my live portfolio, showcasing a high-performance LLM inference stack designed for efficiency and extreme environments.
 
-## The Core Philosophy
-This stack focuses on **architectural reliability** and **resource efficiency** by decoupling knowledge from compute:
+## Why HRM-Flash?
 
-- **Decoupled Knowledge & Compute:** The **HRM Core** (C++17) handles retrieval as a deterministic process, while the LLM acts purely as a renderer. This allows tiny models to outperform giants in factual accuracy.
-- **Deterministic Grounding:** Every output is validated against the source index. If the LLM halluzinates or misses a quote, the system detects it and falls back to a safe, extractive mode.
-- **Custom SM75 FlashAttention:** Natively integrated CUDA kernels for Tensor Parallel inference, ensuring the hardware is utilized to its limit without heavy frameworks.
-- **Hardware-Agnostic Scaling:** The same indexed knowledge base works across **Zero-VRAM (CPU)** and **High-Performance (GPU)** environments.
+This stack is built on three pillars of **vertical integration** and **architectural reliability**:
+
+1.  **Full-Integrity Grounding (HRM Core):** Unlike standard vector-based RAG, the **HRM Core** (C++17) uses a deterministic, integer-only indexing engine. This ensures 100% control over the retrieval set, serving as a "Single Source of Truth" that prevents LLM hallucinations through explicit citation validation.
+2.  **Native CUDA Optimization:** Instead of relying on heavy, generic frameworks, this project natively integrates a **custom SM75 FlashAttention kernel** (`csrc/flash_attn_sm75.cu`). It is specifically tuned for Turing-architecture GPUs (e.g., T4, 2080 Ti), implementing paged KV cache and optimized append operations directly.
+3.  **Decoupled Knowledge & Compute:** The architecture strictly separates the knowledge base (Index) from the reasoning engine (LLM). This allows for hardware-agnostic scaling: run the same indexed data on **Zero-VRAM CPU setups** for reliability, or scale to **Multi-GPU Tensor Parallel clusters** for high-throughput production.
 
 ## Prerequisites
 - **GPU:** NVIDIA SM75 (T4, RTX 20-series) or better for FlashAttention.
