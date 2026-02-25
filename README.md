@@ -146,22 +146,25 @@ This reduces VRAM pressure and allows operation near hardware limits.
                                                layers
 
   hrm binary not found                         Set `--hrm_bin hrm_core/build/hrm`
-  --------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
 
 ------------------------------------------------------------------------
 
 ## Disclaimer
 
 I'm Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
+Full honesty: I’m not a traditional CUDA kernel veteran or ninja. 
+I guide AIs precisely towards my goals — and turn ideas into clean,
+working, performant code very fast.
 
 The underlying idea behind HRM, the architectural decisions and ideas,
-and the papers that led to it are my work.
+and the papers that led to it are my own work.
 
 I built and open-sourced **hrm_flashrenderer** to address a concrete
 hardware constraint: running large models on legacy 11GB GPUs.
 
 The implementation was developed using Agentic Coding. I defined the
-mathematical constraints, system architecture, and verification
+software architecture and its constraints, system architecture, and verification
 criteria. Large parts of the code --- including the SM75 FlashAttention
 kernel --- were generated and iteratively refined using LLMs under my
 direction.
