@@ -139,14 +139,40 @@ def main():
         repo_root = Path(__file__).resolve().parents[1]
         hrm_bin = find_hrm_binary(repo_root=repo_root, explicit=args.hrm_bin)
         hrm_model = Path(args.hrm_model).resolve()
+
+        # Fail fast: validate HRM model directory early
+        if not (hrm_model / "router_index.bin").is_file() or not (hrm_model / "index.sqlite").is_file():
+            raise SystemExit(f"ERR: HRM model directory must contain router_index.bin and index.sqlite: {hrm_model}")
+
+        # Fail fast: check CUDA if not explicitly using CPU
+        if args.device != "cpu":
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    print("WARN: CUDA not available. Results might be slow or fail if GPU is required.")
+                elif torch.cuda.device_count() == 0:
+                    print("WARN: torch reports 0 CUDA devices.")
+            except ImportError:
+                raise SystemExit("ERR: torch is not installed. Required for LLM operations.")
+            except Exception as e:
+                print(f"WARN: Error checking CUDA: {e}")
+
         llm_model = _ensure_llm_model(args.llm_model, local_files_only=bool(args.local_files_only))
 
         # Validate TP compatibility early (production behavior: fail fast with clear error)
         if args.world is not None:
             try:
+                # Ensure torch.types is available for newer transformers versions
+                import torch
+                try:
+                    import torch.types
+                except ImportError:
+                    pass
                 from transformers import AutoConfig
+            except ImportError as e:
+                raise SystemExit(f"ERR: transformers or torch is required for --world validation: {e}")
             except Exception as e:
-                raise SystemExit(f"ERR: transformers is required for --world validation: {e}")
+                raise SystemExit(f"ERR: Failed to initialize transformers: {e}")
             cfg = AutoConfig.from_pretrained(str(llm_model), local_files_only=bool(args.local_files_only))
             validate_tp_world(cfg, int(args.world))
 
@@ -175,9 +201,16 @@ def main():
         # If sources are empty, budgeting is unnecessary and we'd still want --print_prompt to work.
         if (not args.disable_token_budget) and sources_for_prompt:
             try:
+                import torch
+                try:
+                    import torch.types
+                except ImportError:
+                    pass
                 from transformers import AutoTokenizer
+            except ImportError as e:
+                raise SystemExit(f"ERR: transformers or torch is required for token budgeting: {e}")
             except Exception as e:
-                raise SystemExit(f"ERR: transformers is required for token budgeting: {e}")
+                raise SystemExit(f"ERR: Failed to initialize tokenizer: {e}")
             tok = AutoTokenizer.from_pretrained(str(llm_model), local_files_only=bool(args.local_files_only))
             max_prompt_tokens = int(args.max_seq_len) - int(args.max_new_tokens) - int(args.reserve_prompt_tokens)
             if max_prompt_tokens <= 64:

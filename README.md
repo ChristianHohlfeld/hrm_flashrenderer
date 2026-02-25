@@ -122,8 +122,19 @@ Use this only if you have sufficient VRAM and CUDA properly configured.
 export HUGGING_FACE_HUB_TOKEN=hf_XXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ```
 ``` bash
-hrm-flash generate   --hrm_model model_index   --llm_model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "What's the meaning of life?"
+# 1. Start the TP daemon (optional, for low latency)
+# hrm-flash daemon --model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4 --world 2
+
+# 2. Run generate (uses 'model' dir created in build step)
+hrm-flash generate \
+   --hrm_model ./model \
+   --llm_model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4 \
+   --world 2 \
+   --prompt "What's the meaning of life?"
 ```
+
+> [!TIP]
+> Use `--device cpu` to test the pipeline without CUDA. The CLI now performs early validation of HRM models to prevent silent hangs.
 
 ------------------------------------------------------------------------
 
@@ -153,7 +164,13 @@ This reduces VRAM pressure and allows operation near hardware limits.
                                                layers
 
   hrm binary not found                         Set `--hrm_bin hrm_core/build/hrm`
---------------------------------------------------------------------------------
+                                               
+  `No module named 'torch.types'`              Ensure you are using the virtual 
+                                               environment (`.venv/bin/python`)
+                                               
+  GPU Command hangs (`nvidia-smi` hangs)      Kernel/Driver issue. Try a reboot 
+                                               or use `--device cpu` for testing
+  --------------------------------------------------------------------------------
 
 ------------------------------------------------------------------------
 

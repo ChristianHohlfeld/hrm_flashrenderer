@@ -16,10 +16,9 @@ class HRMQueryResult:
 
 
 def run_hrm_query_via_api(repo_root: Path | None, model_dir: Path, prompt: str, top_k: int, top_m: int, k: int) -> HRMQueryResult | None:
-    """Fast path: use libhrm_api.so via ctypes if available.
+    if not (model_dir / "router_index.bin").is_file() or not (model_dir / "index.sqlite").is_file():
+        return None
 
-    Returns None if the shared lib is not available.
-    """
     try:
         from hrm_flash.hrm_api import HRMHandle
     except Exception:
