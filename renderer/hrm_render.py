@@ -170,7 +170,7 @@ def render_with_llama_cpp(
 
 def main():
     ap = argparse.ArgumentParser(description="HRM front layer + small GGUF renderer (deterministic).")
-    ap.add_argument("--hrm_bin", default="../hrm_core/build/hrm", help="Path to built hrm binary")
+    ap.add_argument("--hrm_bin", default=None, help="Path to built hrm binary. If omitted, checks hrm_core/build/hrm relative to CWD or script.")
     ap.add_argument("--model", required=True, help="HRM model directory (router_index.bin + index.sqlite)")
     ap.add_argument("--prompt", help="Single prompt (non-interactive). If omitted, starts REPL.")
     ap.add_argument("--llm", required=True, help="Path to local GGUF model (small renderer)")
@@ -190,12 +190,26 @@ def main():
 
     args = ap.parse_args()
 
-    hrm_bin = os.path.abspath(args.hrm_bin)
+    hrm_bin = args.hrm_bin
+    if hrm_bin is None:
+        # Try relative to CWD (running from root)
+        cand1 = os.path.join("hrm_core", "build", "hrm")
+        # Try relative to script (running from renderer/)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cand2 = os.path.join(os.path.dirname(script_dir), "hrm_core", "build", "hrm")
+        
+        if os.path.isfile(cand1):
+            hrm_bin = os.path.abspath(cand1)
+        elif os.path.isfile(cand2):
+            hrm_bin = os.path.abspath(cand2)
+        else:
+            hrm_bin = os.path.abspath("hrm_core/build/hrm") # Fallback for error message
+
     model_dir = os.path.abspath(args.model)
     gguf = os.path.abspath(args.llm)
 
     if not os.path.isfile(hrm_bin):
-        raise SystemExit(f"hrm binary not found: {hrm_bin} (build it first: cmake -S hrm_core -B hrm_core/build && cmake --build hrm_core/build -j)")
+        raise SystemExit(f"hrm binary not found: {hrm_bin}\nBuild it first: cmake -S hrm_core -B hrm_core/build && cmake --build hrm_core/build -j")
 
     def one(prompt: str):
         hrm = run_hrm_query(hrm_bin, model_dir, prompt, args.top_k, args.top_m, args.k, args.lam_num, args.lam_den)

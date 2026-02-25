@@ -1,10 +1,29 @@
 # build artifacts
 hrm_core/build/
+build/
+dist/
+*.egg-info/
+
+# Indexing & Data
 model/
+model_index*/
+input.txt
 payloads.jsonl
-*.sqlite
+real_payloads.jsonl
+
+# Models
+*.gguf
 *.bin
-*.jsonl
+*.pt
+*.safetensors
+
+# Database & Logs
+*.sqlite
 *.log
+
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+.env
