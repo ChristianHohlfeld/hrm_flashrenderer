@@ -1,81 +1,114 @@
-# HRM FlashRenderer
+HRM FlashRenderer
+=================
 
-**Applied to xAI - Member of Technical Staff Inference**  
-*February 24, 2026*
+**Mission: Extreme VRAM Reduction for Large Models on Legacy GPUs**
 
-This repository showcases my invention: the HRM (Hash Retrieval Model). It demonstrates the underlying architecture and a custom CUDA kernel implemented using Agentic Coding. 
+This repository presents my invention: the **HRM (Hash Retrieval Model)**.
 
-## Why HRM-Flash?
+The core objective is to solve a strict hardware constraint: running massive LLMs (32B+ parameters) on old, VRAM-starved GPUs such as 2×11 GB RTX 2080 Ti.
 
-This stack is built on three pillars of **vertical integration** and **architectural reliability**:
+It achieves this through a fundamental reorientation: Instead of trying to make heavy matrix multiplications fit into tiny VRAM, the entire architecture shifts the burden of knowledge retrieval away from the GPU entirely.
 
-1.  **Full-Integrity Grounding (HRM Core):** Unlike standard vector-based RAG, the **HRM Core** (C++17) uses a deterministic, integer-only indexing engine. This ensures 100% control over the retrieval set, serving as a "Single Source of Truth" that prevents LLM hallucinations through explicit citation validation.
-2.  **Native CUDA Optimization:** Instead of relying on heavy, generic frameworks, this project natively integrates a **custom SM75 FlashAttention kernel** (`csrc/flash_attn_sm75.cu`). It is specifically tuned for Turing-architecture GPUs (e.g., T4, 2080 Ti), implementing paged KV cache and optimized append operations directly.
-3.  **Decoupled Knowledge & Compute:** The architecture strictly separates the knowledge base (Index) from the reasoning engine (LLM). This allows for hardware-agnostic scaling: run the same indexed data on **Zero-VRAM CPU setups** for reliability, or scale to **Multi-GPU Tensor Parallel clusters** for high-throughput production.
+### Core Philosophy
 
-## Prerequisites
-- **GPU:** NVIDIA SM75 (T4, RTX 20-series) or better for FlashAttention.
-- **Software:** CUDA Toolkit, CMake, Python 3.10+.
-- **Dependencies:** `pip install -r requirements.prod.txt`
+*   **HRM Core & Context Bounding** The HRM Core selects context so precisely that we can work with a hard prompt budget. This is the real lever that makes 30B+ models possible on 11 GB VRAM.
+    
+*   **VRAM-Reduction Layer** The GGUF path is not a fallback — it is the current realization of the “Local Renderer” for maximum efficiency on legacy hardware.
+    
+*   **Vision: Resonant Sparse Attention (RSA)** The long-term goal is to eventually replace dense MatMuls with associative recall. GPTQ-Int4 is only a temporary bridge; the true direction is sparse, resonant, memory-efficient attention.
+    
 
-## Quick Start
+This entire architecture was realized through Agentic Coding: translating my conceptual paper and strict implementation path into high-performance, bare-metal code using LLMs.
 
-### 1. Installation
-```bash
-sudo apt install libsqlite3-dev build-essential cmake
-git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
-cd hrm_flashrenderer
+### Why HRM-Flash?
 
-# Recommended: Use a virtual environment
-# python3 -m venv venv && source venv/bin/activate
+This stack is built on three pillars to maximize VRAM efficiency and architectural reliability:
 
-# Or install directly with --break-system-packages (for local dev)
-python3 -m pip install -r requirements.prod.txt --break-system-packages
-python3 -m pip install -e . --break-system-packages
-make build
-```
+1.  **Zero-VRAM Retrieval (HRM Core):** Standard vector RAG wastes VRAM on embeddings and floating-point operations. The C++17 HRM Core replaces this with deterministic, integer-only indexing — completely offloading retrieval to CPU/RAM/SSD.
+    
+2.  **Legacy-Tuned Native CUDA Optimization:** A custom SM75 FlashAttention kernel, specifically tuned for Turing GPUs (2080 Ti, T4, etc.) with paged KV-cache and optimized append operations.
+    
+3.  **Decoupled Knowledge & Compute:** Knowledge base (Index) and reasoning engine (LLM) are strictly separated. This allows running retrieval on zero-VRAM CPU while the LLM operates at the absolute hardware limit on GPU.
+    
 
-### 2. Prepare Your Data (Indexing)
-Before rendering, you must index your knowledge base. Here is an example using the Shakespeare dataset:
-```bash
-# 1. Download example data (Shakespeare + Small LLM)
-curl -L -o input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-curl -L -o model.gguf https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
+### Reality Check
 
-# 2. Prepare and build the HRM index
-hrm_core/build/hrm prep --input input.txt --out payloads.jsonl --cluster-size 200
-hrm_core/build/hrm build --payloads payloads.jsonl --outdir ./model
-```
+Running large models (32B+) on 11 GB per GPU is an extreme edge case. It requires strict prompt budgeting, adjusted parameters, and precise memory management.
 
-### 3. Usage Examples
+### Two Execution Paths
 
-#### Zero VRAM Mode (CPU/GGUF)
-Uses `llama-cpp-python` for a tiny footprint.
-```bash
-python3 renderer/hrm_render.py \
-  --model ./model \
-  --llm ./model.gguf \
-  --n_gpu_layers 0
-```
+**1\. High-Performance Path (Custom Kernel)** Uses my tensor-parallel engine and custom Turing-optimized FlashAttention kernel.
 
-#### Fast GPU Mode (Tensor Parallel)
-Uses the custom FlashAttention engine for HF models.
-```bash
-hrm-flash generate \
-  --hrm_model ./model \
-  --llm_model meta-llama/Llama-3.1-8B-Instruct \
-  --world 2 \
-  --prompt "Your question"
-```
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   hrm-flash generate \    --hrm_model model_index \    --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4 \    --world 2 \    --prompt "Your question"   `
 
----
+**2\. Extreme Low-VRAM Fallback (for 2×11 GB GPUs)** Uses GGUF + llama.cpp with tensor\_split.
 
-# Disclaimer
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   python renderer/hrm_render.py \    --model model_index \    --hrm_bin hrm_core/build/hrm \    --llm /path/to/model.gguf \    --n_gpu_layers 50 \    --tensor_split 0.5 0.5   `
+
+Requirements
+------------
+
+**System:**
+
+*   Ubuntu / Linux
+    
+*   CUDA Toolkit (for full stack)
+    
+
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   sudo apt install libsqlite3-dev build-essential cmake   `
+
+**Python:**
+
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   python3 -m pip install -r requirements.prod.txt  python3 -m pip install -e .   `
+
+**Build:**
+
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   make build   `
+
+Troubleshooting
+---------------
+
+**Problem**
+
+**Solution**
+
+**Could NOT find SQLite3**
+
+sudo apt install libsqlite3-dev + make build
+
+**No space left on device**
+
+Check df -h, avoid keeping GGUF and GPTQ at the same time
+
+**HRM query failed (code=2)**
+
+Rebuild index (hrm\_core/build/hrm build ...)
+
+**Model path does not exist**
+
+Use absolute path to the model
+
+**OOM in full stack**
+
+Reduce --max\_seq\_len to 512 or lower
+
+**hrm binary not found**
+
+Explicitly set --hrm\_bin hrm\_core/build/hrm
+
+Quick Start (Local Renderer)
+----------------------------
+
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   # Build index  hrm_core/build/hrm prep --input your_data.txt --out payloads.jsonl  hrm_core/build/hrm build --payloads payloads.jsonl --outdir model_index  # Run  CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py \    --model model_index \    --hrm_bin hrm_core/build/hrm \    --llm /path/to/model.gguf \    --prompt "Your question" \    --n_gpu_layers 50 \    --n_ctx 4096 \    --max_tokens 512 \    --top_k 4   `
+
+Disclaimer
+==========
+
 I’m Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
 
 **Full honesty:** I’m not a traditional CUDA kernel veteran or ninja. What I do really well is guide AI precisely towards my goals — and turn ideas into clean, working, performant code very fast.
 
-I built and open-sourced **hrm_flashrenderer** to demonstrate this approach, featuring a custom SM75 FlashAttention kernel with paged KV + append.
+To be completely transparent: I built and open-sourced **hrm\_flashrenderer** using my 15+ years of software engineering experience combined with Agentic Coding to demonstrate this approach, successfully generating a custom SM75 FlashAttention kernel with paged KV + append.
 
 I want to bring this direct, pragmatic way of working to **xAI**. Ready to relocate to Bay Area / Seattle tomorrow.
 
