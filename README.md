@@ -1,6 +1,6 @@
 # HRM FlashRenderer
 
-## Extreme VRAM Reduction for Large Models on Legacy GPUs
+## VRAM Reduction for Large Models on Legacy GPUs
 
 HRM (Hash Retrieval Model) is a deterministic retrieval layer designed
 to reduce effective context size before inference.
