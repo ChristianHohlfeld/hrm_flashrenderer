@@ -1,85 +1,77 @@
 # HRM FlashRenderer
 
-## Mission: Extreme VRAM Reduction for Large Models on Legacy GPUs
+## Extreme VRAM Reduction for Large Models on Legacy GPUs
 
-This repository presents my invention: the **HRM (Hash Retrieval
-Model)**.
+HRM (Hash Retrieval Model) is a deterministic retrieval layer designed
+to reduce effective context size before inference.
 
-The core objective is to solve a strict hardware constraint: running
-massive LLMs (32B+ parameters) on legacy, VRAM-constrained GPUs such as
-**2×11 GB RTX 2080 Ti**.
+The goal of this project is practical: enable running large language
+models (30B+ parameters) on legacy GPUs with limited VRAM (e.g. 2×11GB
+RTX 2080 Ti).
 
-Instead of trying to squeeze heavy matrix multiplications into limited
-VRAM, the architecture shifts the burden of knowledge retrieval away
-from the GPU.
+The key idea is simple: move knowledge retrieval off the GPU and
+strictly bound the prompt context before inference.
 
 ------------------------------------------------------------------------
 
-## Quick Start
+## Installation
 
-The steps below provide a straightforward path to getting the system
-running using the Local Renderer (GGUF + llama.cpp).
+Tested on Ubuntu Linux.
 
-### 1. Clone and Install
+### 1. Clone the repository
 
 ``` bash
 git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
 cd hrm_flashrenderer
+```
 
+### 2. Install system dependencies
+
+``` bash
 sudo apt install libsqlite3-dev build-essential cmake
+```
+
+### 3. Install Python dependencies
+
+``` bash
 python3 -m pip install -r requirements.prod.txt
 python3 -m pip install -e .
+```
 
+### 4. Build the core components
+
+``` bash
 make build
 ```
 
-### 2. Build Index
+If `make build` completes without errors, the system is ready.
+
+------------------------------------------------------------------------
+
+## Quick Start (Local Renderer Path)
+
+This is the most reliable way to run the system on low-VRAM GPUs.
+
+### 1. Build the retrieval index
 
 ``` bash
 hrm_core/build/hrm prep --input your_data.txt --out payloads.jsonl
 hrm_core/build/hrm build --payloads payloads.jsonl --outdir model_index
 ```
 
-### 3. Run (2×11GB GPUs)
+### 2. Run inference
 
 ``` bash
 CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --prompt "Your question"   --n_gpu_layers 50   --tensor_split 0.5 0.5
 ```
 
-If this executes successfully, your environment is correctly configured.
+If this runs without crashing, your installation is correct.
 
 ------------------------------------------------------------------------
 
-## Core Philosophy
+## Alternative: Custom FlashAttention Path
 
-### HRM Core & Context Bounding
-
-The HRM Core selects context deterministically and with precision,
-enabling operation under a strict prompt budget.\
-This bounded context is a key enabler for running 30B+ models within 11
-GB VRAM constraints.
-
-### VRAM-Reduction Layer
-
-The GGUF path currently serves as the practical Local Renderer optimized
-for legacy hardware efficiency.
-
-### Vision: Resonant Sparse Attention (RSA)
-
-The long-term direction is to move beyond dense matrix multiplications
-toward associative recall and sparse routing.\
-Quantization techniques such as GPTQ-Int4 are transitional solutions
-rather than the final architectural goal.
-
-This architecture was realized through **Agentic Coding**: translating
-conceptual design and strict architectural constraints into a
-high-performance implementation using LLM-assisted development.
-
-------------------------------------------------------------------------
-
-## Advanced: Custom FlashAttention Path
-
-For maximum performance with sufficient VRAM:
+If you have sufficient VRAM and want maximum performance:
 
 ``` bash
 hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "Your question"
@@ -87,50 +79,37 @@ hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-In
 
 ------------------------------------------------------------------------
 
-## Why HRM-Flash?
+## Architecture Overview
 
-1.  **Zero-VRAM Retrieval (HRM Core)**\
-    Deterministic, integer-only indexing. Retrieval runs entirely on
-    CPU/RAM/SSD.
+-   Retrieval is deterministic and integer-based.
+-   Retrieval runs on CPU/RAM/SSD, not GPU VRAM.
+-   The LLM operates only on bounded context.
+-   Knowledge and compute are strictly separated.
 
-2.  **Legacy-Tuned CUDA Optimization**\
-    Custom SM75 FlashAttention kernel optimized for Turing GPUs (2080
-    Ti, T4) with paged KV-cache and append optimizations.
-
-3.  **Decoupled Knowledge & Compute**\
-    Retrieval and reasoning are strictly separated. The GPU operates at
-    its hardware limit without hosting retrieval overhead.
-
-------------------------------------------------------------------------
-
-## Reality Check
-
-Running 32B+ models on 11GB GPUs remains an extreme edge case.\
-It requires careful prompt budgeting and deliberate parameter tuning.
+This reduces VRAM pressure and allows operation near hardware limits.
 
 ------------------------------------------------------------------------
 
 ## Troubleshooting
 
-  -----------------------------------------------------------------------
-  Problem                             Solution
-  ----------------------------------- -----------------------------------
-  Could NOT find SQLite3              sudo apt install libsqlite3-dev +
-                                      make build
+  -----------------------------------------------------------------------------
+  Problem                                      Fix
+  -------------------------------------------- --------------------------------
+  Could NOT find SQLite3                       sudo apt install libsqlite3-dev
+                                               then `make build`
 
-  No space left on device             Check `df -h`, avoid storing GGUF
-                                      and GPTQ simultaneously
+  No space left on device                      Check `df -h`
 
-  HRM query failed (code=2)           Rebuild index
-                                      (`hrm_core/build/hrm build ...`)
+  HRM query failed (code=2)                    Rebuild the index
 
-  Model path does not exist           Use absolute model path
+  Model path does not exist                    Use an absolute path
 
-  OOM in full stack                   Reduce `--max_seq_len`
+  OOM                                          Reduce `--max_seq_len` or lower
+                                               GPU layers
 
-  hrm binary not found                Set `--hrm_bin hrm_core/build/hrm`
-                                      explicitly
-  -----------------------------------------------------------------------
+  hrm binary not found                         Set
+                                               `--hrm_bin hrm_core/build/hrm`
+  -----------------------------------------------------------------------------
 
 ------------------------------------------------------------------------
 
@@ -138,21 +117,22 @@ It requires careful prompt budgeting and deliberate parameter tuning.
 
 I'm Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
 
-I developed the underlying ideas, architectural direction, mathematical
-constraints, and conceptual papers behind HRM.
+The underlying idea behind HRM, the architectural decisions and ideas,
+and the papers that led to it are my work.
 
 I built and open-sourced **hrm_flashrenderer** to address a concrete
-hardware constraint: running large models on legacy 11GB GPUs.
+physical constraint: running large models on legacy 11GB GPUs.
 
-The implementation was created in close collaboration with AI systems:\
-I defined the architecture, constraints, and verification criteria,
-while LLMs generated and iteratively refined large parts of the code ---
-including the custom SM75 FlashAttention kernel --- under my technical
-guidance and review.
+The implementation was developed using Agentic Coding.\
+I defined the mathematical constraints, system architecture, and
+verification criteria.\
+Large parts of the code --- including the SM75 FlashAttention kernel ---
+were generated and iteratively refined using LLMs under my direction.
 
-This hybrid model --- human-driven design and leadership combined with
-AI-assisted code generation --- reflects my approach to modern systems
-engineering.
+This project reflects how I currently build systems: clear architectural
+ownership, strict constraints, and AI-assisted implementation.
+
+Let's talk.
 
 christianhohlfeld.com\
 GitHub: ChristianHohlfeld
