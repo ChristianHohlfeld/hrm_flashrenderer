@@ -21,17 +21,32 @@ def _ensure_llm_model(model_str: str, local_files_only: bool = False) -> Path:
     # Not a local dir, try HF Hub download
     try:
         from huggingface_hub import snapshot_download
-        print(f"[*] Model '{model_str}' not found locally. Attempting HF Hub download...")
-        # We download config + safetensors.
+        
+        # 1. First try silent, local-only resolution to avoid redundant output
+        try:
+            path = snapshot_download(
+                repo_id=model_str,
+                local_files_only=True,
+                allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt"]
+            )
+            return Path(path).resolve()
+        except Exception:
+            # Not in cache, proceed to network download if allowed
+            if local_files_only:
+                raise SystemExit(f"ERR: Model '{model_str}' not found in local HF cache and --local_files_only is set.")
+            
+        print(f"[*] Model '{model_str}' not found in local cache. Attempting HF Hub download...")
+        # 2. Network download
         path = snapshot_download(
             repo_id=model_str,
-            local_files_only=local_files_only,
+            local_files_only=False,
             allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt"]
         )
         return Path(path).resolve()
     except Exception as e:
-        if local_files_only:
-            raise SystemExit(f"ERR: Model '{model_str}' not found locally and --local_files_only is set.")
+        if "Model" in str(e) and "not found" in str(e):
+            # Pass through the local_files_only error if already raised
+            raise
         raise SystemExit(f"ERR: Failed to resolve/download model '{model_str}': {e}")
 
 
