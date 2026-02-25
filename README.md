@@ -22,6 +22,7 @@ This stack is built on three pillars of **vertical integration** and **architect
 
 ### 1. Installation
 ```bash
+sudo apt install libsqlite3-dev build-essential cmake
 git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
 cd hrm_flashrenderer
 
