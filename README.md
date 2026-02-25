@@ -6,120 +6,114 @@ This repository presents my invention: the **HRM (Hash Retrieval
 Model)**.
 
 The core objective is to solve a strict hardware constraint: running
-massive LLMs (32B+ parameters) on old, VRAM-starved GPUs such as 2×11 GB
-RTX 2080 Ti.
+massive LLMs (32B+ parameters) on legacy, VRAM-constrained GPUs such as
+**2×11 GB RTX 2080 Ti**.
 
-It achieves this through a fundamental reorientation: instead of trying
-to make heavy matrix multiplications fit into tiny VRAM, the entire
-architecture shifts the burden of knowledge retrieval away from the GPU
-entirely.
-
-------------------------------------------------------------------------
-
-## Core Philosophy
-
-### HRM Core & Context Bounding
-
-The HRM Core selects context so precisely that we can work with a hard
-prompt budget. This is the real lever that makes 30B+ models possible on
-11 GB VRAM.
-
-### VRAM-Reduction Layer
-
-The GGUF path is not a fallback --- it is the current realization of the
-"Local Renderer" for maximum efficiency on legacy hardware.
-
-### Vision: Resonant Sparse Attention (RSA)
-
-The long-term goal is to eventually replace dense MatMuls with
-associative recall. GPTQ-Int4 is only a temporary bridge; the true
-direction is sparse, resonant, memory-efficient attention.
-
-This entire architecture was realized through Agentic Coding:
-translating my conceptual paper and strict implementation path into
-high-performance, bare-metal code using LLMs.
+Instead of trying to squeeze heavy matrix multiplications into tiny
+VRAM, the architecture fundamentally shifts the burden of knowledge
+retrieval away from the GPU entirely.
 
 ------------------------------------------------------------------------
 
-## Why HRM-Flash?
+# 🚀 Quick Start (Frictionless Path)
 
-This stack is built on three pillars to maximize VRAM efficiency and
-architectural reliability:
+Copy, paste, build, run.
 
-1.  **Zero-VRAM Retrieval (HRM Core):**\
-    Standard vector RAG wastes VRAM on embeddings and floating-point
-    operations. The C++17 HRM Core replaces this with deterministic,
-    integer-only indexing --- completely offloading retrieval to
-    CPU/RAM/SSD.
-
-2.  **Legacy-Tuned Native CUDA Optimization:**\
-    A custom SM75 FlashAttention kernel, specifically tuned for Turing
-    GPUs (2080 Ti, T4, etc.) with paged KV-cache and optimized append
-    operations.
-
-3.  **Decoupled Knowledge & Compute:**\
-    Knowledge base (Index) and reasoning engine (LLM) are strictly
-    separated. This allows running retrieval on zero-VRAM CPU while the
-    LLM operates at the absolute hardware limit on GPU.
-
-------------------------------------------------------------------------
-
-## Reality Check
-
-Running large models (32B+) on 11 GB per GPU is an extreme edge case. It
-requires strict prompt budgeting, adjusted parameters, and precise
-memory management.
-
-------------------------------------------------------------------------
-
-## Two Execution Paths
-
-### 1. High-Performance Path (Custom Kernel)
-
-Uses my tensor-parallel engine and custom Turing-optimized
-FlashAttention kernel.
+## 1. Clone & Install
 
 ``` bash
-hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "Your question"
-```
+git clone https://github.com/ChristianHohlfeld/hrm_flashrenderer.git
+cd hrm_flashrenderer
 
-### 2. Extreme Low-VRAM Fallback (for 2×11 GB GPUs)
-
-Uses GGUF + llama.cpp with tensor_split.
-
-``` bash
-python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --n_gpu_layers 50   --tensor_split 0.5 0.5
-```
-
-------------------------------------------------------------------------
-
-## Requirements
-
-### System
-
-Ubuntu / Linux\
-CUDA Toolkit (for full stack)
-
-``` bash
 sudo apt install libsqlite3-dev build-essential cmake
-```
-
-### Python
-
-``` bash
 python3 -m pip install -r requirements.prod.txt
 python3 -m pip install -e .
-```
 
-### Build
-
-``` bash
 make build
 ```
 
 ------------------------------------------------------------------------
 
-## Troubleshooting
+## 2. Build Index
+
+``` bash
+hrm_core/build/hrm prep --input your_data.txt --out payloads.jsonl
+hrm_core/build/hrm build --payloads payloads.jsonl --outdir model_index
+```
+
+------------------------------------------------------------------------
+
+## 3. Run (2×11GB GPUs)
+
+``` bash
+CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --prompt "Your question"   --n_gpu_layers 50   --tensor_split 0.5 0.5
+```
+
+If this works, your system is correctly configured.
+
+------------------------------------------------------------------------
+
+# 🧠 Core Philosophy
+
+### HRM Core & Context Bounding
+
+The HRM Core selects context so precisely that we can operate under a
+strict prompt budget.\
+This bounded context is the real lever that makes 30B+ models feasible
+on 11 GB VRAM.
+
+### VRAM-Reduction Layer
+
+The GGUF path is not a fallback --- it is the current realization of the
+"Local Renderer" optimized for legacy hardware efficiency.
+
+### Vision: Resonant Sparse Attention (RSA)
+
+The long-term goal is to replace dense MatMuls with associative recall
+and sparse routing.\
+GPTQ-Int4 is only a temporary bridge --- the direction is deterministic,
+memory-efficient attention.
+
+This architecture was realized through **Agentic Coding**: translating
+my conceptual paper and strict architectural constraints into
+high-performance, bare-metal code using LLMs.
+
+------------------------------------------------------------------------
+
+# ⚙ Advanced: Custom FlashAttention Path
+
+For maximum performance with sufficient VRAM:
+
+``` bash
+hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "Your question"
+```
+
+------------------------------------------------------------------------
+
+# 🧩 Why HRM-Flash?
+
+1.  **Zero-VRAM Retrieval (HRM Core)**\
+    Deterministic, integer-only indexing. Retrieval runs entirely on
+    CPU/RAM/SSD.
+
+2.  **Legacy-Tuned CUDA Optimization**\
+    Custom SM75 FlashAttention kernel optimized for Turing GPUs (2080
+    Ti, T4) with paged KV-cache and append optimizations.
+
+3.  **Decoupled Knowledge & Compute**\
+    Retrieval and reasoning are strictly separated. The GPU operates at
+    its hardware limit --- nothing more.
+
+------------------------------------------------------------------------
+
+# ⚠ Reality Check
+
+Running 32B+ models on 11GB GPUs is an extreme edge case.\
+It requires strict prompt budgeting and careful parameter tuning.
+
+------------------------------------------------------------------------
+
+# 🛠 Troubleshooting
 
   -----------------------------------------------------------------------
   Problem                             Solution
@@ -127,52 +121,38 @@ make build
   Could NOT find SQLite3              sudo apt install libsqlite3-dev +
                                       make build
 
-  No space left on device             Check `df -h`, avoid keeping GGUF
-                                      and GPTQ at the same time
+  No space left on device             Check `df -h`, avoid storing GGUF
+                                      and GPTQ simultaneously
 
   HRM query failed (code=2)           Rebuild index
                                       (`hrm_core/build/hrm build ...`)
 
-  Model path does not exist           Use absolute path to the model
+  Model path does not exist           Use absolute model path
 
-  OOM in full stack                   Reduce `--max_seq_len` to 512 or
-                                      lower
+  OOM in full stack                   Reduce `--max_seq_len`
 
-  hrm binary not found                Explicitly set
-                                      `--hrm_bin hrm_core/build/hrm`
+  hrm binary not found                Set `--hrm_bin hrm_core/build/hrm`
+                                      explicitly
   -----------------------------------------------------------------------
 
 ------------------------------------------------------------------------
 
-## Quick Start (Local Renderer)
-
-``` bash
-# Build index
-hrm_core/build/hrm prep --input your_data.txt --out payloads.jsonl
-hrm_core/build/hrm build --payloads payloads.jsonl --outdir model_index
-
-# Run
-CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --prompt "Your question"   --n_gpu_layers 50   --n_ctx 4096   --max_tokens 512   --top_k 4
-```
-
-------------------------------------------------------------------------
-
-## Disclaimer
+# 👤 Disclaimer
 
 I'm Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
 
-Full honesty: I'm not a traditional CUDA kernel veteran or ninja. What I
-do really well is guide AI precisely towards my goals --- and turn ideas
-into clean, working, performant code very fast.
+Full transparency: I am not a traditional CUDA kernel veteran. What I do
+exceptionally well is combine **15+ years of software engineering
+experience** with modern **Agentic Coding workflows** to transform
+architectural ideas into clean, working, performant systems --- fast.
 
-To be completely transparent: I built and open-sourced
-**hrm_flashrenderer** using my 15+ years of software engineering
-experience combined with Agentic Coding to demonstrate this approach,
-successfully generating a custom SM75 FlashAttention kernel with paged
-KV + append.
+I built and open-sourced **hrm_flashrenderer** to solve a real physical
+constraint: running massive models on legacy 11GB GPUs.\
+The stack --- including the custom SM75 FlashAttention kernel --- was
+generated and refined using LLMs under my strict architectural and
+mathematical constraints.
 
-I want to bring this direct, pragmatic way of working to **xAI**. Ready
-to relocate to Bay Area / Seattle tomorrow.
+I want to bring this direct, pragmatic engineering approach to **xAI**.
 
 **Let's talk.**
 
