@@ -9,7 +9,7 @@ build-hrm:
 	cmake --build hrm_core/build -j
 
 build-flash:
-	TORCH_CUDA_ARCH_LIST=7.5 python3 setup.py install --user --break-system-packages
+	TORCH_CUDA_ARCH_LIST=7.5 python3 setup.py install
 
 test: test-hrm test-flash
 
