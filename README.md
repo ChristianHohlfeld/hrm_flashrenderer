@@ -138,18 +138,21 @@ It requires careful prompt budgeting and deliberate parameter tuning.
 
 I'm Christian Heinrich Hohlfeld, B.Sc. Software Engineering.
 
-I combine more than 15 years of software engineering experience with
-modern Agentic Coding workflows to translate architectural ideas into
-working, performant systems.
+I developed the underlying ideas, architectural direction, mathematical
+constraints, and conceptual papers behind HRM.
 
 I built and open-sourced **hrm_flashrenderer** to address a concrete
-hardware constraint: running large models on legacy 11GB GPUs.\
-The stack --- including the custom SM75 FlashAttention kernel --- was
-generated and refined using LLMs under architectural and mathematical
-constraints defined by me.
+hardware constraint: running large models on legacy 11GB GPUs.
 
-I am interested in contributing this pragmatic engineering approach to
-**xAI**.
+The implementation was created in close collaboration with AI systems:\
+I defined the architecture, constraints, and verification criteria,
+while LLMs generated and iteratively refined large parts of the code ---
+including the custom SM75 FlashAttention kernel --- under my technical
+guidance and review.
+
+This hybrid model --- human-driven design and leadership combined with
+AI-assisted code generation --- reflects my approach to modern systems
+engineering.
 
 christianhohlfeld.com\
 GitHub: ChristianHohlfeld
