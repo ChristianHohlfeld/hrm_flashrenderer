@@ -119,11 +119,9 @@ If this runs without crashing, your environment is correctly configured.
 Use this only if you have sufficient VRAM and CUDA properly configured.
 
 ``` bash
-# 1. Replace with your Read-Token (https://huggingface.co/settings/tokens)
 export HUGGING_FACE_HUB_TOKEN=hf_XXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ```
 ``` bash
-# 2. Run hrm-flash
 hrm-flash generate   --hrm_model model_index   --llm_model Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "What's the meaning of life?"
 ```
 
