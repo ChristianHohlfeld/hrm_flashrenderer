@@ -106,7 +106,7 @@ CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py \
    --model ./model \
    --hrm_bin hrm_core/build/hrm \
    --llm ./model.gguf \
-   --prompt "Your question" \
+   --prompt "What's the meaning of life?" \
    --n_gpu_layers 50
 ```
 
@@ -119,7 +119,7 @@ If this runs without crashing, your environment is correctly configured.
 Use this only if you have sufficient VRAM and CUDA properly configured.
 
 ``` bash
-hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "Your question"
+hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "What's the meaning of life?"
 ```
 
 ------------------------------------------------------------------------
