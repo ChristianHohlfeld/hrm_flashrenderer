@@ -1,7 +1,7 @@
 # Core
-torch
-transformers
-safetensors
+torch==2.1.2
+transformers==4.37.2
+safetensors>=0.4.1
 
 # Server
 fastapi
