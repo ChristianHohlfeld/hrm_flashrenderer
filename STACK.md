@@ -1,72 +1,125 @@
-# HRM Frontstack (Production) — VRAM-minimal by design
+# HRM FlashRenderer
 
-**Goal (your original intent):**
-- Keep the *knowledge mass* in a deterministic on-disk index (SSD/RAM via OS page cache).
-- Use a *small* renderer model (GGUF) that can run CPU-only (**0 VRAM**) or with limited GPU offload.
-- Never require a huge Transformer to fully reside in GPU VRAM.
+**Deterministic Retrieval + Rendering Stack for Low‑VRAM Local
+Inference**
 
-This repo contains:
-- `hrm_core/` (C++17): deterministic retrieval core (0 RNG, 0 floats, 0 matrices)
-  - builds `router_index.bin` + `index.sqlite`
-  - supports one-shot JSON query (`hrm query --prompt "..." --format json`)
-- `renderer/hrm_render.py`: deterministic HRM→LLM pipeline
-  - uses HRM for routing + MMR selection
-  - feeds top snippets into a small local GGUF model (llama.cpp)
-  - validates strict JSON + exact quotes; deterministic fallback if invalid
-- `engine/` + `hrm_flash/flash_daemon.py`: persistent TP renderer
-  - GPU path: custom FlashAttention kernel (SM75), CUDA required, world 1/2/3/4
-  - **CPU path**: `--device cpu --world 1` — uses PyTorch fallback attention, no CUDA install needed
+This repository presents my invention: the HRM (Hash Retrieval Model).
+It demonstrates the complete architecture, including a self-written CUDA
+kernel.
 
-## Build HRM core
-```bash
+## Why HRM-Flash?
+
+This stack is built on three pillars of **vertical integration** and
+**architectural reliability**:
+
+1.  **Full-Integrity Grounding (HRM Core):** The C++17 core uses
+    deterministic, integer-only indexing. No vectors, no randomness ---
+    always the same sources for the same query.
+2.  **Native CUDA Optimization:** Custom SM75 FlashAttention kernel with
+    paged KV-cache and optimized append operations, specifically tuned
+    for Turing GPUs (2080 Ti, T4, etc.).
+3.  **Decoupled Knowledge & Compute:** Knowledge base (index) and
+    reasoning engine are strictly separated --- enabling scaling from
+    zero‑VRAM CPU setups to multi‑GPU tensor parallel deployments.
+
+## Reality Check
+
+This stack is **not** plug & play for every scenario.
+
+-   The **full native stack** (`hrm-flash` + tensor parallel + custom
+    kernel) delivers maximum performance but requires more VRAM.
+-   The **low‑VRAM fallback** (`renderer/hrm_render.py` + GGUF +
+    llama.cpp `tensor_split`) is the most practical path for 2×11GB GPUs
+    (e.g., 2×2080 Ti).
+-   Large models (32B+) on 11GB per GPU operate at hardware limits ---
+    you must work with prompt budgeting and adjusted parameters.
+
+## Two Execution Paths
+
+### 1. Full Native Stack (with sufficient VRAM)
+
+Uses my tensor-parallel engine and my custom FlashAttention kernel.
+
+``` bash
+hrm-flash generate   --hrm_model model_index   --llm_model models/Qwen2.5-32B-Instruct-GPTQ-Int4   --world 2   --prompt "Your question"
+```
+
+### 2. Low‑VRAM Fallback (for 2×11GB GPUs)
+
+Uses GGUF + llama.cpp with tensor_split.
+
+``` bash
+python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --n_gpu_layers 50   --tensor_split 0.5 0.5
+```
+
+## Requirements
+
+### System:
+
+Ubuntu / Linux\
+CUDA Toolkit (for the full stack)
+
+``` bash
+sudo apt install libsqlite3-dev build-essential cmake
+```
+
+### Python:
+
+``` bash
+python3 -m pip install -r requirements.prod.txt
+python3 -m pip install -e .
+```
+
+### Build:
+
+``` bash
 make build
-make test
 ```
 
-## Build an index
-```bash
-# Example: Tiny Shakespeare
-curl -L -o input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-hrm_core/build/hrm prep --input input.txt --out payloads.jsonl --cluster-size 200
-hrm_core/build/hrm build --payloads payloads.jsonl --outdir model
+## Troubleshooting
+
+  -----------------------------------------------------------------------
+  Problem                             Solution
+  ----------------------------------- -----------------------------------
+  Could NOT find SQLite3              sudo apt install libsqlite3-dev +
+                                      make build
+
+  No space left on device             Check `df -h`, avoid storing GGUF
+                                      and GPTQ simultaneously
+
+  HRM query failed (code=2)           Rebuild index
+                                      (`hrm_core/build/hrm build ...`)
+
+  Model path does not exist           Use absolute model path
+
+  OOM in full stack                   Reduce `--max_seq_len` to 512 or
+                                      lower
+
+  hrm binary not found                Explicitly set
+                                      `--hrm_bin hrm_core/build/hrm`
+  -----------------------------------------------------------------------
+
+## Quick Start (Low‑VRAM Path)
+
+``` bash
+# Build index
+hrm_core/build/hrm prep --input your_data.txt --out payloads.jsonl
+hrm_core/build/hrm build --payloads payloads.jsonl --outdir model_index
+
+# Run
+CUDA_VISIBLE_DEVICES=0,1 python renderer/hrm_render.py   --model model_index   --hrm_bin hrm_core/build/hrm   --llm /path/to/model.gguf   --prompt "Your question"   --n_gpu_layers 50   --n_ctx 4096   --max_tokens 512   --top_k 4
 ```
 
-## Run the renderer (CPU-only = 0 VRAM)
-```bash
-python -m pip install -r renderer/requirements.txt
-python renderer/hrm_render.py --model model --llm /path/to/small.gguf --n_gpu_layers 0
-```
+## Disclaimer
 
-## Optional: limited GPU offload
-- increase `--n_gpu_layers` gradually to trade VRAM for speed.
-- You still never need the full model in VRAM.
+I am Christian Heinrich Hohlfeld, B.Sc. Software Engineering.\
+Full honesty: I am not a traditional CUDA ninja. What I am truly good at
+is steering AI precisely and turning ideas into clean, performant code
+quickly.\
+I built and open-sourced hrm_flashrenderer to demonstrate exactly this
+way of working --- including my own SM75 FlashAttention kernel.\
+I want to bring this direct, pragmatic way of building to xAI. Ready for
+Bay Area / Seattle.
 
-## Why this addresses VRAM limits
-Classic LLM stacks keep two big VRAM consumers:
-1) **Model weights** (static, huge)
-2) **KV cache** (grows with context)
-
-This stack changes the problem:
-- The context you feed the renderer is hard-bounded by HRM selection.
-- The renderer can be small and/or CPU-mapped, so weights do **not** have to sit in VRAM.
-
-Determinism:
-- HRM retrieval is deterministic.
-- Renderer is configured to greedy decoding (temperature=0, top_k=1). CPU-only + fixed seed gives strongest stability.
-
-## CPU-Only Mode
-
-Pass `--device cpu` to any command that uses the TP renderer. No CUDA installation needed.
-
-```bash
-# TP daemon, CPU, world=1 (single process)
-hrm-flash daemon --model /path/to/hf-model --world 1 --device cpu --port 5555
-
-# Direct generate on CPU
-hrm-flash generate --hrm_model ./model --llm_model /path/to/hf-model \
-  --world 1 --device cpu --prompt "..." --max_new_tokens 64
-```
-
-- `pip install -e .` works without NVCC — the CUDA extension is skipped; PyTorch fallback is used automatically.
-- CPU inference is significantly slower than GPU; tune `--max_new_tokens` accordingly.
-- For 0-VRAM operation, prefer the **llama.cpp path** (`renderer/hrm_render.py` with a small GGUF model), which uses no PyTorch at all.
+Let's talk.\
+christianhohlfeld.com \| GitHub
