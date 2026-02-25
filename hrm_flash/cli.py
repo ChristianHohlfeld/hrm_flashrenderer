@@ -13,16 +13,33 @@ from hrm_flash.utils import find_hrm_binary, validate_tp_world
 
 
 def _ensure_llm_model(model_str: str, local_files_only: bool = False) -> Path:
-    """Ensure model_str points to a local directory. If not, try HF download."""
+    """Ensure model_str points to a local directory.
+    
+    If model_str is an existing local dir, returned as-is.
+    Otherwise, we check for it in './llm_models/{repo_name}'.
+    If not there, we download it to that folder using Hugging Face Hub.
+    """
     p = Path(model_str)
     if p.is_dir():
         return p.resolve()
 
-    # Not a local dir, try HF Hub download
+    # Define a project-local models folder for persistent storage
+    project_root = Path(__file__).parent.parent
+    local_models_dir = project_root / "llm_models"
+    
+    # Sanitize repo_id for the filesystem (e.g. Qwen/Qwen2.5-1.5B-Instruct -> Qwen2.5-1.5B-Instruct)
+    safe_name = model_str.replace("/", "--").replace("\\", "--")
+    target_dir = local_models_dir / safe_name
+
+    # 1. Check if model is already stored in our project-local models folder
+    if target_dir.joinpath("config.json").exists():
+        return target_dir.resolve()
+
+    # 2. Not in local folder, try to resolve via HF Hub
     try:
         from huggingface_hub import snapshot_download
         
-        # 1. First try silent, local-only resolution to avoid redundant output
+        # Check if it's already in the global HF cache (silent check)
         try:
             path = snapshot_download(
                 repo_id=model_str,
@@ -31,21 +48,22 @@ def _ensure_llm_model(model_str: str, local_files_only: bool = False) -> Path:
             )
             return Path(path).resolve()
         except Exception:
-            # Not in cache, proceed to network download if allowed
             if local_files_only:
-                raise SystemExit(f"ERR: Model '{model_str}' not found in local HF cache and --local_files_only is set.")
-            
-        print(f"[*] Model '{model_str}' not found in local cache. Attempting HF Hub download...")
-        # 2. Network download
+                raise SystemExit(f"ERR: Model '{model_str}' not found in local cache and --local_files_only is set.")
+
+        print(f"[*] Model '{model_str}' not found in './llm_models'. Fetching to local project folder...")
+        local_models_dir.mkdir(exist_ok=True)
+        
+        # Download specifically to our local folder
         path = snapshot_download(
             repo_id=model_str,
-            local_files_only=False,
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False, # Use actual files for direct loading
             allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt"]
         )
         return Path(path).resolve()
     except Exception as e:
         if "Model" in str(e) and "not found" in str(e):
-            # Pass through the local_files_only error if already raised
             raise
         raise SystemExit(f"ERR: Failed to resolve/download model '{model_str}': {e}")
 
