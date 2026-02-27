@@ -2687,14 +2687,12 @@ int main(int argc,char** argv){
   const char* index_path="index_v7.bin";
   int steps=2000,batch=64,seq=128,gpus_req=2;
   float lr=3e-4f,wd=0.01f,clip=1.0f;
-  int log_every=50,save_every=500;
-  uint64_t seed=123;
   bool do_train=false;
   bool do_chat=false;
   bool do_measure=false;
   bool do_continue=false;
+  int use_graph = (std::getenv("DEBUG_NOGRAPH") ? 0 : 1);
   const char* chat_prompt="";
-  int use_graph=1; // 1=CUDA Graph capture, 0=normal launches
 
   for(int i=1;i<argc;i++){
     if(!std::strcmp(argv[i],"--train")) do_train=true;
@@ -2715,9 +2713,7 @@ int main(int argc,char** argv){
     else if(!std::strcmp(argv[i],"--log_every") && i+1<argc) log_every=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--save_every") && i+1<argc) save_every=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--seed") && i+1<argc) seed=(uint64_t)std::strtoull(argv[++i],nullptr,10);
-else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++i]);
-    else if(!std::strcmp(argv[i],"--no_graph")) use_graph=0;
-        else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
+    else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
   }
   if(!do_train && !do_chat) do_train=true;
 
@@ -2734,6 +2730,11 @@ else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++
   if(!do_train || do_chat || do_continue){
     has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
   }
+  
+  if(do_train && has_ckpt && !do_continue){
+    die("ckpt exists: pass --continue or delete ckpt (or use --force-new in the .sh)");
+  }
+  
   if(!has_ckpt){
     if(!load_index_v7(index_path, &pi)) pi = make_pair_index(bytes);
   }
@@ -2942,7 +2943,30 @@ FORCE_NEW=0
 USER_PASSED_CKPT=0
 declare -a PASSED_ARGS
 for arg in "$@"; do
-  if [[ "$arg" == "--force-new" ]]; then
+  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Wrapper Options:"
+    echo "  --force-new       Delete the existing checkpoint for this configuration and start fresh."
+    echo ""
+    echo "Engine Options:"
+    echo "  --train           Start training mode."
+    echo "  --chat            Start chat mode."
+    echo "  --chat_prompt P   Provides initial chat prompt."
+    echo "  --continue        Continue from an existing checkpoint."
+    echo "  --steps N         Number of training steps."
+    echo "  --batch N         Batch size across all GPUs."
+    echo "  --seq N           Sequence length."
+    echo "  --gpus N          Number of GPUs to use."
+    echo "  --measure         Print token/sec performance."
+    echo "  --no_graph        Disable CUDA Graphs for execution (Graph is on by default)."
+    echo "  --lr F            Learning rate."
+    echo "  --ckpt PATH       Specify a custom checkpoint path to save/load."
+    echo ""
+    echo "By default, the script generates a deterministic checkpoint based on model dimensions."
+    echo "If a checkpoint exists, it will auto-continue (or auto-chat if neither --train nor --chat is given)."
+    exit 0
+  elif [[ "$arg" == "--force-new" ]]; then
     FORCE_NEW=1
   elif [[ "$arg" == "--ckpt" ]]; then
     USER_PASSED_CKPT=1

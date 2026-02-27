@@ -3372,7 +3372,30 @@ FORCE_NEW=0
 USER_PASSED_CKPT=0
 declare -a PASSED_ARGS
 for arg in "$@"; do
-  if [[ "$arg" == "--force-new" ]]; then
+  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Wrapper Options:"
+    echo "  --force-new       Delete the existing checkpoint for this configuration and start fresh."
+    echo ""
+    echo "Engine Options:"
+    echo "  --train           Start training mode."
+    echo "  --chat            Start chat mode."
+    echo "  --chat_prompt P   Provides initial chat prompt."
+    echo "  --continue        Continue from an existing checkpoint."
+    echo "  --steps N         Number of training steps."
+    echo "  --batch N         Batch size across all GPUs."
+    echo "  --seq N           Sequence length."
+    echo "  --gpus N          Number of GPUs to use."
+    echo "  --measure         Print token/sec performance."
+    echo "  --no_graph        Disable CUDA Graphs for execution (Graph is on by default)."
+    echo "  --lr F            Learning rate."
+    echo "  --ckpt PATH       Specify a custom checkpoint path to save/load."
+    echo ""
+    echo "By default, the script generates a deterministic checkpoint based on model dimensions."
+    echo "If a checkpoint exists, it will auto-continue (or auto-chat if neither --train nor --chat is given)."
+    exit 0
+  elif [[ "$arg" == "--force-new" ]]; then
     FORCE_NEW=1
   elif [[ "$arg" == "--ckpt" ]]; then
     USER_PASSED_CKPT=1

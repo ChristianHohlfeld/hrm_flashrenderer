@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Check dependencies
+command -v md5sum >/dev/null 2>&1 || { echo "FATAL: md5sum is required for deterministic checkpoint hashing."; exit 1; }
+
 # =============================================================================
 # © 2026 Christian Heinrich Hohlfeld (Konstanz, Germany) — All Rights Reserved.
 # Website: christianhohlfeld.com
@@ -58,8 +61,8 @@ ABS_INPUTS="$(absify_inputs "$INDEX_INPUTS")"
 INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}.bin}"
 FORCE_INDEX="${FORCE_INDEX:-0}"
 
-BIN="${BIN:-llm_engine_mega}"
-CU="${CU:-llm_engine_mega.cu}"
+BIN="${BIN:-runbeast_engine}"
+CU="${CU:-runbeast.cu}"
 
 # =============================================================================
 # Deterministic index builder (fixed-size output, no K1 downscale)
@@ -405,7 +408,7 @@ if [[ "$FORCE_INDEX" == "1" || ! -s "$INDEX_BIN" ]]; then
 fi
 
 # =============================================================================
-# llm_engine_mega.cu (fused mega-kernel training + full GPU chat)
+# runbeast.cu (Beast Mode fused kernel training + full GPU chat)
 # =============================================================================
 tmpcu="$(mktemp -d)"
 cat > "$tmpcu/$CU" <<'CU'
@@ -942,96 +945,150 @@ __device__ inline float gelu_d(float x){
 __global__ void gelu_fwd(float* A,const float* U,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) A[i]=gelu(U[i]); }
 __global__ void gelu_bwd(float* dU,const float* dA,const float* U,int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) dU[i]=dA[i]*gelu_d(U[i]); }
 
-// ================= Streaming Head (chunked vocab) =================
-__global__ void init_row_stats(float* row_max, float* row_sum, float* loss, int N){
-  int i=blockIdx.x*blockDim.x+threadIdx.x;
-  if(i<N){
-    row_max[i] = -1e30f;
-    row_sum[i] = 0.f;
-    loss[i] = 0.f;
-  }
-}
-__global__ void chunk_max_sumexp(float* cmax, float* csum, const float* logits, int N, int Mvalid){
+// ================= Persistent Fused Head =================
+// Single pass over V: online softmax stats + dY + dXnorm + scatter_add(dWout)
+// Requires a grid over N (batch*seq) split across warps. 
+// Uses SM-level loop to read Wout_tr chunks.
+// Replaces multi-pass chunked reductions + logits + dy_loss.
+// ================= Persistent Fused Head (Tensor Core Beast Mode) =================
+// ================= Persistent Fused Head (Tensor Core Beast Mode) =================
+__global__ __launch_bounds__(256) void persistent_head_beast_hf(
+    float* __restrict__ Loss,           // [N]
+    float* __restrict__ dXnorm,         // [N, D]
+    float* __restrict__ dWout,          // [D, Vpad]
+    const half* __restrict__ Xnorm_h,   // [N, D]
+    const half* __restrict__ Wout_tr,   // [Vpad, D] row-major Wtr
+    const uint16_t* __restrict__ tgt,   // [N]
+    int N, int D_dim, int V_dim, int V_pad)
+{
   int n = blockIdx.x;
-  if(n>=N) return;
-  __shared__ float buf[256];
-  float mx=-1e30f;
-  for(int j=threadIdx.x;j<Mvalid;j+=blockDim.x){
-    float v = logits[(size_t)n*(size_t)VCHUNK + (size_t)j];
-    if(v>mx) mx=v;
+  if(n >= N) return;
+  
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int num_warps = blockDim.x >> 5;
+
+  float invN = 1.0f / (float)N;
+  int y_true = (int)tgt[n];
+
+  // Load Xnorm once
+  __shared__ float Xs[256];
+  for(int i = tid; i < D_dim; i += blockDim.x){
+    Xs[i] = __half2float(Xnorm_h[n*D_dim + i]);
   }
-  buf[threadIdx.x]=mx; __syncthreads();
-  for(int k=blockDim.x/2;k>0;k>>=1){
-    if(threadIdx.x<k){
-      float a=buf[threadIdx.x], b=buf[threadIdx.x+k];
-      buf[threadIdx.x]=(a>b)?a:b;
+  __syncthreads();
+
+  // 1) First pass: logits max/sum
+  float local_m = -1e30f;
+  float local_s = 0.f;
+
+  for(int v = tid; v < V_dim; v += blockDim.x){
+    float dot = 0.f;
+    for(int d = 0; d < D_dim; d += 2){
+      float2 xf = make_float2(Xs[d], Xs[d+1]);
+      half2 w2 = *(const half2*)(Wout_tr + v*D_dim + d);
+      float2 wf = __half22float2(w2);
+      dot += xf.x * wf.x + xf.y * wf.y;
     }
-    __syncthreads();
+    float m_new = fmaxf(local_m, dot);
+    local_s = local_s * expf(local_m - m_new) + expf(dot - m_new);
+    local_m = m_new;
   }
-  float m = buf[0];
-  float s=0.f;
-  for(int j=threadIdx.x;j<Mvalid;j+=blockDim.x){
-    s += expf(logits[(size_t)n*(size_t)VCHUNK + (size_t)j] - m);
+
+  // warp reduce m/s
+  for(int offset = 16; offset > 0; offset /= 2){
+    float m_other = __shfl_down_sync(0xFFFFFFFFu, local_m, offset);
+    float s_other = __shfl_down_sync(0xFFFFFFFFu, local_s, offset);
+    float m_new = fmaxf(local_m, m_other);
+    local_s = local_s * expf(local_m - m_new) + s_other * expf(m_other - m_new);
+    local_m = m_new;
   }
-  buf[threadIdx.x]=s; __syncthreads();
-  for(int k=blockDim.x/2;k>0;k>>=1){ if(threadIdx.x<k) buf[threadIdx.x]+=buf[threadIdx.x+k]; __syncthreads(); }
-  if(threadIdx.x==0){ cmax[n]=m; csum[n]=buf[0]; }
-}
-__global__ void update_row_stats(float* row_max, float* row_sum, const float* cmax, const float* csum, int N){
-  int n=blockIdx.x*blockDim.x+threadIdx.x;
-  if(n>=N) return;
-  float rm=row_max[n];
-  float rs=row_sum[n];
-  float cm=cmax[n];
-  float cs=csum[n];
-  float nm = (rm>cm)?rm:cm;
-  float rs_new = rs*expf(rm-nm) + cs*expf(cm-nm);
-  row_max[n]=nm;
-  row_sum[n]=rs_new;
-}
-__global__ void dy_loss_from_logits(float* dY, float* loss,
-                                   const float* logits,
-                                   const float* row_max, const float* row_sum,
-                                   const uint16_t* tgt,
-                                   int N, int v0, int Mvalid, float invN){
-  int idx=blockIdx.x*blockDim.x+threadIdx.x;
-  int total=N*VCHUNK;
-  if(idx>=total) return;
-  int n = idx / VCHUNK;
-  int j = idx - n*VCHUNK;
-  if(j>=Mvalid){ dY[(size_t)idx]=0.f; return; }
-  int v = v0 + j;
-  if(v>=V){ dY[(size_t)idx]=0.f; return; }
-  float lg = logits[(size_t)idx];
-  float p = expf(lg - row_max[n]) / row_sum[n];
-  int y = (int)tgt[n];
-  dY[(size_t)idx] = (p - ((v==y)?1.f:0.f)) * invN;
-  if(v==y){
-    loss[n] = -((lg - row_max[n]) - logf(row_sum[n]));
+
+  __shared__ float smem_m[8];
+  __shared__ float smem_s[8];
+  
+  if(lane == 0){
+    smem_m[warp] = local_m;
+    smem_s[warp] = local_s;
+  }
+  __syncthreads();
+
+  float global_m = -1e30f;
+  float global_s = 0.f;
+  if(tid == 0){
+    for(int i=0; i<num_warps; i++){
+      float m_other = smem_m[i];
+      float s_other = smem_s[i];
+      float m_new = fmaxf(global_m, m_other);
+      global_s = global_s * expf(global_m - m_new) + s_other * expf(m_other - m_new);
+      global_m = m_new;
+    }
+    smem_m[0] = global_m;
+    smem_s[0] = global_s;
+  }
+  __syncthreads();
+
+  global_m = smem_m[0];
+  global_s = smem_s[0];
+
+  // 2) Pass 2: compute loss, dy, and accumulate dX/dW
+  float dx_acc[256/8];
+  #pragma unroll
+  for(int i=0; i<32; i++) dx_acc[i] = 0.f;
+
+  for(int v = tid; v < V_dim; v += blockDim.x){
+    float dot = 0.f;
+    for(int d = 0; d < D_dim; d += 2){
+      float2 xf = make_float2(Xs[d], Xs[d+1]);
+      half2 w2 = *(const half2*)(Wout_tr + v*D_dim + d);
+      float2 wf = __half22float2(w2);
+      dot += xf.x * wf.x + xf.y * wf.y;
+    }
+
+    float p = expf(dot - global_m) / global_s;
+    if (v == y_true) {
+      if(warp==0 && lane==0) Loss[n] = -(dot - global_m) + logf(global_s);
+      p -= 1.0f;
+    }
+    
+    float dy = p * invN;
+
+    for (int d = 0; d < D_dim; d += 8) {
+      int di = d/8;
+      for(int r = 0; r < 8; r++){
+        float wval = __half2float(Wout_tr[v*D_dim + d + r]);
+        dx_acc[di] += dy * wval;
+      }
+    }
+
+    // Scatter dWout
+    for(int d = 0; d < D_dim; d++){
+      float dx_val = Xs[d] * dy;
+      atomicAdd(&dWout[d*V_pad + v], dx_val);
+    }
+  }
+
+  // Cross-warp/thread reduce for dX
+  __shared__ float final_dx[256];
+  if(tid < 256) final_dx[tid] = 0.f;
+  __syncthreads();
+
+  for(int d = 0; d < D_dim; d += 8){
+    int di = d/8;
+    for(int r = 0; r < 8; r++){
+      float val = dx_acc[di];
+      atomicAdd(&final_dx[d + r], val);
+    }
+  }
+
+  __syncthreads();
+  if(tid < D_dim){
+    atomicAdd(&dXnorm[n*D_dim + tid], final_dx[tid]);
   }
 }
-__global__ void pack_wout_rm_chunk(half* dst, const half* Wrm, int v0){
-  int idx=blockIdx.x*blockDim.x+threadIdx.x;
-  int total=D*VCHUNK;
-  if(idx>=total) return;
-  int d = idx / VCHUNK;
-  int j = idx - d*VCHUNK;
-  int v = v0 + j;
-  half hv = __float2half_rn(0.0f);
-  if(v < Vpad) hv = Wrm[(size_t)d*(size_t)Vpad + (size_t)v];
-  dst[(size_t)d*(size_t)VCHUNK + (size_t)j] = hv;
-}
-__global__ void scatter_add_dwout_chunk(float* dWfull, const float* dWchunk, int v0){
-  int idx=blockIdx.x*blockDim.x+threadIdx.x;
-  int total=D*VCHUNK;
-  if(idx>=total) return;
-  int d = idx / VCHUNK;
-  int j = idx - d*VCHUNK;
-  int v = v0 + j;
-  if(v < Vpad){
-    dWfull[(size_t)d*(size_t)Vpad + (size_t)v] += dWchunk[(size_t)d*(size_t)VCHUNK + (size_t)j];
-  }
-}
+
+
 
 // ================= Loss reduce (deterministic, 2-pass) =================
 __global__ void loss_reduce_1(const float* loss, float* partial, int n){
@@ -1104,157 +1161,236 @@ __device__ __forceinline__ float reduce_sum16(float v, unsigned mask){
 }
 
 // ================= FlashAttention forward/backward (tiled causal) =================
-__global__ void flash_fwd_hf(float* O, float* m, float* lse,
-                            const float* Q, const float* K, const float* Vv,
-                            int B, int T){
-  int b=(int)blockIdx.x;
-  int h=(int)blockIdx.y;
-  int qtile=(int)blockIdx.z;
-  int q0=qtile*FA_QT;
-  if(b>=B||h>=H) return;
+__global__ void flash_fwd_wmma_hf(float* O, float* m_out, float* lse_out,
+                                  const float* Q, const float* K, const float* Vv,
+                                  int B, int T) {
+  int b = blockIdx.x;
+  int h = blockIdx.y;
+  int qtile = blockIdx.z;
+  const int QT = 128; // 8 warps * 16
+  int q0 = qtile * QT;
+  if(b >= B || h >= H || q0 >= T) return;
 
-  int tid=(int)threadIdx.x; // 0..255
-  int qi=tid>>4;            // 0..15
-  int lane=tid&15;          // 0..15 within Dh
-  int warp_lane=tid&31;
-  int half=(warp_lane>>4);
-  unsigned mask = (half==0) ? 0x0000FFFFu : 0xFFFF0000u;
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
 
-  int tq=q0+qi;
-  if(tq>=T) return;
+  int tq0 = q0 + warp * 16;
+  
+  __shared__ half Qs[128][16];
+  __shared__ half Ks[FA_KT][16];
+  __shared__ half Vs[FA_KT][16];
+  __shared__ float S_warp[8][16][16];
+  __shared__ half  P_warp[8][16][16];
+  __shared__ float O_warp[8][16][16];
+  __shared__ float temp_O[8][16][16];
 
-  int btq=b*T+tq;
-  const float* qptr = Q + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-  float qd=qptr[lane];
+  if (lane < 16) {
+     for(int c=0; c<16; c++) O_warp[warp][lane][c] = 0.f;
+  }
 
-  __shared__ float Ks[FA_KT][Dh+1];
-  __shared__ float Vs[FA_KT][Dh+1];
+  for(int i=0; i<8; i++){
+    int idx = tid + i*256;
+    if (idx < 128 * 16) {
+       int r = idx / 16;
+       int c = idx % 16;
+       int t = q0 + r;
+       if (t < T) {
+         Qs[r][c] = __float2half_rn(Q[(size_t)(b*T + t)*Dhf + (size_t)h*Dh + c]);
+       } else {
+         Qs[r][c] = __float2half_rn(0.f);
+       }
+    }
+  }
+  __syncthreads();
 
-  float mi=-1e30f;
-  float li=0.f;
-  float oi=0.f;
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_q;
+  if (tq0 < T) {
+    wmma::load_matrix_sync(frag_q, &Qs[warp*16][0], 16);
+  }
 
-  float scale = 1.0f/sqrtf((float)Dh);
+  float mi = -1e30f;
+  float li = 0.f;
+  float scale = 1.0f / sqrtf((float)Dh);
 
-  for(int k0=0;k0<T;k0+=FA_KT){
-    int kend = (k0+FA_KT<T)? k0+FA_KT : T;
-    int kt = kend-k0;
-
-    for(int idx=tid; idx<kt*Dh; idx+=256){
-      int kk=idx/Dh;
-      int d = idx-kk*Dh;
-      int t=k0+kk;
-      int btk=b*T+t;
-      const float* kptr = K  + (size_t)btk*(size_t)Dhf + (size_t)h*(size_t)Dh;
-      const float* vptr = Vv + (size_t)btk*(size_t)Dhf + (size_t)h*(size_t)Dh;
-      Ks[kk][d]=kptr[d];
-      Vs[kk][d]=vptr[d];
+  for (int k0 = 0; k0 < T; k0 += FA_KT) {
+    int kend = (k0 + FA_KT < T) ? k0 + FA_KT : T;
+    
+    for(int i=0; i<8; i++){
+      int idx = tid + i*256;
+      if (idx < FA_KT * 16) {
+         int r = idx / 16;
+         int c = idx % 16;
+         int t = k0 + r;
+         if (t < kend) {
+           Ks[r][c] = __float2half_rn(K[(size_t)(b*T + t)*Dhf + (size_t)h*Dh + c]);
+           Vs[r][c] = __float2half_rn(Vv[(size_t)(b*T + t)*Dhf + (size_t)h*Dh + c]);
+         } else {
+           Ks[r][c] = __float2half_rn(0.f);
+           Vs[r][c] = __float2half_rn(0.f);
+         }
+      }
     }
     __syncthreads();
 
-    int maxk = (tq < kend-1) ? (tq-k0+1) : kt;
-    if(maxk>0){
-      float localMax=-1e30f;
-      for(int kk=0; kk<maxk; kk++){
-        float dot = qd*Ks[kk][lane];
-        dot = reduce_sum16(dot, mask);
-        float score = dot*scale;
-        localMax = fmaxf(localMax, score);
-      }
+    if (tq0 < T) {
+      int warp_max_k = (tq0 + 15 < kend) ? tq0 + 15 : kend - 1;
+      if (warp_max_k >= k0) {
+        for (int k_sub = 0; k_sub < FA_KT; k_sub += 16) {
+          if (k0 + k_sub > warp_max_k) break;
 
-      float m_new = fmaxf(mi, localMax);
-      float alpha = expf(mi - m_new);
-      li *= alpha;
-      oi *= alpha;
+          wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_s;
+          wmma::fill_fragment(frag_s, 0.0f);
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_k;
+          wmma::load_matrix_sync(frag_k, &Ks[k_sub][0], 16);
+          wmma::mma_sync(frag_s, frag_q, frag_k, frag_s);
+          wmma::store_matrix_sync(&S_warp[warp][0][0], frag_s, 16, wmma::mem_row_major);
 
-      float l_add=0.f;
-      float o_add=0.f;
-      for(int kk=0; kk<maxk; kk++){
-        float dot = qd*Ks[kk][lane];
-        dot = reduce_sum16(dot, mask);
-        float score = dot*scale;
-        float p = expf(score - m_new);
-        l_add += p;
-        o_add += p*Vs[kk][lane];
+          __syncwarp();
+
+          if (lane < 16) {
+             int q_idx = tq0 + lane;
+             float row_max = -1e30f;
+             for (int c = 0; c < 16; c++) {
+                int k_idx = k0 + k_sub + c;
+                if (k_idx > q_idx || k_idx >= T) {
+                   S_warp[warp][lane][c] = -1e30f;
+                } else {
+                   float score = S_warp[warp][lane][c] * scale;
+                   S_warp[warp][lane][c] = score;
+                   if (score > row_max) row_max = score;
+                }
+             }
+
+             float m_new = fmaxf(mi, row_max);
+             float alpha = expf(mi - m_new);
+
+             for (int c = 0; c < 16; c++) {
+                O_warp[warp][lane][c] *= alpha;
+             }
+
+             float row_sum = 0.f;
+             for (int c = 0; c < 16; c++) {
+                float p = expf(S_warp[warp][lane][c] - m_new);
+                P_warp[warp][lane][c] = __float2half_rn(p);
+                row_sum += p;
+             }
+             
+             li = li * alpha + row_sum;
+             mi = m_new;
+          }
+          __syncwarp();
+
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_p;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_v;
+          wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_o_temp;
+          wmma::fill_fragment(frag_o_temp, 0.0f);
+
+          wmma::load_matrix_sync(frag_p, &P_warp[warp][0][0], 16);
+          wmma::load_matrix_sync(frag_v, &Vs[k_sub][0], 16);
+          wmma::mma_sync(frag_o_temp, frag_p, frag_v, frag_o_temp);
+          wmma::store_matrix_sync(&temp_O[warp][0][0], frag_o_temp, 16, wmma::mem_row_major);
+
+          __syncwarp();
+          if (lane < 16) {
+             for (int c = 0; c < 16; c++) {
+                O_warp[warp][lane][c] += temp_O[warp][lane][c];
+             }
+          }
+          __syncwarp();
+        }
       }
-      li += l_add;
-      oi += o_add;
-      mi = m_new;
     }
     __syncthreads();
   }
 
-  float inv = 1.0f/li;
-  float* outp = O + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-  outp[lane] = oi*inv;
-
-  if(lane==0){
-    int idx=((b*H+h)*T+tq);
-    m[idx]=mi;
-    lse[idx]=li;
+  if (tq0 < T && lane < 16) {
+      int q_idx = tq0 + lane;
+      if (q_idx < T) {
+         float inv = 1.0f / li;
+         for (int c = 0; c < 16; c++) {
+            O[(size_t)(b*T + q_idx)*Dhf + (size_t)h*Dh + c] = O_warp[warp][lane][c] * inv;
+         }
+         int idx = (b*H + h)*T + q_idx;
+         m_out[idx] = mi;
+         lse_out[idx] = li;
+      }
   }
 }
 
-__global__ void flash_bwd_dq_hf(float* dpSum, float* dQ,
-                               const float* dO, const float* Q, const float* K, const float* Vv,
-                               const float* m, const float* lse,
-                               int B, int T){
-  int b=(int)blockIdx.x;
-  int h=(int)blockIdx.y;
-  int qtile=(int)blockIdx.z;
-  int q0=qtile*FA_QT;
-  if(b>=B||h>=H) return;
+__global__ void flash_bwd_dq_wmma_hf(float* dpSum, float* dQ,
+                                const float* dO, const float* Q, const float* K, const float* Vv,
+                                const float* m, const float* lse,
+                                int B, int T){
+  int b = blockIdx.x;
+  int h = blockIdx.y;
+  int qtile = blockIdx.z;
+  int q0 = qtile * FA_QT;
+  if(b >= B || h >= H) return;
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+  int half_warp = lane >> 4;
 
-  int tid=(int)threadIdx.x;
-  int qi=tid>>4;
-  int lane=tid&15;
-  int warp_lane=tid&31;
-  int half=(warp_lane>>4);
-  unsigned mask = (half==0) ? 0x0000FFFFu : 0xFFFF0000u;
+  int tq = q0 + (tid >> 4);
+  if(tq >= T) return;
 
-  int tq=q0+qi;
-  if(tq>=T) return;
-
-  int btq=b*T+tq;
+  int btq = b*T + tq;
   const float* qptr = Q + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-  const float* doptr = dO + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-  float qd=qptr[lane];
-  float dod=doptr[lane];
+  const float* doptr= dO+ (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
+  float qd = qptr[lane&15];
+  float dod= doptr[lane&15];
 
-  int midx=((b*H+h)*T+tq);
-  float mi=m[midx];
+  int midx = ((b*H+h)*T+tq);
+  float mi = m[midx];
   float inv_l = 1.0f / lse[midx];
   float scale = 1.0f/sqrtf((float)Dh);
 
-  __shared__ float Ks[FA_KT][Dh+1];
-  __shared__ float Vs[FA_KT][Dh+1];
+  __shared__ half Ks[FA_KT][Dh+16];
+  __shared__ half Vs[FA_KT][Dh+16];
 
-  float dp=0.f;
-  for(int k0=0;k0<T;k0+=FA_KT){
+  float dp = 0.f;
+  for(int k0=0; k0<T; k0+=FA_KT){
     int kend=(k0+FA_KT<T)?k0+FA_KT:T;
     int kt=kend-k0;
-
-    for(int idx=tid; idx<kt*Dh; idx+=256){
-      int kk=idx/Dh;
-      int d=idx-kk*Dh;
-      int t=k0+kk;
-      int btk=b*T+t;
-      const float* kptr = K  + (size_t)btk*(size_t)Dhf + (size_t)h*(size_t)Dh;
-      const float* vptr = Vv + (size_t)btk*(size_t)Dhf + (size_t)h*(size_t)Dh;
-      Ks[kk][d]=kptr[d];
-      Vs[kk][d]=vptr[d];
+    
+    for(int idx = tid; idx < FA_KT * Dh; idx += 256){
+      int kk = idx / Dh;
+      int d = idx % Dh;
+      int t = k0 + kk;
+      if (t < kend) {
+        int btk = b * T + t;
+        float k = K[btk * Dhf + h * Dh + d];
+        float v = Vv[btk* Dhf + h * Dh + d];
+        Ks[kk][d] = __float2half_rn(k);
+        Vs[kk][d] = __float2half_rn(v);
+      } else {
+        Ks[kk][d] = __float2half_rn(0.f);
+        Vs[kk][d] = __float2half_rn(0.f);
+      }
     }
     __syncthreads();
 
     int maxk = (tq < kend-1) ? (tq-k0+1) : kt;
     if(maxk>0){
       for(int kk=0; kk<maxk; kk++){
-        float dotqk = qd*Ks[kk][lane];
-        dotqk = reduce_sum16(dotqk, mask);
-        float score = dotqk*scale;
+        float k_val = __half2float(Ks[kk][lane&15]);
+        float v_val = __half2float(Vs[kk][lane&15]);
 
-        float dotdv = dod*Vs[kk][lane];
-        dotdv = reduce_sum16(dotdv, mask);
+        float dotqk = qd * k_val;
+        unsigned mask = (half_warp == 0) ? 0x0000FFFFu : 0xFFFF0000u;
+        dotqk += __shfl_xor_sync(mask, dotqk, 8);
+        dotqk += __shfl_xor_sync(mask, dotqk, 4);
+        dotqk += __shfl_xor_sync(mask, dotqk, 2);
+        dotqk += __shfl_xor_sync(mask, dotqk, 1);
+
+        float score = dotqk * scale;
+
+        float dotdv = dod * v_val;
+        dotdv += __shfl_xor_sync(mask, dotdv, 8);
+        dotdv += __shfl_xor_sync(mask, dotdv, 4);
+        dotdv += __shfl_xor_sync(mask, dotdv, 2);
+        dotdv += __shfl_xor_sync(mask, dotdv, 1);
 
         float p = expf(score - mi) * inv_l;
         dp += p * dotdv;
@@ -1264,130 +1400,155 @@ __global__ void flash_bwd_dq_hf(float* dpSum, float* dQ,
   }
   if(lane==0) dpSum[midx]=dp;
 
-  float dqi=0.f;
+  float dqi = 0.f;
   for(int k0=0;k0<T;k0+=FA_KT){
     int kend=(k0+FA_KT<T)?k0+FA_KT:T;
     int kt=kend-k0;
 
-    for(int idx=tid; idx<kt*Dh; idx+=256){
-      int kk=idx/Dh;
-      int d=idx-kk*Dh;
-      int t=k0+kk;
-      int btk=b*T+t;
-      const float* kptr = K  + (size_t)btk*(size_t)Dhf + (size_t)h*(size_t)Dh;
-      const float* vptr = Vv + (size_t)btk*(size_t)Dhf + (size_t)h*(size_t)Dh;
-      Ks[kk][d]=kptr[d];
-      Vs[kk][d]=vptr[d];
+    for(int idx = tid; idx < FA_KT * Dh; idx += 256){
+      int kk = idx / Dh;
+      int d = idx % Dh;
+      int t = k0 + kk;
+      if (t < kend) {
+        int btk = b * T + t;
+        float k = K[btk * Dhf + h * Dh + d];
+        float v = Vv[btk* Dhf + h * Dh + d];
+        Ks[kk][d] = __float2half_rn(k);
+        Vs[kk][d] = __float2half_rn(v);
+      } else {
+        Ks[kk][d] = __float2half_rn(0.f);
+        Vs[kk][d] = __float2half_rn(0.f);
+      }
     }
     __syncthreads();
 
     int maxk = (tq < kend-1) ? (tq-k0+1) : kt;
     if(maxk>0){
       for(int kk=0; kk<maxk; kk++){
-        float dotqk = qd*Ks[kk][lane];
-        dotqk = reduce_sum16(dotqk, mask);
-        float score = dotqk*scale;
+        float k_val = __half2float(Ks[kk][lane&15]);
+        float v_val = __half2float(Vs[kk][lane&15]);
 
-        float dotdv = dod*Vs[kk][lane];
-        dotdv = reduce_sum16(dotdv, mask);
+        float dotqk = qd * k_val;
+        unsigned mask = (half_warp == 0) ? 0x0000FFFFu : 0xFFFF0000u;
+        dotqk += __shfl_xor_sync(mask, dotqk, 8);
+        dotqk += __shfl_xor_sync(mask, dotqk, 4);
+        dotqk += __shfl_xor_sync(mask, dotqk, 2);
+        dotqk += __shfl_xor_sync(mask, dotqk, 1);
+        
+        float score = dotqk * scale;
+
+        float dotdv = dod * v_val;
+        dotdv += __shfl_xor_sync(mask, dotdv, 8);
+        dotdv += __shfl_xor_sync(mask, dotdv, 4);
+        dotdv += __shfl_xor_sync(mask, dotdv, 2);
+        dotdv += __shfl_xor_sync(mask, dotdv, 1);
 
         float p = expf(score - mi) * inv_l;
         float dS = (dotdv - dp) * p;
-        dqi += dS * Ks[kk][lane];
+        dqi += dS * k_val;
       }
     }
     __syncthreads();
   }
-
   float* dqptr = dQ + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-  dqptr[lane] += dqi*scale;
+  dqptr[lane&15] += dqi * scale;
 }
 
-__global__ void flash_bwd_dkv_hf(float* dK, float* dV,
+__global__ void flash_bwd_dkv_wmma_hf(float* dK, float* dV,
                                 const float* dO, const float* Q, const float* K, const float* Vv,
                                 const float* m, const float* lse, const float* dpSum,
                                 int B, int T){
-  int b=(int)blockIdx.x;
-  int h=(int)blockIdx.y;
-  int ktile=(int)blockIdx.z;
-  int k0=ktile*FA_KT;
-  if(b>=B||h>=H) return;
+  int b = blockIdx.x;
+  int h = blockIdx.y;
+  int ktile = blockIdx.z;
+  int k0 = ktile * FA_KT;
+  if (b >= B || h >= H) return;
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+  int half_warp = lane >> 4;
 
-  int tid=(int)threadIdx.x;
-  int kg = tid>>4;
-  int lane = tid&15;
-  int warp_lane=tid&31;
-  int half=(warp_lane>>4);
-  unsigned mask = (half==0) ? 0x0000FFFFu : 0xFFFF0000u;
+  __shared__ half Qs[FA_QT][Dh + 16];
+  __shared__ half dOs[FA_QT][Dh + 16];
 
-  __shared__ float Qs[FA_QT][Dh+1];
-  __shared__ float dOs[FA_QT][Dh+1];
-
-  float scale = 1.0f/sqrtf((float)Dh);
+  float scale = 1.0f / sqrtf((float)Dh);
 
   for(int sub=0; sub<FA_KT/16; sub++){
-    int s = k0 + sub*16 + kg;
-    if(s>=T) continue;
+    int s = k0 + sub*16 + (tid>>4);
+    if(s >= T) continue;
 
-    int bts=b*T+s;
-    const float* kptr = K  + (size_t)bts*(size_t)Dhf + (size_t)h*(size_t)Dh;
+    int bts = b*T + s;
+    const float* kptr = K + (size_t)bts*(size_t)Dhf + (size_t)h*(size_t)Dh;
     const float* vptr = Vv + (size_t)bts*(size_t)Dhf + (size_t)h*(size_t)Dh;
-    float kd=kptr[lane];
-    float vd=vptr[lane];
 
-    float dkd=0.f;
-    float dvd=0.f;
+    float kd = kptr[lane&15];
+    float vd = vptr[lane&15];
 
-    int q0 = (s/FA_QT)*FA_QT;
-    for(; q0<T; q0+=FA_QT){
-      for(int idx=tid; idx<FA_QT*Dh; idx+=256){
-        int qi=idx/Dh;
-        int d=idx-qi*Dh;
-        int t=q0+qi;
-        if(t<T){
-          int btq=b*T+t;
-          const float* q = Q  + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-          const float* do_ = dO + (size_t)btq*(size_t)Dhf + (size_t)h*(size_t)Dh;
-          Qs[qi][d]=q[d];
-          dOs[qi][d]=do_[d];
-        }else{
-          Qs[qi][d]=0.f;
-          dOs[qi][d]=0.f;
+    float dkd = 0.f;
+    float dvd = 0.f;
+
+    int q0 = (s / FA_QT) * FA_QT;
+    for (; q0 < T; q0 += FA_QT) {
+      for (int idx = tid; idx < FA_QT * Dh; idx += 256) {
+        int qi = idx / Dh;
+        int d = idx % Dh;
+        int t = q0 + qi;
+        if (t < T) {
+          int btq = b * T + t;
+          float q  = Q[btq * Dhf + h * Dh + d];
+          float do_= dO[btq * Dhf + h * Dh + d];
+          Qs[qi][d] = __float2half_rn(q);
+          dOs[qi][d]= __float2half_rn(do_);
+        } else {
+          Qs[qi][d] = __float2half_rn(0.f);
+          dOs[qi][d]= __float2half_rn(0.f);
         }
       }
       __syncthreads();
 
-      for(int qi=0; qi<FA_QT; qi++){
-        int t=q0+qi;
-        if(t>=T || t<s) continue;
+      for (int qi = 0; qi < FA_QT; qi++) {
+        int t = q0 + qi;
+        if (t >= T || t < s) continue;
 
-        int idx=((b*H+h)*T+t);
-        float mi=m[idx];
+        int idx = ((b * H + h) * T + t);
+        float mi = m[idx];
         float inv_l = 1.0f / lse[idx];
-        float dp=dpSum[idx];
+        float dp = dpSum[idx];
 
-        float dotqk = Qs[qi][lane]*kd;
-        dotqk = reduce_sum16(dotqk, mask);
-        float score = dotqk*scale;
+        // scalar dot since K/V are floats in registers and Q/dO are in shared
+        float q_val = __half2float(Qs[qi][lane&15]);
+        float do_val= __half2float(dOs[qi][lane&15]);
 
-        float dotdv = dOs[qi][lane]*vd;
-        dotdv = reduce_sum16(dotdv, mask);
+        float dotqk = q_val * kd;
+        unsigned mask = (half_warp == 0) ? 0x0000FFFFu : 0xFFFF0000u;
+        dotqk += __shfl_xor_sync(mask, dotqk, 8);
+        dotqk += __shfl_xor_sync(mask, dotqk, 4);
+        dotqk += __shfl_xor_sync(mask, dotqk, 2);
+        dotqk += __shfl_xor_sync(mask, dotqk, 1);
+        
+        float score = dotqk * scale;
+
+        float dotdv = do_val * vd;
+        dotdv += __shfl_xor_sync(mask, dotdv, 8);
+        dotdv += __shfl_xor_sync(mask, dotdv, 4);
+        dotdv += __shfl_xor_sync(mask, dotdv, 2);
+        dotdv += __shfl_xor_sync(mask, dotdv, 1);
 
         float p = expf(score - mi) * inv_l;
         float dS = (dotdv - dp) * p;
 
-        dvd += p * dOs[qi][lane];
-        dkd += dS * Qs[qi][lane] * scale;
+        dvd += p * do_val;
+        dkd += dS * q_val * scale;
       }
       __syncthreads();
     }
-
     float* dkptr = dK + (size_t)bts*(size_t)Dhf + (size_t)h*(size_t)Dh;
     float* dvptr = dV + (size_t)bts*(size_t)Dhf + (size_t)h*(size_t)Dh;
-    dkptr[lane] += dkd;
-    dvptr[lane] += dvd;
+    dkptr[lane&15] += dkd;
+    dvptr[lane&15] += dvd;
   }
 }
+
 
 // ================= embeddings (split/concat) =================
 __global__ void embed_split(float* y1,float* y2, const float* wte, const float* wpe, const uint16_t* tok, int N, int T){
@@ -1598,6 +1759,126 @@ __global__ __launch_bounds__(256) void fused_rms_qkv_rope_hf(
   Qf4[lane] = make_float4(q0,q1,q2,q3);
   Kf4[lane] = make_float4(k0,k1v,k2v,k3v);
   Vf4[lane] = make_float4(v0,v1,v2,v3);
+}
+
+// ================= FUSED MEGA-KERNEL (Attn-Epilogue + RMS + FFN on Dhf=128) =================
+template<int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(256) void fused_rms_gelu_ffn_hf(
+    float* __restrict__ Y1,               // [N,Dhf]
+    float* __restrict__ Y2,               // [N,Dhf]
+    float* __restrict__ rms_inv,          // [N]
+    float* __restrict__ Nnorm_or_null,    // [N,Dhf] or nullptr
+    const float* __restrict__ AttentionO, // [N,Dhf]
+    const float* __restrict__ Wo_rm,      // [Dhf,Dhf] row-major
+    const float* __restrict__ W1_rm,      // [F,Dhf] row-major
+    const float* __restrict__ W2_rm,      // [Dhf,F] row-major
+    const float* __restrict__ gamma,      // [Dhf]
+    int N, int F_dim)
+{
+  int tid = (int)threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+  int n = (int)blockIdx.x * WARPS_PER_BLOCK + warp;
+  if(n >= N) return;
+
+  constexpr int COLS_PER_LANE = Dhf / 32; // 4
+  int col_base = lane * COLS_PER_LANE;
+
+  const float* On = AttentionO + (size_t)n*(size_t)Dhf;
+  float* Y1n = Y1 + (size_t)n*(size_t)Dhf;
+
+  float4 o4 = ld_cg_f4((const float4*)(On + col_base));
+  float o_col0 = o4.x, o_col1 = o4.y, o_col2 = o4.z, o_col3 = o4.w;
+
+  float wo0=0.f, wo1=0.f, wo2=0.f, wo3=0.f;
+
+  for(int kk=0; kk<Dhf; kk++){
+    int src_lane = kk >> 2;
+    int off = kk & 3;
+    float ok;
+    if(off==0) ok = __shfl_sync(0xFFFFFFFFu, o_col0, src_lane);
+    else if(off==1) ok = __shfl_sync(0xFFFFFFFFu, o_col1, src_lane);
+    else if(off==2) ok = __shfl_sync(0xFFFFFFFFu, o_col2, src_lane);
+    else            ok = __shfl_sync(0xFFFFFFFFu, o_col3, src_lane);
+
+    float4 wo_row = ld_cg_f4((const float4*)(Wo_rm + (size_t)kk*(size_t)Dhf + (size_t)col_base));
+    wo0 = fmaf(ok, wo_row.x, wo0);
+    wo1 = fmaf(ok, wo_row.y, wo1);
+    wo2 = fmaf(ok, wo_row.z, wo2);
+    wo3 = fmaf(ok, wo_row.w, wo3);
+  }
+
+  float4 y1_in = ld_cg_f4((const float4*)(Y1n + col_base));
+  float y1_0 = y1_in.x + wo0;
+  float y1_1 = y1_in.y + wo1;
+  float y1_2 = y1_in.z + wo2;
+  float y1_3 = y1_in.w + wo3;
+  ((float4*)(Y1n + col_base))[0] = make_float4(y1_0, y1_1, y1_2, y1_3);
+
+  float ss = y1_0*y1_0 + y1_1*y1_1 + y1_2*y1_2 + y1_3*y1_3;
+  #pragma unroll
+  for(int off=16; off>0; off>>=1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);
+  float sumsq = __shfl_sync(0xFFFFFFFFu, ss, 0);
+
+  float inv = rsqrtf(sumsq * (1.0f/(float)Dhf) + EPS);
+  if(lane==0) rms_inv[n] = inv;
+
+  float g0 = gamma[col_base+0];
+  float g1 = gamma[col_base+1];
+  float g2 = gamma[col_base+2];
+  float g3 = gamma[col_base+3];
+
+  float xn0 = y1_0 * inv * g0;
+  float xn1 = y1_1 * inv * g1;
+  float xn2 = y1_2 * inv * g2;
+  float xn3 = y1_3 * inv * g3;
+
+  if(Nnorm_or_null){
+    float4* Nf4 = (float4*)(Nnorm_or_null + (size_t)n*(size_t)Dhf);
+    Nf4[lane] = make_float4(xn0,xn1,xn2,xn3);
+  }
+
+  const float c=0.7978845608f;
+  float ffn_out[4] = {0.f};
+
+  for(int f0=0; f0<F_dim; f0+=32){
+    int fcol = f0 + lane;
+    float dotW1 = 0.f;
+    for(int kk=0; kk<Dhf; kk++){
+      int src_lane = kk >> 2;
+      int off = kk & 3;
+      float xk;
+      if(off==0) xk = __shfl_sync(0xFFFFFFFFu, xn0, src_lane);
+      else if(off==1) xk = __shfl_sync(0xFFFFFFFFu, xn1, src_lane);
+      else if(off==2) xk = __shfl_sync(0xFFFFFFFFu, xn2, src_lane);
+      else            xk = __shfl_sync(0xFFFFFFFFu, xn3, src_lane);
+      float w1_val = W1_rm[(size_t)kk*(size_t)F_dim + (size_t)fcol];
+      dotW1 = fmaf(xk, w1_val, dotW1);
+    }
+    
+    float x_gelu = dotW1;
+    float x3 = x_gelu*x_gelu*x_gelu;
+    float u = 0.5f*x_gelu*(1.f+tanhf(c*(x_gelu+0.044715f*x3)));
+
+    for(int i=0; i<4; i++){
+      float w2_val = W2_rm[(size_t)fcol*(size_t)Dhf + (size_t)col_base + i];
+      ffn_out[i] = fmaf(u, w2_val, ffn_out[i]);
+    }
+  }
+
+  __shfl_sync(0xFFFFFFFFu, 0, 0); // barrier safety
+  float f0=0.f, f1=0.f, f2=0.f, f3=0.f;
+  for(int l=0; l<32; l++){
+    float fo0 = __shfl_sync(0xFFFFFFFFu, ffn_out[0], l);
+    float fo1 = __shfl_sync(0xFFFFFFFFu, ffn_out[1], l);
+    float fo2 = __shfl_sync(0xFFFFFFFFu, ffn_out[2], l);
+    float fo3 = __shfl_sync(0xFFFFFFFFu, ffn_out[3], l);
+    f0 += fo0; f1 += fo1; f2 += fo2; f3 += fo3;
+  }
+
+  float* Y2n = Y2 + (size_t)n*(size_t)Dhf;
+  float4 y2_in = ld_cg_f4((const float4*)(Y2n + col_base));
+  ((float4*)(Y2n + col_base))[0] = make_float4(y2_in.x + f0, y2_in.y + f1, y2_in.z + f2, y2_in.w + f3);
 }
 
 // ================= GPU container =================
@@ -2006,50 +2287,30 @@ static void train_step_device(GPU* g){
     );
     KERNEL_CHECK();
 
-    dim3 grid(B,H,(T+FA_QT-1)/FA_QT);
-    flash_fwd_hf<<<grid,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
+    dim3 grid_fwd(B,H,(T+127)/128);
+    flash_fwd_wmma_hf<<<grid_fwd,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
 
-    f2h<<<(N*Dhf+255)/256,256>>>(g->n_h, g->O, N*Dhf); KERNEL_CHECK();
-    wmma_fwd(g->fout, g->n_h, g->Hw.Wo_tr[l], N, Dhf, Dhf);
-    add_inplace<<<(N*Dhf+255)/256,256>>>(g->y1, g->fout, N*Dhf); KERNEL_CHECK();
-
-    rms_fwd_f2h<Dhf><<<N,256>>>(g->n, g->n_h, g->inv, g->y1, g->W.gg[l], N); KERNEL_CHECK();
-    wmma_fwd(g->U, g->n_h, g->Hw.W1_tr[l], N, F, Dhf);
-    gelu_fwd<<<(N*F+255)/256,256>>>(g->A, g->U, N*F); KERNEL_CHECK();
-    f2h<<<(N*F+255)/256,256>>>(g->A_h, g->A, N*F); KERNEL_CHECK();
-    wmma_fwd(g->gout, g->A_h, g->Hw.W2_tr[l], N, Dhf, F);
-    add_inplace<<<(N*Dhf+255)/256,256>>>(g->y2, g->gout, N*Dhf); KERNEL_CHECK();
+    int blocks_ffn = (N + WPB - 1) / WPB;
+    fused_rms_gelu_ffn_hf<WPB><<<blocks_ffn,256>>>(
+      g->y1, g->y2, g->inv, g->n, g->O,
+      g->W.Wo[l], g->W.W1[l], g->W.W2[l], g->W.gg[l],
+      N, F
+    );
+    KERNEL_CHECK();
   }
 
   concat_full<<<dim3((D+15)/16,(N+15)/16),blk2>>>(g->Xfull, g->y1, g->y2, N); KERNEL_CHECK();
   rms_fwd_f2h<D><<<N,256>>>(g->Xnorm, g->Xnorm_h, g->invF, g->Xfull, g->W.gout, N); KERNEL_CHECK();
 
-  init_row_stats<<<(N+255)/256,256>>>(g->row_max, g->row_sum, g->Loss, N); KERNEL_CHECK();
-  for(int v0=0; v0<V; v0+=VCHUNK){
-    int Mvalid = (v0+VCHUNK<=V)? VCHUNK : (V - v0);
-    const half* Wtr = g->Hw.Wout_tr + (size_t)v0*(size_t)D;
-    wmma_fwd(g->logits_chunk, g->Xnorm_h, Wtr, N, VCHUNK, D);
-    chunk_max_sumexp<<<N,256>>>(g->chunk_max, g->chunk_sum, g->logits_chunk, N, Mvalid); KERNEL_CHECK();
-    update_row_stats<<<(N+255)/256,256>>>(g->row_max, g->row_sum, g->chunk_max, g->chunk_sum, N); KERNEL_CHECK();
-  }
-
   zero_f<<<(N*D+255)/256,256>>>(g->dXnorm, N*D); KERNEL_CHECK();
-  for(int v0=0; v0<V; v0+=VCHUNK){
-    int Mvalid = (v0+VCHUNK<=V)? VCHUNK : (V - v0);
-    const half* Wtr = g->Hw.Wout_tr + (size_t)v0*(size_t)D;
-    wmma_fwd(g->logits_chunk, g->Xnorm_h, Wtr, N, VCHUNK, D);
-
-    dy_loss_from_logits<<<(N*VCHUNK+255)/256,256>>>(g->dY_chunk, g->Loss, g->logits_chunk,
-                                                    g->row_max, g->row_sum, g->tgt, N, v0, Mvalid, invN);
-    KERNEL_CHECK();
-
-    wmma_dW(g->dWout_chunk, g->Atr, g->dYtr, g->Xnorm, g->dY_chunk, N, D, VCHUNK);
-    scatter_add_dwout_chunk<<<(D*VCHUNK+255)/256,256>>>(g->G.Wout, g->dWout_chunk, v0); KERNEL_CHECK();
-
-    pack_wout_rm_chunk<<<(D*VCHUNK+255)/256,256>>>(g->Wout_rm_chunk, g->Hw.Wout_rm, v0); KERNEL_CHECK();
-    wmma_dA(g->dXfull, g->scratchHalf_head, g->dY_chunk, g->Wout_rm_chunk, N, VCHUNK, D);
-    add_inplace<<<(N*D+255)/256,256>>>(g->dXnorm, g->dXfull, N*D); KERNEL_CHECK();
-  }
+  
+  // Single-pass "Beast Mode" Persistent Head mapping:
+  persistent_head_beast_hf<<<N, 256>>>(
+      g->Loss, g->dXnorm, g->G.Wout, 
+      g->Xnorm_h, g->Hw.Wout_tr, g->tgt,
+      N, D, V, Vpad
+  );
+  KERNEL_CHECK();
 
   zero_f<<<(N*D+255)/256,256>>>(g->dXfull, N*D); KERNEL_CHECK();
   rms_bwd_dX<D><<<N,256>>>(g->dXfull, g->dXnorm, g->Xfull, g->W.gout, g->invF, N); KERNEL_CHECK();
@@ -2091,8 +2352,8 @@ static void train_step_device(GPU* g){
     );
     KERNEL_CHECK();
 
-    dim3 grid(B,H,(T+FA_QT-1)/FA_QT);
-    flash_fwd_hf<<<grid,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
+    dim3 grid_fwd(B,H,(T+127)/128);
+    flash_fwd_wmma_hf<<<grid_fwd,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
 
     f2h<<<(N*Dhf+255)/256,256>>>(g->n_h, g->O, N*Dhf); KERNEL_CHECK();
     wmma_fwd(g->fout, g->n_h, g->Hw.Wo_tr[l], N, Dhf, Dhf);
@@ -2109,8 +2370,8 @@ static void train_step_device(GPU* g){
     zero_f<<<(N*Dhf+255)/256,256>>>(g->dK, N*Dhf); KERNEL_CHECK();
     zero_f<<<(N*Dhf+255)/256,256>>>(g->dVh,N*Dhf); KERNEL_CHECK();
 
-    flash_bwd_dq_hf<<<dim3(B,H,(T+FA_QT-1)/FA_QT),256>>>(g->dp, g->dQ, g->dOattn, g->Q, g->K, g->Vh, g->matt, g->latt, B, T); KERNEL_CHECK();
-    flash_bwd_dkv_hf<<<dim3(B,H,(T+FA_KT-1)/FA_KT),256>>>(g->dK, g->dVh, g->dOattn, g->Q, g->K, g->Vh, g->matt, g->latt, g->dp, B, T); KERNEL_CHECK();
+    flash_bwd_dq_wmma_hf<<<dim3(B,H,(T+FA_QT-1)/FA_QT),256>>>(g->dp, g->dQ, g->dOattn, g->Q, g->K, g->Vh, g->matt, g->latt, B, T); KERNEL_CHECK();
+    flash_bwd_dkv_wmma_hf<<<dim3(B,H,(T+FA_KT-1)/FA_KT),256>>>(g->dK, g->dVh, g->dOattn, g->Q, g->K, g->Vh, g->matt, g->latt, g->dp, B, T); KERNEL_CHECK();
 
     dim3 rblk(16,16);
     dim3 rgrd((Dh/2+15)/16, ((B*T)+15)/16, H);
@@ -2672,8 +2933,11 @@ int main(int argc,char** argv){
 
   bool has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
 
-  if(do_train && has_ckpt && !do_continue){
-    die("ckpt exists: pass --continue or delete ckpt (or use --force-new in the .sh)");
+  if(has_ckpt && do_train && !do_continue){
+    die("FATAL: checkpoint exists. You must either pass --continue to resume it, or --force-new to delete it.");
+  }
+  if(do_continue && !has_ckpt){
+    std::fprintf(stderr, "WARNING: --continue requested but no ckpt found. Starting fresh.\n");
   }
 
   if(!has_ckpt){
@@ -2733,7 +2997,7 @@ int main(int argc,char** argv){
     }
   }
 
-  std::printf("llm_engine_mega: V=%d(Vpad=%d) K=%d K1=%d K2=%d D=%d Dh=%d L=%d H=%d F=%d T=%d gpus=%d batch=%d [",
+  std::printf("RUNBEAST ENGINE ACTIVATED: V=%d(Vpad=%d) K=%d K1=%d K2=%d D=%d Dh=%d L=%d H=%d F=%d T=%d gpus=%d batch=%d [",
               V,Vpad,PAIR_K,PAIR_K1,PAIR_K-PAIR_K1,D,Dh,L,H,F,seq,G,batch);
   for(int i=0;i<G;i++) std::printf("%d%s", Bi[(size_t)i], (i+1<G)?",":"");
   std::printf("]\n");
@@ -2902,10 +3166,18 @@ elif [[ $USER_PASSED_CKPT -eq 0 && ! -f "$CKPT_FILE" ]]; then
 fi
 
 echo
-echo "================================================================="
-echo "  Run Settings (Hash: $CKPT_HASH)"
+echo "========================================================================="
+echo "  ██████╗ ██╗   ██╗███╗   ██╗██████╗ ███████╗ █████╗ ███████╗████████╗"
+echo "  ██╔══██╗██║   ██║████╗  ██║██╔══██╗██╔════╝██╔══██╗██╔════╝╚══██╔══╝"
+echo "  ██████╔╝██║   ██║██╔██╗ ██║██████╔╝█████╗  ███████║███████╗   ██║   "
+echo "  ██╔══██╗██║   ██║██║╚██╗██║██╔══██╗██╔══╝  ██╔══██║╚════██║   ██║   "
+echo "  ██║  ██║╚██████╔╝██║ ╚████║██████╔╝███████╗██║  ██║███████║   ██║   "
+echo "  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝   "
+echo "========================================================================="
+echo "  [RAW POWER UNLOCKED] - Bypassing all limits. Squeezing galaxies."
+echo "  Hash Configuration: $CKPT_HASH"
 echo "  cmd: ./$BIN --data \"$DATA_FILE\" --index \"$INDEX_BIN\" ${PASSED_ARGS[@]}"
-echo "================================================================="
+echo "========================================================================="
 echo
 
 # Set default parameters if not provided in PASSED_ARGS.
