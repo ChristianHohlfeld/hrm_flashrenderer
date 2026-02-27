@@ -1811,15 +1811,18 @@ static void train_step_device(GPU* g){
   loss_reduce_2<<<1,256>>>(g->partial, g->loss_mean, 256, invN); KERNEL_CHECK();
 }
 
-static void ensure_train_graph(GPU* g){
-  if(g->graph_built) return;
-  CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal));
-  CUDA_CHECK(cudaMemcpyAsync(g->tok, g->htok_h, (size_t)g->N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
-  CUDA_CHECK(cudaMemcpyAsync(g->tgt, g->htgt_h, (size_t)g->N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
-  train_step_device(g);
-  CUDA_CHECK(cudaStreamEndCapture(0, &g->graph));
-  CUDA_CHECK(cudaGraphInstantiate(&g->graphExec, g->graph, nullptr, nullptr, 0));
-  g->graph_built = 1;
+static void ensure_train_graph(GPU* g) {
+    if (g->graph_built) return;
+
+    // Start capture on the main stream
+    CUDA_CHECK(cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal));
+
+    // Record only the compute-intensive device-only work
+    train_step_device(g);
+
+    CUDA_CHECK(cudaStreamEndCapture(0, &g->graph));
+    CUDA_CHECK(cudaGraphInstantiate(&g->graphExec, g->graph, nullptr, nullptr, 0));
+    g->graph_built = 1;
 }
 
 static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int64_t start_bias, uint64_t seed, int use_graph){
