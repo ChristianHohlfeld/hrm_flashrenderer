@@ -117,8 +117,11 @@ static Stage1 build_stage1(const std::vector<std::string>& inputs, int K1){
     uint64_t ca=cnt[a], cb=cnt[b];
     if(ca!=cb) return ca>cb;
     return a<b;
-  });
-  if((int)all.size()<K1) die("K1 too large for corpus");
+  if((int)all.size()<K1){
+    std::fprintf(stderr, "[index] WARNING: K1 (%d) is larger than unique pairs in corpus (%d). Scaling K1 down to %d.\n", K1, (int)all.size(), (int)all.size());
+    K1 = (int)all.size();
+    s1.K1 = K1;
+  }
   s1.id2pair.assign(all.begin(), all.begin()+K1);
   for(int i=0;i<K1;i++) s1.pair2id[s1.id2pair[(size_t)i]] = 256 + i;
   return s1;
@@ -531,13 +534,15 @@ static bool load_index_v7(const char* path, PairIndex* pi){
   r_u32(ver); r_u32(k1); r_u32(k2); r_u32(pow2); r_u32(res);
   (void)res;
   if(ver!=1u) die("bad index ver");
-  if((int)k1!=K1 || (int)k2!=K2) die("index K mismatch");
-  pi->id2pair.resize(K1);
-  r_bytes(pi->id2pair.data(), (size_t)K1*sizeof(uint16_t));
+  if((int)k1 > K1 || (int)k2 > K2) die("index K mismatch (index larger than max macros)");
+  
+  pi->id2pair.resize(k1);
+  r_bytes(pi->id2pair.data(), (size_t)k1*sizeof(uint16_t));
   pi->pair2id.assign(65536,-1);
-  for(int i=0;i<K1;i++) pi->pair2id[pi->id2pair[(size_t)i]] = BASE_V + i;
-  pi->id2pair2.resize(K2);
-  if(K2>0) r_bytes(pi->id2pair2.data(), (size_t)K2*sizeof(uint32_t));
+  for(int i=0;i<(int)k1;i++) pi->pair2id[pi->id2pair[(size_t)i]] = BASE_V + i;
+
+  pi->id2pair2.resize(k2);
+  if(k2>0) r_bytes(pi->id2pair2.data(), (size_t)k2*sizeof(uint32_t));
   int table_size = 1 << (int)pow2;
   if(table_size < 2) die("bad index table");
   pi->hkeys.resize((size_t)table_size);
@@ -2669,8 +2674,13 @@ else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++
   }
 
   std::vector<float> hostW(weights_floats());
-  if(has_ckpt) hostW=winit;
+  if(has_ckpt) {
+    hostW=winit;
+    if(!do_train) do_chat = true; // Auto start chat if model checkpoint is loaded and train not explicitly set
+  }
   else init_weights_cpu(hostW, seed);
+
+  if(!do_train && !do_chat) do_train=true;
 
   if(do_chat){
     chat_repl(pi, hostW, ckpt_path, chat_prompt, do_measure);
@@ -2792,8 +2802,11 @@ echo
 echo "[*] TRAIN example:"
 echo "  ./$BIN --train --data \"$DATA_FILE\" --ckpt ckpt.bin --steps 20000 --batch 256 --seq 512 --gpus 4 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 1000"
 echo
-echo "[*] CHAT example:"
-echo "  ./$BIN --chat --ckpt ckpt.bin --chat_prompt \"Hello\""
+echo
+echo "[*] Quickstart / Default behavior:"
+echo "  # If 'ckpt.bin' exists, runs in chat mode automatically."
+echo "  # If 'ckpt.bin' doesn't exist, starts training automatically on '$DATA_FILE'."
+echo "  ./$BIN --data \"$DATA_FILE\" --ckpt ckpt.bin"
 echo
 if [[ "$#" -gt 0 ]]; then
   ./"$BIN" "$@"

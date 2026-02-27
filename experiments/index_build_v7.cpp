@@ -163,7 +163,11 @@ static Stage1 build_stage1(const std::vector<std::string>& inputs, int K1){
     if(ca!=cb) return ca>cb;
     return a<b;
   });
-  if((int)all.size()<K1) die("K1 too large for corpus");
+  if((int)all.size()<K1){
+    std::fprintf(stderr, "[index] WARNING: K1 (%d) is larger than unique pairs in corpus (%d). Scaling K1 down to %d.\n", K1, (int)all.size(), (int)all.size());
+    K1 = (int)all.size();
+    s1.K1 = K1;
+  }
   s1.id2pair.assign(all.begin(), all.begin()+K1);
   for(int i=0;i<K1;i++) s1.pair2id[s1.id2pair[(size_t)i]] = 256 + i;
   return s1;
@@ -358,7 +362,7 @@ int main(int argc, char** argv){
   wu32(f, (uint32_t)K2);
   wu32(f, (uint32_t)pow2);
   wu32(f, 0u);
-  for(int i=0;i<K1;i++) wu16(f, s1.id2pair[(size_t)i]);
+  for(int i=0;i<s1.K1;i++) wu16(f, s1.id2pair[(size_t)i]);
   for(int i=0;i<K2;i++) wu32(f, id2pair2[(size_t)i]);
   wf(f, hkeys.data(), hkeys.size()*sizeof(uint32_t));
   wf(f, hvals.data(), hvals.size()*sizeof(uint16_t));

@@ -40,14 +40,16 @@ Run the scripts in training mode, specifying your text corpus and the desired ou
 *Note: Wait for this process to complete before testing chat.*
 
 ### 2. Run Inference (Chat Mode)
-Once training finishes and the `my_custom_model.bin` file is saved, you can chat with it by referencing that same checkpoint.
+Because these scripts are now designed with a "Quickstart Feature", if your custom model checkpoint (`my_custom_model.bin`) already exists from step 1, the script will **automatically boot directly into Chat Mode**!
+
+So, the next time you want to chat with your model, you just run the exact same command:
 
 ```bash
-# Chat with the PHO version
-./run_llm.sh --chat --measure --ckpt my_custom_model.bin
+# Chat with the PHO version (auto-detects the saved model)
+./run_llm.sh --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin
 
-# Chat with the original version
-./run_llm_orig.sh --chat --measure --ckpt my_custom_model.bin
+# Chat with the original version (auto-detects the saved model)
+./run_llm_orig.sh --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin
 ```
 
 When the `>` prompt appears, type your message and hit Enter. The model will auto-regressively predict the next stream of tokens based on what it learned from your custom corpus!
