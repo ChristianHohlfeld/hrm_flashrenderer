@@ -38,7 +38,9 @@ INDEX_BIN="${INDEX_BIN:-index_v7.bin}"
 FORCE_INDEX="${FORCE_INDEX:-0}"
 
 if [[ "$FORCE_INDEX" == "1" || ! -f "$INDEX_BIN" ]]; then
-  cat > index_build_v7.cpp <<'CPP'
+  TMP_BUILD_DIR=$(mktemp -d)
+  
+  cat > "$TMP_BUILD_DIR/index_build_v7.cpp" <<'CPP'
 /*
 =============================================================================
 © 2026 Christian Heinrich Hohlfeld (Konstanz, Deutschland) — Alle Rechte vorbehalten.
@@ -339,8 +341,9 @@ TMAX="${TMAX:-512}"
 
 BIN="${BIN:-llm_engine}"
 CU="${CU:-llm_engine.cu}"
+TMP_CU_DIR=$(mktemp -d)
 
-cat > "$CU" <<'CU'
+cat > "$TMP_CU_DIR/$CU" <<'CU'
 /*
 =============================================================================
 © 2026 Christian Heinrich Hohlfeld (Konstanz, Deutschland) — Alle Rechte vorbehalten.
@@ -2797,7 +2800,10 @@ CU
 echo "[*] Building: $BIN (sm_75)"
 nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread --use_fast_math -lineinfo --expt-relaxed-constexpr \
   -DPAIR_K="$PAIR_K" -DPAIR_K1="$PAIR_K1" -DVCHUNK="$VCHUNK" -DDMODEL="$DMODEL" -DNHEAD="$NHEAD" -DNLAY="$NLAY" -DFFN="$FFN" -DTMAX="$TMAX" \
-  "$CU" -o "$BIN"
+  "$TMP_CU_DIR/$CU" -o "$TMP_CU_DIR/temp_bin"
+
+mv "$TMP_CU_DIR/temp_bin" "$BIN"
+rm -rf "$TMP_CU_DIR"
 
 echo
 echo "[*] TRAIN example:"
