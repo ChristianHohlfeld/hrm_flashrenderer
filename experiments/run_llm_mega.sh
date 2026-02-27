@@ -400,7 +400,7 @@ CPP
   rm -rf "$tmpdir"
 }
 
-if [[ "$FORCE_INDEX" == "1" || ! -f "$INDEX_BIN" ]]; then
+if [[ "$FORCE_INDEX" == "1" || ! -s "$INDEX_BIN" ]]; then
   build_index
 fi
 
@@ -662,6 +662,7 @@ static std::vector<uint16_t> encode_ids(const PairIndex& pi, const uint8_t* b, s
 }
 
 static inline void decode_id(const PairIndex& pi, uint16_t id, std::vector<uint8_t>& out){
+  if(id >= (uint16_t)V){ out.push_back('?'); return; }
   if(id < BASE_V){ out.push_back((uint8_t)id); return; }
   if(id < (uint16_t)(BASE_V + K1)){
     int idx=(int)id-BASE_V;
@@ -2634,7 +2635,7 @@ int main(int argc,char** argv){
   bool do_chat=false;
   bool do_measure=false;
   bool do_continue=false;
-  int use_graph=1;
+  int use_graph = (std::getenv("DEBUG_NOGRAPH") ? 0 : 1);
   const char* chat_prompt="";
 
   for(int i=1;i<argc;i++){
@@ -2656,8 +2657,6 @@ int main(int argc,char** argv){
     else if(!std::strcmp(argv[i],"--log_every") && i+1<argc) log_every=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--save_every") && i+1<argc) save_every=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--seed") && i+1<argc) seed=(uint64_t)std::strtoull(argv[++i],nullptr,10);
-    else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++i]);
-    else if(!std::strcmp(argv[i],"--no_graph")) use_graph=0;
     else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
   }
 
@@ -2672,6 +2671,10 @@ int main(int argc,char** argv){
   std::vector<float> winit;
 
   bool has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
+
+  if(do_train && has_ckpt && !do_continue){
+    die("ckpt exists: pass --continue or delete ckpt (or use --force-new in the .sh)");
+  }
 
   if(!has_ckpt){
     if(!load_index_v7(index_path, &pi)) die("no ckpt and could not load index (build index first)");
@@ -2816,7 +2819,30 @@ FORCE_NEW=0
 USER_PASSED_CKPT=0
 declare -a PASSED_ARGS
 for arg in "$@"; do
-  if [[ "$arg" == "--force-new" ]]; then
+  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Wrapper Options:"
+    echo "  --force-new       Delete the existing checkpoint for this configuration and start fresh."
+    echo ""
+    echo "Engine Options:"
+    echo "  --train           Start training mode."
+    echo "  --chat            Start chat mode."
+    echo "  --chat_prompt P   Provides initial chat prompt."
+    echo "  --continue        Continue from an existing checkpoint."
+    echo "  --steps N         Number of training steps."
+    echo "  --batch N         Batch size across all GPUs."
+    echo "  --seq N           Sequence length."
+    echo "  --gpus N          Number of GPUs to use."
+    echo "  --measure         Print token/sec performance."
+    echo "  --no_graph        Disable CUDA Graphs for execution (Graph is on by default)."
+    echo "  --lr F            Learning rate."
+    echo "  --ckpt PATH       Specify a custom checkpoint path to save/load."
+    echo ""
+    echo "By default, the script generates a deterministic checkpoint based on model dimensions."
+    echo "If a checkpoint exists, it will auto-continue (or auto-chat if neither --train nor --chat is given)."
+    exit 0
+  elif [[ "$arg" == "--force-new" ]]; then
     FORCE_NEW=1
   elif [[ "$arg" == "--ckpt" ]]; then
     USER_PASSED_CKPT=1

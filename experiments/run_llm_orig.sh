@@ -55,7 +55,7 @@ INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}.bin}"
 ABS_INPUT="$(absify_inputs "$INDEX_INPUTS")"
 FORCE_INDEX="${FORCE_INDEX:-0}"
 
-if [[ "$FORCE_INDEX" == "1" || ! -f "$INDEX_BIN" ]]; then
+if [[ "$FORCE_INDEX" == "1" || ! -s "$INDEX_BIN" ]]; then
   TMP_BUILD_DIR=$(mktemp -d)
   
   cat > "$TMP_BUILD_DIR/index_build_v7.cpp" <<'CPP'
@@ -703,6 +703,7 @@ static std::vector<uint16_t> encode_ids(const PairIndex& pi, const uint8_t* b, s
 }
 
 static inline void decode_id(const PairIndex& pi, uint16_t id, std::vector<uint8_t>& out){
+  if(id >= (uint16_t)V){ out.push_back('?'); return; }
   if(id < BASE_V){ out.push_back((uint8_t)id); return; }
   if(id < (uint16_t)(BASE_V + K1)){
     int idx=(int)id-BASE_V;
@@ -2861,13 +2862,11 @@ if [[ ! -f "$TMP_CU_DIR/$CU" ]]; then
   echo "FATAL: missing $CU in $TMP_CU_DIR"; exit 1
 fi
 
-python3 - <<'PY'
+python3 - "$TMP_CU_DIR/$CU" <<'PY'
 import re, pathlib, sys
 import os
 
-# We need the path from the environment or hardcoded as argument. 
-# Here we'll just read the file from the arguments since we use $TMP_CU_DIR/$CU
-cu_path = os.environ.get("CU_PATH")
+cu_path = sys.argv[1]
 p=pathlib.Path(cu_path)
 s=p.read_text(encoding="utf-8", errors="replace")
 

@@ -3092,23 +3092,7 @@ else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++
   auto bytes_raw=read_file_bytes(data_path);
 
   // If training from scratch but file exists, prevent overwrite
-  std::string actual_ckpt_path = ckpt_path;
-  if (!do_continue && !do_chat) {
-    FILE* exist = std::fopen(ckpt_path, "rb");
-    if (exist) {
-      std::fclose(exist);
-      std::printf("[*] Found existing '%s'. To resume, use --continue.\n", ckpt_path);
-      std::printf("[*] Auto-versioning to avoid overwrite...\n");
-      int suffix = 1;
-      while (true) {
-        FILE* tst = std::fopen(actual_ckpt_path.c_str(), "rb");
-        if (!tst) break; // Free name found
-        std::fclose(tst);
-        actual_ckpt_path = std::string(ckpt_path) + "." + std::to_string(suffix++);
-      }
-    }
-  }
-  ckpt_path = actual_ckpt_path.c_str();
+
 
   PhoU pho = pho_default();
   bool pho_on = false;
@@ -3303,6 +3287,68 @@ if(use_graph){
 }
 CU
 
+# ---------------- Patch llm_engine.cu (Graph-safe KERNEL_CHECK + pointer restore) ----------------
+if [[ ! -f "$TMP_CU_DIR/$CU" ]]; then
+  echo "FATAL: missing $CU in $TMP_CU_DIR"; exit 1
+fi
+
+python3 - "$TMP_CU_DIR/$CU" <<'PY'
+import re, pathlib, sys
+import os
+
+cu_path = sys.argv[1]
+p=pathlib.Path(cu_path)
+s=p.read_text(encoding="utf-8", errors="replace")
+
+if "MEGA_KERNEL_PATCH_v1" not in s:
+    ins = "\n// MEGA_KERNEL_PATCH_v1\nstatic int g_is_capturing = 0;\n"
+    if "static int g_is_capturing" not in s:
+        m=list(re.finditer(r'^\s*#include[^\n]*\n', s, flags=re.M))
+        if not m:
+            raise SystemExit("patch: could not find includes")
+        last=m[-1].end()
+        s = s[:last] + ins + s[last:]
+
+    def repl_kernel_check(m):
+        return (
+            "#define KERNEL_CHECK() do{ if(g_is_capturing) break; cudaError_t e=cudaGetLastError(); if(e!=cudaSuccess){ \\\n"
+            "  std::fprintf(stderr,\"KERNEL %s:%d: %s\\n\",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} }while(0)\n"
+        )
+    s2, n = re.subn(r'#define\s+KERNEL_CHECK\(\)\s+do\{.*?\}while\(0\)\s*\n', repl_kernel_check, s, count=1, flags=re.S)
+    if n>0:
+        s=s2
+
+    if "g_is_capturing=1" not in s:
+        s = s.replace("CUDA_CHECK(cudaStreamBeginCapture(0", "g_is_capturing=1;\n  CUDA_CHECK(cudaStreamBeginCapture(0", 1)
+    if "g_is_capturing=0" not in s:
+        s = s.replace("CUDA_CHECK(cudaStreamEndCapture(0, &g->graph));",
+                      "CUDA_CHECK(cudaStreamEndCapture(0, &g->graph));\n  g_is_capturing=0;\n  KERNEL_CHECK();",
+                      1)
+
+    m=re.search(r'(static\s+void\s+train_step_device\s*\(\s*GPU\*\s*g\s*\)\s*\{)(.*?)(\n\}\s*\n\s*static\s+void\s+ensure_train_graph)', s, flags=re.S)
+    if m:
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        if "save pointer state (reversible swaps)" not in body:
+            body2 = re.sub(
+                r'(int\s+B\s*=\s*g->B\s*,\s*T\s*=\s*g->T\s*,\s*N\s*=\s*g->N\s*;\s*)',
+                r'\1\n  // MEGA_KERNEL_PATCH_v1: save pointer state (reversible swaps)\n'
+                r'  float *y1=g->y1,*y2=g->y2,*x1=g->x1,*x2=g->x2;\n'
+                r'  float *dy1=g->dy1,*dy2=g->dy2,*dx1=g->dx1,*dx2=g->dx2;\n',
+                body,
+                count=1
+            )
+            body = body2
+        if "restore pointer state for next step" not in body:
+            body = body + (
+                "\n  // MEGA_KERNEL_PATCH_v1: restore pointer state for next step\n"
+                "  g->y1=y1; g->y2=y2; g->x1=x1; g->x2=x2;\n"
+                "  g->dy1=dy1; g->dy2=dy2; g->dx1=dx1; g->dx2=dx2;\n"
+            )
+        s = s[:m.start()] + head + body + tail + s[m.end():]
+
+    p.write_text(s, encoding="utf-8")
+PY
+
 echo "[*] Building: $BIN (sm_75)"
 nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread --use_fast_math -lineinfo --expt-relaxed-constexpr \
   -DPAIR_K="$PAIR_K" -DPAIR_K1="$PAIR_K1" -DVCHUNK="$VCHUNK" -DDMODEL="$DMODEL" -DNHEAD="$NHEAD" -DNLAY="$NLAY" -DFFN="$FFN" -DTMAX="$TMAX" \
@@ -3311,20 +3357,88 @@ nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread --use_fast_math -lin
 mv "$TMP_CU_DIR/temp_bin" "$BIN"
 rm -rf "$TMP_CU_DIR"
 
-echo
-echo "[*] TRAIN example:"
-echo "  ./$BIN --train --data \"$DATA_FILE\" --ckpt ckpt.bin --steps 20000 --batch 256 --seq 512 --gpus 4 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 1000"
-echo
-echo
-echo "[*] Quickstart / Default behavior:"
-echo "  # If 'ckpt.bin' exists, runs in chat mode automatically."
-echo "  # If 'ckpt.bin' doesn't exist, starts training automatically on '$DATA_FILE'."
-echo "  ./$BIN --data \"$DATA_FILE\" --ckpt ckpt.bin"
-echo
-if [[ "$#" -gt 0 ]]; then
-  # If you pass arguments to this script, we prepended --data and --index so they are picked up unless overridden.
-  ./"$BIN" --data "$DATA_FILE" --index "$INDEX_BIN" "$@"
+# =============================================================================
+# Deterministic Hash-based Checkpointing
+# =============================================================================
+# Create a deterministic MD5 hash based on the structural hyperparameters.
+# This ensures checkpoints are strictly tied to the exact architecture they
+# were trained on, preventing shape-mismatch crashes.
+HASH_STR="${BIN}_K${PAIR_K}_D${DMODEL}_H${NHEAD}_L${NLAY}_F${FFN}_T${TMAX}"
+CKPT_HASH=$(echo -n "$HASH_STR" | md5sum | head -c 8)
+DEFAULT_CKPT_FILE="${WORKDIR}/ckpt_${BIN}_${CKPT_HASH}.bin"
+
+# Parse bash-level arguments
+FORCE_NEW=0
+USER_PASSED_CKPT=0
+declare -a PASSED_ARGS
+for arg in "$@"; do
+  if [[ "$arg" == "--force-new" ]]; then
+    FORCE_NEW=1
+  elif [[ "$arg" == "--ckpt" ]]; then
+    USER_PASSED_CKPT=1
+    PASSED_ARGS+=("$arg")
+  else
+    PASSED_ARGS+=("$arg")
+  fi
+done
+
+# If the user didn't explicitly provide a --ckpt, we inject our deterministic one
+if [[ $USER_PASSED_CKPT -eq 0 ]]; then
+  CKPT_FILE="$DEFAULT_CKPT_FILE"
+  # Inject it so the C++ engine knows where to look/save
+  PASSED_ARGS+=("--ckpt" "$CKPT_FILE")
 else
-  # Default smoke-run (same as previous behavior)
-  ./"$BIN" --train --data "$DATA_FILE" --index "$INDEX_BIN" --ckpt ckpt.bin --steps 2000 --batch 64 --seq 128 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 500
+  # The user passed a custom ckpt path, we'll respect it but extract it to check existence
+  # Actually, parsing it out of bash arrays robustly is slightly tricky here, so we'll
+  # assume if they pass a custom path they know what they're doing with --continue
+  CKPT_FILE="" # Unused in explicit check below
 fi
+
+if [[ $FORCE_NEW -eq 1 ]]; then
+  echo "[*] --force-new passed. Ensuring a fresh start."
+  if [[ $USER_PASSED_CKPT -eq 0 && -f "$CKPT_FILE" ]]; then
+    rm -f "$CKPT_FILE"
+    echo "[*] Deleted existing checkpoint: $CKPT_FILE"
+  fi
+  # If they passed custom ckpt, we assume they wiped it themselves or we just pass through
+fi
+
+# Auto-continue logic
+# If we have a known CKPT_FILE and it exists, default to --continue
+has_train_flag=0
+has_chat_flag=0
+has_continue_flag=0
+for arg in "${PASSED_ARGS[@]}"; do
+  if [[ "$arg" == "--train" ]]; then has_train_flag=1; fi
+  if [[ "$arg" == "--chat" ]]; then has_chat_flag=1; fi
+  if [[ "$arg" == "--continue" ]]; then has_continue_flag=1; fi
+done
+
+if [[ $USER_PASSED_CKPT -eq 0 && -f "$CKPT_FILE" ]]; then
+  echo "[*] Found deterministic checkpoint: $CKPT_FILE"
+  if [[ $has_chat_flag -eq 0 && $has_train_flag -eq 0 ]]; then
+     echo "[*] Auto-entering Chat mode."
+     PASSED_ARGS+=("--chat" "--chat_prompt" "Hello")
+  elif [[ $has_train_flag -eq 1 && $has_continue_flag -eq 0 && $FORCE_NEW -eq 0 ]]; then
+     echo "[*] Auto-appending --continue to training."
+     PASSED_ARGS+=("--continue")
+  fi
+elif [[ $USER_PASSED_CKPT -eq 0 && ! -f "$CKPT_FILE" ]]; then
+  echo "[*] No checkpoint found for hash [${CKPT_HASH}]. Starting fresh."
+  if [[ $has_chat_flag -eq 0 && $has_train_flag -eq 0 ]]; then
+     echo "[*] Auto-entering Train mode."
+     PASSED_ARGS+=("--train")
+  fi
+fi
+
+echo
+echo "================================================================="
+echo "  Run Settings (Hash: $CKPT_HASH)"
+echo "  cmd: ./$BIN --data \"$DATA_FILE\" --index \"$INDEX_BIN\" ${PASSED_ARGS[@]}"
+echo "================================================================="
+echo
+
+# Set default parameters if not provided in PASSED_ARGS.
+# The user's array over-rides anything added later inside C++, but we must provide --data & --index.
+./"$BIN" --data "$DATA_FILE" --index "$INDEX_BIN" "${PASSED_ARGS[@]}"
+
