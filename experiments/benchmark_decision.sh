@@ -14,7 +14,7 @@ LOG_EVERY="${LOG_EVERY:-10}"
 SAVE_EVERY="${SAVE_EVERY:-1000}"
 GPUS="${GPUS:-1}"
 INCLUDE_BEAST="${INCLUDE_BEAST:-1}"
-LR_LIST="${LR_LIST:-3e-4}"   # comma-separated, e.g. 1e-4,3e-4,1e-3
+LR_LIST="${LR_LIST:-0.0003}"   # comma-separated, e.g. 0.0001,0.0003,0.001
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/bench_decision}"
 mkdir -p "$OUT_DIR/corpora" "$OUT_DIR/logs"
 
@@ -52,6 +52,15 @@ RUNNERS=(
 )
 [[ "$INCLUDE_BEAST" == "1" ]] && RUNNERS+=("beast|./runbeast.sh|")
 
+normalize_lr() {
+  python3 - "$1" <<'PYLR'
+import sys
+x=float(sys.argv[1])
+out=f"{x:.10f}".rstrip('0').rstrip('.')
+print(out)
+PYLR
+}
+
 CSV="$OUT_DIR/raw.csv"
 echo 'runner,scenario,lr,rep,tok_s,elapsed_sec' > "$CSV"
 
@@ -64,11 +73,12 @@ run_once(){
     "$script" --train --force-new --steps "$STEPS" --log_every "$LOG_EVERY" --save_every "$SAVE_EVERY" \
     --gpus "$GPUS" --seq "$seq" --batch "$batch" --measure --lr "$lr" --ckpt "$ckpt" $flag > "$log" 2>&1
 
-  local tok sec
+  local tok sec lr_disp
   tok="$(grep -Eo 'tok/s=[0-9]+(\.[0-9]+)?' "$log" | tail -1 | cut -d= -f2 || echo NA)"
   sec="$(grep -Eo 'ELAPSED_SEC=[0-9]+(\.[0-9]+)?' "$log" | tail -1 | cut -d= -f2 || echo NA)"
-  echo "$runner,$scenario,$lr,$rep,$tok,$sec" >> "$CSV"
-  printf '%-9s %-16s lr=%-7s r%-2s tok/s=%-9s sec=%s\n' "$runner" "$scenario" "$lr" "$rep" "$tok" "$sec"
+  lr_disp="$(normalize_lr "$lr")"
+  echo "$runner,$scenario,$lr_disp,$rep,$tok,$sec" >> "$CSV"
+  printf '%-9s %-16s lr=%-8s r%-2s tok/s=%-9s sec=%s\n' "$runner" "$scenario" "$lr_disp" "$rep" "$tok" "$sec"
 }
 
 echo "Running decision benchmark..."
