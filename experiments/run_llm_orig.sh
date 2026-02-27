@@ -2856,6 +2856,69 @@ if(use_graph){
   return 0;
 }
 CU
+# ---------------- Patch llm_engine_orig.cu (Graph-safe KERNEL_CHECK + pointer restore) ----------------
+if [[ ! -f "$TMP_CU_DIR/$CU" ]]; then
+  echo "FATAL: missing $CU in $TMP_CU_DIR"; exit 1
+fi
+
+python3 - <<'PY'
+import re, pathlib, sys
+import os
+
+# We need the path from the environment or hardcoded as argument. 
+# Here we'll just read the file from the arguments since we use $TMP_CU_DIR/$CU
+cu_path = os.environ.get("CU_PATH")
+p=pathlib.Path(cu_path)
+s=p.read_text(encoding="utf-8", errors="replace")
+
+if "MEGA_KERNEL_PATCH_v1" not in s:
+    ins = "\n// MEGA_KERNEL_PATCH_v1\nstatic int g_is_capturing = 0;\n"
+    if "static int g_is_capturing" not in s:
+        m=list(re.finditer(r'^\s*#include[^\n]*\n', s, flags=re.M))
+        if not m:
+            raise SystemExit("patch: could not find includes")
+        last=m[-1].end()
+        s = s[:last] + ins + s[last:]
+
+    def repl_kernel_check(m):
+        return (
+            "#define KERNEL_CHECK() do{ if(g_is_capturing) break; cudaError_t e=cudaGetLastError(); if(e!=cudaSuccess){ \\\n"
+            "  std::fprintf(stderr,\"KERNEL %s:%d: %s\\n\",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} }while(0)\n"
+        )
+    s2, n = re.subn(r'#define\s+KERNEL_CHECK\(\)\s+do\{.*?\}while\(0\)\s*\n', repl_kernel_check, s, count=1, flags=re.S)
+    if n>0:
+        s=s2
+
+    if "g_is_capturing=1" not in s:
+        s = s.replace("CUDA_CHECK(cudaStreamBeginCapture(0", "g_is_capturing=1;\n  CUDA_CHECK(cudaStreamBeginCapture(0", 1)
+    if "g_is_capturing=0" not in s:
+        s = s.replace("CUDA_CHECK(cudaStreamEndCapture(0, &g->graph));",
+                      "CUDA_CHECK(cudaStreamEndCapture(0, &g->graph));\n  g_is_capturing=0;\n  KERNEL_CHECK();",
+                      1)
+
+    m=re.search(r'(static\s+void\s+train_step_device\s*\(\s*GPU\*\s*g\s*\)\s*\{)(.*?)(\n\}\s*\n\s*static\s+void\s+ensure_train_graph)', s, flags=re.S)
+    if m:
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        if "save pointer state (reversible swaps)" not in body:
+            body2 = re.sub(
+                r'(int\s+B\s*=\s*g->B\s*,\s*T\s*=\s*g->T\s*,\s*N\s*=\s*g->N\s*;\s*)',
+                r'\1\n  // MEGA_KERNEL_PATCH_v1: save pointer state (reversible swaps)\n'
+                r'  float *y1=g->y1,*y2=g->y2,*x1=g->x1,*x2=g->x2;\n'
+                r'  float *dy1=g->dy1,*dy2=g->dy2,*dx1=g->dx1,*dx2=g->dx2;\n',
+                body,
+                count=1
+            )
+            body = body2
+        if "restore pointer state for next step" not in body:
+            body = body + (
+                "\n  // MEGA_KERNEL_PATCH_v1: restore pointer state for next step\n"
+                "  g->y1=y1; g->y2=y2; g->x1=x1; g->x2=x2;\n"
+                "  g->dy1=dy1; g->dy2=dy2; g->dx1=dx1; g->dx2=dx2;\n"
+            )
+        s = s[:m.start()] + head + body + tail + s[m.end():]
+
+    p.write_text(s, encoding="utf-8")
+PY
 
 echo "[*] Building: $BIN (sm_75)"
 nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread --use_fast_math -lineinfo --expt-relaxed-constexpr \
