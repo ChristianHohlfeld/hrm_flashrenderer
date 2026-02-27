@@ -2687,6 +2687,8 @@ int main(int argc,char** argv){
   const char* index_path="index_v7.bin";
   int steps=2000,batch=64,seq=128,gpus_req=2;
   float lr=3e-4f,wd=0.01f,clip=1.0f;
+  int log_every=50,save_every=500;
+  uint64_t seed=123;
   bool do_train=false;
   bool do_chat=false;
   bool do_measure=false;
@@ -2713,6 +2715,8 @@ int main(int argc,char** argv){
     else if(!std::strcmp(argv[i],"--log_every") && i+1<argc) log_every=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--save_every") && i+1<argc) save_every=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--seed") && i+1<argc) seed=(uint64_t)std::strtoull(argv[++i],nullptr,10);
+    else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++i]);
+    else if(!std::strcmp(argv[i],"--no_graph")) use_graph=0;
     else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
   }
   if(!do_train && !do_chat) do_train=true;
