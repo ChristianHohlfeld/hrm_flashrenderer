@@ -396,6 +396,7 @@ int main(int argc, char** argv){
   std::fprintf(stderr,"[index] inputs=%zu K1=%d K2=%d\n", inputs.size(), K1, K2);
 
   Stage1 s1=build_stage1(inputs, K1);
+  K1 = s1.K1;
   std::vector<uint32_t> id2pair2;
   build_stage2_external(inputs, s1, K2, id2pair2);
   std::vector<uint32_t> hkeys;

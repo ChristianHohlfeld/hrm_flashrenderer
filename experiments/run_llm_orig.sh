@@ -300,6 +300,7 @@ int main(int argc, char** argv){
   std::fprintf(stderr,"[index] inputs=%zu K1=%d K2=%d\n", inputs.size(), K1, K2);
 
   Stage1 s1=build_stage1(inputs, K1);
+  K1 = s1.K1;
   std::vector<uint32_t> id2pair2;
   build_stage2_external(inputs, s1, K2, id2pair2);
   std::vector<uint32_t> hkeys;
@@ -324,9 +325,18 @@ int main(int argc, char** argv){
   return 0;
 }
 CPP
-  g++ -O3 -std=c++17 index_build_v7.cpp -o index_build_v7
+  g++ -O3 -std=c++17 "$TMP_BUILD_DIR/index_build_v7.cpp" -o "$TMP_BUILD_DIR/index_build_v7"
   echo "[*] Building deterministic index: $INDEX_BIN (K1=$PAIR_K1 K2=$((PAIR_K-PAIR_K1)))"
-  ./index_build_v7 --k1 "$PAIR_K1" --k2 "$((PAIR_K-PAIR_K1))" --out "$INDEX_BIN" --inputs "$INDEX_INPUTS"
+  
+  # Ensure input files are absolute so the binary in the temp dir can find them
+  ABS_INPUT=$INDEX_INPUTS
+  if [[ ! "$ABS_INPUT" = /* ]]; then
+    ABS_INPUT="$WORKDIR/$INDEX_INPUTS"
+  fi
+  "$TMP_BUILD_DIR/index_build_v7" --k1 "$PAIR_K1" --k2 "$((PAIR_K-PAIR_K1))" --out "$INDEX_BIN" --inputs "$ABS_INPUT"
+  
+  # Cleanup index builder
+  rm -rf "$TMP_BUILD_DIR"
 fi
 
 
