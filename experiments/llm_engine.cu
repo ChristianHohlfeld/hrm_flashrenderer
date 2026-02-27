@@ -2011,7 +2011,7 @@ static void ensure_train_graph(GPU* g){
 }
 
 // ================= train step (host wrapper) =================
-static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int start_bias, uint64_t seed, int use_graph){
+static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int64_t start_bias, uint64_t seed, int use_graph){
   CUDA_CHECK(cudaSetDevice(g->dev));
   int B=g->B, T=g->T, N=g->N;
 
@@ -2023,13 +2023,24 @@ static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int 
   uint16_t* htok = g->htok_h;
   uint16_t* htgt = g->htgt_h;
   for(int b=0;b<B;b++){
-    int s0=(irand(&r,max_start)+start_bias+b*9973) % max_start;
+    int64_t s0 = (int64_t)irand(&r, max_start) + start_bias + (int64_t)b * 9973LL;
+    s0 %= (int64_t)max_start;
+    if(s0 < 0) s0 += max_start;
+
     uint16_t* dst_tok = htok + (size_t)b*(size_t)T;
     uint16_t* dst_tgt = htgt + (size_t)b*(size_t)T;
     const uint16_t* src = ids.data() + (size_t)s0;
     for(int t=0;t<T;t++){
       dst_tok[t]=src[(size_t)t];
       dst_tgt[t]=src[(size_t)t+1];
+    }
+  }
+
+  for(int i=0;i<N;i++){
+    if((int)htok[i] >= V || (int)htgt[i] >= V){
+      std::fprintf(stderr,"BAD TOK: step=%d dev=%d i=%d tok=%u tgt=%u V=%d\n",
+                   step, g->dev, i, (unsigned)htok[i], (unsigned)htgt[i], V);
+      std::exit(1);
     }
   }
 
@@ -2631,9 +2642,9 @@ if(use_graph){
   for(int step=1; step<=steps; step++){
     std::vector<float> losses((size_t)G,0.f);
     std::vector<std::thread> th; th.reserve((size_t)G);
-    int base=step*1315423911;
+    int64_t base = (int64_t)step * 1315423911LL;
     for(int i=0;i<G;i++){
-      th.emplace_back([&,i](){ losses[(size_t)i]=train_step(&gpus[(size_t)i], ids, step, base+i*9973, seed, use_graph); });
+      th.emplace_back([&,i](){ losses[(size_t)i]=train_step(&gpus[(size_t)i], ids, step, base + (int64_t)i*9973LL, seed, use_graph); });
     }
     for(auto& t: th) t.join();
 
