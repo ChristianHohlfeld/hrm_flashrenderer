@@ -24,13 +24,31 @@ Both scripts have been augmented to support optional benchmarking metrics to cle
 
 ## Usage
 
-**Train with defaults:**
+To train on your own data, ensure your text file is located either in the current directory or provide an absolute path, and specify `--data <your_file.txt>`. 
+
+### 1. Train on Custom Data
+
+Run the scripts in training mode, specifying your text corpus and the desired output weights file (`--ckpt`):
+
 ```bash
-./run_llm.sh --train --data ../tinyshakespeare.txt --ckpt ckpt.bin
+# Train using the PHO version
+./run_llm.sh --train --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin --steps 2000 --batch 64 --seq 128 --gpus 2
+
+# Or train using the original version
+./run_llm_orig.sh --train --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin --steps 2000 --batch 64 --seq 128 --gpus 2
+```
+*Note: Wait for this process to complete before testing chat.*
+
+### 2. Run Inference (Chat Mode)
+Once training finishes and the `my_custom_model.bin` file is saved, you can chat with it by referencing that same checkpoint.
+
+```bash
+# Chat with the PHO version
+./run_llm.sh --chat --measure --ckpt my_custom_model.bin
+
+# Chat with the original version
+./run_llm_orig.sh --chat --measure --ckpt my_custom_model.bin
 ```
 
-**Evaluate with metrics:**
-```bash
-./run_llm.sh --measure --train --steps 50
-```
+When the `>` prompt appears, type your message and hit Enter. The model will auto-regressively predict the next stream of tokens based on what it learned from your custom corpus!
 
