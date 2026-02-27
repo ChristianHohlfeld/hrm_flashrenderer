@@ -1652,44 +1652,68 @@ static void adam_step(GPU* g, int step, float lr, float wd, float clip){
 }
 
 // ================= train step (device-only, capturable) =================
-static void train_step_device(GPU* g){
+static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int64_t start_bias, uint64_t seed, int use_graph){
+  CUDA_CHECK(cudaSetDevice(g->dev));
   int B=g->B, T=g->T, N=g->N;
-  float invN = 1.0f/(float)N;
-  size_t Wn=weights_floats();
-  zero_f<<<(int)((Wn+255)/256),256>>>(g->dG,(int)Wn); KERNEL_CHECK();
 
-  dim3 blk2(16,16);
-  dim3 grdE((D+15)/16,(N+15)/16);
-  embed_split<<<grdE,blk2>>>(g->y1,g->y2,g->W.wte,g->W.wpe,g->tok,N,T); KERNEL_CHECK();
+  // Deterministic RNG for batch selection
+  RNG r{ seed ^ (uint64_t)(0x9E3779B97F4A7C15ULL + (uint64_t)g->dev*1315423911ULL + (uint64_t)step*2654435761ULL) };
+  int max_start=(int)ids.size() - (T+1);
+  if(max_start<=0) die("encoded stream too small");
 
-  // Forward
-  for(int l=0;l<L;l++){
-    // ===== FULL-BLAST FUSED STRIKE (replaces RMS + QKV WMMA + RoPE) =====
-    // No need to write g->n in forward; pass nullptr.
-    constexpr int WPB = 8;
-    int blocks = (N + WPB - 1) / WPB;
-    fused_rms_qkv_rope_hf<WPB><<<blocks,256>>>(g->Q, g->K, g->Vh, g->inv, (float*)nullptr,
-                                              g->y2,
-                                              g->W.Wq[l], g->W.Wk[l], g->W.Wv[l],
-                                              g->W.gf[l],
-                                              g->sin_tbl, g->cos_tbl,
-                                              N, T);
-    KERNEL_CHECK();
+  // Prepare batch on pinned host memory
+  uint16_t* htok = g->htok_h;
+  uint16_t* htgt = g->htgt_h;
+  for(int b=0;b<B;b++){
+    int64_t s0 = (int64_t)irand(&r, max_start) + start_bias + (int64_t)b * 9973LL;
+    s0 %= (int64_t)max_start;
+    if(s0 < 0) s0 += max_start;
 
-    dim3 grid(B,H,(T+FA_QT-1)/FA_QT);
-    flash_fwd_hf<<<grid,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
-
-    f2h<<<(N*Dhf+255)/256,256>>>(g->n_h, g->O, N*Dhf); KERNEL_CHECK();
-    wmma_fwd(g->fout, g->n_h, g->Hw.Wo_tr[l], N, Dhf, Dhf);
-    add_inplace<<<(N*Dhf+255)/256,256>>>(g->y1, g->fout, N*Dhf); KERNEL_CHECK();
-
-    rms_fwd_f2h<Dhf><<<N,256>>>(g->n, g->n_h, g->inv, g->y1, g->W.gg[l], N); KERNEL_CHECK();
-    wmma_fwd(g->U, g->n_h, g->Hw.W1_tr[l], N, F, Dhf);
-    gelu_fwd<<<(N*F+255)/256,256>>>(g->A, g->U, N*F); KERNEL_CHECK();
-    f2h<<<(N*F+255)/256,256>>>(g->A_h, g->A, N*F); KERNEL_CHECK();
-    wmma_fwd(g->gout, g->A_h, g->Hw.W2_tr[l], N, Dhf, F);
-    add_inplace<<<(N*Dhf+255)/256,256>>>(g->y2, g->gout, N*Dhf); KERNEL_CHECK();
+    uint16_t* dst_tok = htok + (size_t)b*(size_t)T;
+    uint16_t* dst_tgt = htgt + (size_t)b*(size_t)T;
+    const uint16_t* src = ids.data() + (size_t)s0;
+    for(int t=0;t<T;t++){
+      dst_tok[t]=src[(size_t)t];
+      dst_tgt[t]=src[(size_t)t+1];
+    }
   }
+
+  // Token boundary validation
+  for(int i=0;i<N;i++){
+    if((int)htok[i] >= V || (int)htgt[i] >= V){
+      std::fprintf(stderr,"BAD TOK: step=%d dev=%d i=%d tok=%u tgt=%u V=%d\n",
+                   step, g->dev, i, (unsigned)htok[i], (unsigned)htgt[i], V);
+      std::exit(1);
+    }
+  }
+
+  // 1. Mandatory Async H2D Transfer (Always outside Graph capture for maximum flexibility)
+  CUDA_CHECK(cudaMemcpyAsync(g->tok, g->htok_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
+  CUDA_CHECK(cudaMemcpyAsync(g->tgt, g->htgt_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
+
+  // 2. Execute the Compute Pipeline
+  if(use_graph){
+    if(!g->graph_built){
+      // ensure_train_graph must only record train_step_device(g)
+      ensure_train_graph(g); 
+      CUDA_CHECK(cudaStreamSynchronize(0));
+    }
+    // Launch the captured graph
+    CUDA_CHECK(cudaGraphLaunch(g->graphExec, 0));
+  }else{
+    // Standard execution path
+    train_step_device(g);
+  }
+
+  // 3. Synchronize before attempting to read back the loss
+  CUDA_CHECK(cudaStreamSynchronize(0));
+
+  // 4. Retrieve loss (The Line 1816 fix: move this out of the capture-sensitive path)
+  float loss=0.f;
+  CUDA_CHECK(cudaMemcpy(&loss, g->loss_mean, sizeof(float), cudaMemcpyDeviceToHost));
+  
+  return loss;
+}
 
   // Head forward (streaming chunks)
   concat_full<<<dim3((D+15)/16,(N+15)/16),blk2>>>(g->Xfull, g->y1, g->y2, N); KERNEL_CHECK();
