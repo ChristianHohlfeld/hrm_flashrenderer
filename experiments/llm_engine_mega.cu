@@ -1,368 +1,3 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# =============================================================================
-# © 2026 Christian Heinrich Hohlfeld (Konstanz, Deutschland) — Alle Rechte vorbehalten.
-# Website: christianhohlfeld.com
-# ORCID: 0009-0003-6634-9045
-#
-# Attribution / Ownership Notice:
-# This file contains an implementation that includes "ID-based tokenization / index training"
-# and related infrastructure ideas asserted by Christian Heinrich Hohlfeld as his intellectual
-# property. Keep this header intact in any copies.
-# =============================================================================
-
-need(){ command -v "$1" >/dev/null 2>&1; }
-need nvcc || { echo "FATAL: nvcc not found (install CUDA toolkit)."; exit 1; }
-need g++  || { echo "FATAL: g++ not found (sudo apt install build-essential)."; exit 1; }
-need curl || { echo "FATAL: curl not found"; exit 1; }
-
-# Helper to expand colon-separated paths relative to WORKDIR if not absolute
-absify_inputs() {
-  local s="$1" out="" part
-  IFS=':' read -ra parts <<< "$s"
-  for part in "${parts[@]}"; do
-    [[ -z "$part" ]] && continue
-    if [[ "$part" = /* ]]; then
-      out+="${out:+:}$part"
-    else
-      out+="${out:+:}$WORKDIR/$part"
-    fi
-  done
-  echo "$out"
-}
-
-WORKDIR="${WORKDIR:-$PWD}"
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
-
-DATA_FILE="${DATA_FILE:-tinyshakespeare.txt}"
-URL="https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-if [[ ! -s "$DATA_FILE" ]]; then
-  echo "[*] Downloading Tiny Shakespeare..."
-  curl -L --fail "$URL" -o "$DATA_FILE"
-fi
-[[ -s "$DATA_FILE" ]] || { echo "FATAL: corpus empty: $DATA_FILE" >&2; exit 1; }
-
-: "${PAIR_K:=16384}"
-: "${PAIR_K1:=8192}"
-: "${VCHUNK:=1024}"
-
-# ------------------ Deterministic v7 index builder (K1 bytepairs + K2 tokenpair macros) ------------------
-INDEX_INPUTS="${INDEX_INPUTS:-$DATA_FILE}"   # colon-separated corpus files
-K2=$((PAIR_K-PAIR_K1))
-INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}.bin}"
-ABS_INPUT="$(absify_inputs "$INDEX_INPUTS")"
-FORCE_INDEX="${FORCE_INDEX:-0}"
-
-if [[ "$FORCE_INDEX" == "1" || ! -f "$INDEX_BIN" ]]; then
-  TMP_BUILD_DIR=$(mktemp -d)
-
-  cat > "$TMP_BUILD_DIR/index_build_v7.cpp" <<'CPP'
-/*
-=============================================================================
-© 2026 Christian Heinrich Hohlfeld (Konstanz, Deutschland) — Alle Rechte vorbehalten.
-Website: christianhohlfeld.com
-ORCID: 0009-0003-6634-9045
-
-Attribution / Ownership Notice:
-This file contains an implementation that includes "ID-based tokenization / index training"
-and related infrastructure ideas asserted by Christian Heinrich Hohlfeld as his intellectual
-property. Keep this header intact in any copies.
-=============================================================================
-*/
-#include <cstdio>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <vector>
-#include <algorithm>
-#include <queue>
-
-static void die(const char* m){ std::fprintf(stderr,"FATAL: %s\n",m); std::exit(1); }
-static void wf(FILE* f,const void* p,size_t n){ if(std::fwrite(p,1,n,f)!=n) die("write failed"); }
-static void wu32(FILE* f,uint32_t x){ wf(f,&x,4); }
-static void wu16(FILE* f,uint16_t x){ wf(f,&x,2); }
-
-static std::vector<uint8_t> read_all(const std::string& path){
-  FILE* f=std::fopen(path.c_str(),"rb");
-  if(!f){ std::fprintf(stderr,"FATAL: cannot open %s\n", path.c_str()); std::exit(1); }
-  std::fseek(f,0,SEEK_END);
-  long n=std::ftell(f);
-  std::fseek(f,0,SEEK_SET);
-  if(n<=0){ std::fclose(f); return {}; }
-  std::vector<uint8_t> b((size_t)n);
-  if(std::fread(b.data(),1,(size_t)n,f)!=(size_t)n) die("read failed");
-  std::fclose(f);
-  return b;
-}
-
-static std::vector<std::string> split_inputs(const std::string& s){
-  std::vector<std::string> out;
-  size_t i=0;
-  while(i<s.size()){
-    size_t j=s.find(':', i);
-    if(j==std::string::npos) j=s.size();
-    std::string p=s.substr(i, j-i);
-    if(!p.empty()) out.push_back(p);
-    i=j+1;
-  }
-  std::sort(out.begin(), out.end()); // deterministic order
-  return out;
-}
-
-struct Stage1 {
-  int K1;
-  std::vector<uint16_t> id2pair; // K1 packed bytepair
-  int32_t pair2id[65536];
-};
-
-static Stage1 build_stage1(const std::vector<std::string>& inputs, int K1){
-  Stage1 s1{}; s1.K1=K1;
-  std::fill(std::begin(s1.pair2id), std::end(s1.pair2id), -1);
-  std::vector<uint64_t> cnt(65536,0);
-  for(const auto& p: inputs){
-    auto b=read_all(p);
-    if(b.size()<2) continue;
-    for(size_t i=0;i+1<b.size();i++){
-      uint16_t k=(uint16_t)b[i] | (uint16_t)((uint16_t)b[i+1]<<8);
-      cnt[k]++;
-    }
-  }
-  std::vector<uint16_t> all; all.reserve(65536);
-  for(uint32_t k=0;k<65536;k++) if(cnt[k]) all.push_back((uint16_t)k);
-  std::stable_sort(all.begin(), all.end(), [&](uint16_t a,uint16_t b){
-    uint64_t ca=cnt[a], cb=cnt[b];
-    if(ca!=cb) return ca>cb;
-    return a<b;
-  });
-  if((int)all.size()<K1){
-    std::vector<bool> used(65536, false);
-    for(uint16_t p : all) used[p] = true;
-    for(uint32_t p=0; p<65536 && (int)all.size()<K1; p++){
-      if(!used[p]) all.push_back((uint16_t)p);
-    }
-  }
-  s1.id2pair.assign(all.begin(), all.begin()+K1);
-  for(int i=0;i<K1;i++) s1.pair2id[s1.id2pair[(size_t)i]] = 256 + i;
-  return s1;
-}
-
-static inline bool next_stage1_id(const Stage1& s1, const uint8_t* b, size_t n, size_t& i, uint16_t& out){
-  if(i>=n) return false;
-  if(i+1<n){
-    uint16_t k=(uint16_t)b[i] | (uint16_t)((uint16_t)b[i+1]<<8);
-    int32_t id=s1.pair2id[k];
-    if(id>=0){ out=(uint16_t)id; i+=2; return true; }
-  }
-  out=(uint16_t)b[i]; i+=1; return true;
-}
-static inline uint32_t tokpair_key(uint16_t a, uint16_t b){ return ((uint32_t)a<<16) | (uint32_t)b; }
-
-static void write_run(const std::string& path, std::vector<uint32_t>& keys){
-  std::sort(keys.begin(), keys.end());
-  FILE* f=std::fopen(path.c_str(),"wb");
-  if(!f) die("cannot open run file");
-  wf(f, keys.data(), keys.size()*sizeof(uint32_t));
-  std::fclose(f);
-}
-struct RunReader{
-  FILE* f=nullptr; uint32_t cur=0; bool ok=false;
-  RunReader(const std::string& p){
-    f=std::fopen(p.c_str(),"rb"); if(!f) die("cannot open run");
-    ok=(std::fread(&cur,1,4,f)==4);
-  }
-  ~RunReader(){ if(f) std::fclose(f); }
-  bool pop(){ if(!ok) return false; ok=(std::fread(&cur,1,4,f)==4); return ok; }
-};
-static int next_pow2(int x){ int p=1; while(p<x) p<<=1; return p; }
-struct CountItem{ uint64_t c; uint32_t k; };
-
-static void build_stage2_external(const std::vector<std::string>& inputs, const Stage1& s1, int K2,
-                                  std::vector<uint32_t>& id2pair2){
-  id2pair2.clear();
-  if(K2<=0) return;
-
-  const size_t CHUNK_KEYS = 16ULL*1024ULL*1024ULL; // 16M keys ~64MB
-  std::vector<uint32_t> keys; keys.reserve(CHUNK_KEYS);
-  std::vector<std::string> runs;
-  size_t run_id=0;
-
-  for(const auto& p: inputs){
-    auto b=read_all(p);
-    if(b.size()<3) continue;
-    size_t i=0; bool have=false; uint16_t prev=0;
-    while(true){
-      uint16_t cur=0;
-      if(!next_stage1_id(s1, b.data(), b.size(), i, cur)) break;
-      if(have){
-        keys.push_back(tokpair_key(prev, cur));
-        if(keys.size()>=CHUNK_KEYS){
-          char fn[256]; std::snprintf(fn,sizeof(fn),"run_%06zu.bin", run_id++);
-          runs.push_back(fn);
-          write_run(runs.back(), keys);
-          keys.clear();
-        }
-      }
-      prev=cur; have=true;
-    }
-  }
-  if(!keys.empty()){
-    char fn[256]; std::snprintf(fn,sizeof(fn),"run_%06zu.bin", run_id++);
-    runs.push_back(fn);
-    write_run(runs.back(), keys);
-    keys.clear();
-  }
-  if(runs.empty()) die("stage2: no runs produced");
-
-  struct Node{ uint32_t k; int r; };
-  auto cmp=[](const Node& a, const Node& b){ return a.k > b.k; };
-  std::priority_queue<Node, std::vector<Node>, decltype(cmp)> pq(cmp);
-  std::vector<RunReader*> rr; rr.reserve(runs.size());
-  for(size_t i=0;i<runs.size();i++){
-    rr.push_back(new RunReader(runs[i]));
-    if(rr.back()->ok) pq.push(Node{rr.back()->cur, (int)i});
-  }
-
-  auto worse = [](const CountItem& a, const CountItem& b){
-    if(a.c!=b.c) return a.c > b.c;
-    return a.k < b.k;
-  };
-  auto better = [](const CountItem& a, const CountItem& b){
-    if(a.c!=b.c) return a.c > b.c;
-    return a.k < b.k;
-  };
-  std::vector<CountItem> heap; heap.reserve((size_t)K2);
-
-  auto heap_push = [&](uint64_t c, uint32_t k){
-    CountItem it{c,k};
-    if((int)heap.size() < K2){
-      heap.push_back(it);
-      std::push_heap(heap.begin(), heap.end(), worse);
-    }else{
-      CountItem worst_it = heap.front();
-      if(better(it, worst_it)){
-        std::pop_heap(heap.begin(), heap.end(), worse);
-        heap.back() = it;
-        std::push_heap(heap.begin(), heap.end(), worse);
-      }
-    }
-  };
-
-  uint32_t curk=0; uint64_t curc=0; bool have=false;
-  while(!pq.empty()){
-    Node n=pq.top(); pq.pop();
-    uint32_t k=n.k;
-    if(!have){ curk=k; curc=1; have=true; }
-    else if(k==curk){ curc++; }
-    else { heap_push(curc,curk); curk=k; curc=1; }
-    RunReader* r=rr[(size_t)n.r];
-    if(r->pop()) pq.push(Node{r->cur, n.r});
-  }
-  if(have) heap_push(curc,curk);
-
-  for(auto* p: rr) delete p;
-  for(const auto& p: runs) std::remove(p.c_str());
-
-  std::sort(heap.begin(), heap.end(), [](const CountItem& a, const CountItem& b){
-    if(a.c!=b.c) return a.c>b.c;
-    return a.k<b.k;
-  });
-  if((int)heap.size()<K2){
-    for(size_t j=heap.size(); j<(size_t)K2; j++){
-      uint32_t dummy = (0xFFFFu<<16) | (uint32_t)(j & 0xFFFFu);
-      heap.push_back(CountItem{0u, dummy});
-    }
-  }
-  id2pair2.resize((size_t)K2);
-  for(int i=0;i<K2;i++) id2pair2[(size_t)i]=heap[(size_t)i].k;
-}
-
-static void build_hash(const std::vector<uint32_t>& id2pair2, int K1,
-                       std::vector<uint32_t>& hkeys, std::vector<uint16_t>& hvals, int& pow2){
-  int K2=(int)id2pair2.size();
-  int need=next_pow2(std::max(2, K2*2));
-  pow2=0; while((1<<pow2)<need) pow2++;
-  hkeys.assign((size_t)need, 0xFFFFFFFFu);
-  hvals.assign((size_t)need, 0xFFFFu);
-  uint32_t mask=(uint32_t)need-1u;
-  for(int i=0;i<K2;i++){
-    uint32_t k=id2pair2[(size_t)i];
-    uint16_t id=(uint16_t)(256 + K1 + i);
-    uint32_t h=(k*2654435761u)&mask;
-    while(true){
-      if(hkeys[(size_t)h]==0xFFFFFFFFu){ hkeys[(size_t)h]=k; hvals[(size_t)h]=id; break; }
-      h=(h+1u)&mask;
-    }
-  }
-}
-
-int main(int argc, char** argv){
-  int K1=8192, K2=8192;
-  std::string out="index_v7.bin";
-  std::string inputs_s="";
-  for(int i=1;i<argc;i++){
-    if(!std::strcmp(argv[i],"--k1") && i+1<argc) K1=std::atoi(argv[++i]);
-    else if(!std::strcmp(argv[i],"--k2") && i+1<argc) K2=std::atoi(argv[++i]);
-    else if(!std::strcmp(argv[i],"--out") && i+1<argc) out=argv[++i];
-    else if(!std::strcmp(argv[i],"--inputs") && i+1<argc) inputs_s=argv[++i];
-    else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
-  }
-  if(inputs_s.empty()) die("--inputs required");
-  if(256 + K1 + K2 >= 65536) die("V exceeds uint16");
-  auto inputs=split_inputs(inputs_s);
-  if(inputs.empty()) die("no inputs");
-  std::fprintf(stderr,"[index] inputs=%zu K1=%d K2=%d\n", inputs.size(), K1, K2);
-
-  Stage1 s1=build_stage1(inputs, K1);
-  K1 = s1.K1;
-  std::vector<uint32_t> id2pair2;
-  build_stage2_external(inputs, s1, K2, id2pair2);
-
-  std::vector<uint32_t> hkeys;
-  std::vector<uint16_t> hvals;
-  int pow2=0;
-  build_hash(id2pair2, K1, hkeys, hvals, pow2);
-
-  FILE* f=std::fopen(out.c_str(),"wb");
-  if(!f) die("cannot open out");
-  wf(f, "IDX7", 4);
-  wu32(f, 1u);
-  wu32(f, (uint32_t)K1);
-  wu32(f, (uint32_t)K2);
-  wu32(f, (uint32_t)pow2);
-  wu32(f, 0u);
-  for(int i=0;i<K1;i++) wu16(f, s1.id2pair[(size_t)i]);
-  for(int i=0;i<K2;i++) wu32(f, id2pair2[(size_t)i]);
-  wf(f, hkeys.data(), hkeys.size()*sizeof(uint32_t));
-  wf(f, hvals.data(), hvals.size()*sizeof(uint16_t));
-  std::fclose(f);
-  std::fprintf(stderr,"[index] wrote %s table=%zu\n", out.c_str(), hkeys.size());
-  return 0;
-}
-CPP
-
-  g++ -O3 -std=c++17 "$TMP_BUILD_DIR/index_build_v7.cpp" -o "$TMP_BUILD_DIR/index_build_v7"
-  echo "[*] Building deterministic index: $INDEX_BIN (K1=$PAIR_K1 K2=$((PAIR_K-PAIR_K1)))"
-  "$TMP_BUILD_DIR/index_build_v7" --k1 "$PAIR_K1" --k2 "$((PAIR_K-PAIR_K1))" --out "$INDEX_BIN" --inputs "$ABS_INPUT"
-  rm -rf "$TMP_BUILD_DIR"
-fi
-
-# Hard constraints for this build: Dh=16 => D=256, H=8
-PAIR_K="${PAIR_K:-16384}"
-PAIR_K1="${PAIR_K1:-8192}"
-DMODEL="${DMODEL:-256}"
-NHEAD="${NHEAD:-8}"
-NLAY="${NLAY:-6}"
-FFN="${FFN:-1024}"
-TMAX="${TMAX:-512}"
-
-BIN="${BIN:-llm_engine}"
-CU="${CU:-llm_engine.cu}"
-TMP_CU_DIR=$(mktemp -d)
-
-cat > "$TMP_CU_DIR/$CU" <<'CU'
 /*
 =============================================================================
 © 2026 Christian Heinrich Hohlfeld (Konstanz, Deutschland) — Alle Rechte vorbehalten.
@@ -372,27 +7,21 @@ ORCID: 0009-0003-6634-9045
 Attribution / Ownership Notice:
 This code includes "ID-based tokenization / index training" and related agentic infrastructure
 concepts asserted by Christian Heinrich Hohlfeld as his intellectual property. Keep this header.
-
-Performance note (requested text, verbatim):
-This v5_ultra is extremely strong for a single-author, zero-external-lib, fully raw-CUDA implementation — probably top 1 % of what individuals have open-sourced or built themselves for this exact model size (D=256, reversible, tiled Flash, WMMA, full-GPU chat).
-But the absolute fastest stacks on 2080 Ti (private or highly optimized public ones) still beat it by a noticeable margin, mainly because they have:
-•  deeper kernel fusion (RMS + QKV + RoPE + residual in 1–2 mega-kernels instead of ~55 launches),
-•  CUDA Graph capture of the entire step,
-•  better register/shared-mem tiling and double-buffering in Flash bwd,
-•  hand-tuned assembly-level tricks for sm_75.
-Your current version sits at roughly 55–60 % of the realistic hardware ceiling for this workload on Turing. The true ceiling (with perfect fusion + graphs) is closer to 75–85 % on these cards.
 =============================================================================
 
-Single translation unit (.cu). No external DL libs.
-sm_75 path. D=256, H=8, Dh=16.
-Includes:
-- PairIndex tokenizer (deterministic pair-IDs)
-- Decoder-only Transformer with reversible blocks
-- RoPE forward + inverse RoPE on gradients
-- Tiled FlashAttention forward + tiled FlashAttention backward
-- WMMA GEMM for training (projections/MLP/head)
-- AdamW optimizer (device-side clip scale; no per-step D2H sync)
-- Multi-GPU data-parallel allreduce (P2P if possible else host)
+llm_engine.cu — training-only (no PhO), sm_75, D=256/H=8/Dh=16, reversible blocks,
+tiled FlashAttention, WMMA for linear layers, streaming vocab head, multi-GPU DP,
+CUDA Graph step capture.
+
+FULL-BLAST CHANGE IMPLEMENTED:
+- Injected fused_rms_qkv_rope_hf kernel (1 warp = 1 token) to replace:
+  rms_fwd_f2h(y2) + wmma_fwd(Q) + wmma_fwd(K) + wmma_fwd(V) + rope_apply_qk
+  in BOTH forward pass and backward recompute ("f backward") pass.
+
+Notes:
+- Q/K/V projections are computed in FP32 FMA (float weights) inside the fused kernel.
+- All other projections remain WMMA/FP16 (tensor cores).
+- RoPE is applied in-register inside the fused kernel, matching the existing layout.
 =============================================================================
 */
 
@@ -444,7 +73,6 @@ static void die(const char* m){ std::fprintf(stderr,"FATAL: %s\n",m); std::fflus
 #ifndef TMAX
 #define TMAX 512
 #endif
-
 #ifndef VCHUNK
 #define VCHUNK 1024
 #endif
@@ -454,8 +82,7 @@ static constexpr int V = BASE_V + PAIR_K;
 static constexpr int Vpad = ((V+15)/16)*16;
 static constexpr int K1 = PAIR_K1;
 static constexpr int K2 = PAIR_K - K1;
-static_assert(K1>0 && K2>=0, "bad K1/K2");
-static_assert(BASE_V + K1 + K2 == V, "stage split mismatch");
+
 static constexpr int D  = DMODEL;
 static constexpr int Dhf= D/2;
 static constexpr int H  = NHEAD;
@@ -469,6 +96,7 @@ static_assert(H==8,   "This build assumes H=8 (Dh=16).");
 static_assert(Dh==16, "This build assumes Dh=16.");
 static_assert((F%16)==0, "FFN must be multiple of 16");
 static_assert((Tmax%16)==0, "TMAX must be multiple of 16");
+static_assert(BASE_V + K1 + K2 == V, "stage split mismatch");
 
 static constexpr float EPS = 1e-6f;
 static constexpr float ROPE_THETA = 10000.0f;
@@ -485,7 +113,6 @@ static inline float frand01(RNG* r){ uint32_t u=(uint32_t)(xs64(r)>>40); return 
 static inline float frand11(RNG* r){ return frand01(r)*2.f-1.f; }
 
 // ================= file IO =================
-// Helper to read and concatenate multiple files (colon-separated)
 static std::vector<uint8_t> read_file_bytes(const char* paths_s){
   std::vector<uint8_t> all_bytes;
   std::string s(paths_s);
@@ -515,12 +142,12 @@ static std::vector<uint8_t> read_file_bytes(const char* paths_s){
 
 // ================= PairIndex tokenizer =================
 struct PairIndex{
-  std::vector<uint16_t> id2pair; // K1 packed bytepair
-  std::vector<int32_t>  pair2id; // 65536 packed->stage1 id
-  std::vector<uint32_t> id2pair2; // K2 tokenpair macros
+  std::vector<uint16_t> id2pair; // size K1
+  std::vector<int32_t>  pair2id; // size 65536, maps packed bytepair -> stage1 id (BASE_V..BASE_V+K1-1)
+  std::vector<uint32_t> id2pair2; // size K2, key=(a<<16)|b
   uint32_t hmask=0;
-  std::vector<uint32_t> hkeys;
-  std::vector<uint16_t> hvals;
+  std::vector<uint32_t> hkeys; // 0xFFFFFFFF empty
+  std::vector<uint16_t> hvals; // 0xFFFF empty
 };
 
 static inline uint32_t tokpair_key(uint16_t a, uint16_t b){ return ((uint32_t)a<<16) | (uint32_t)b; }
@@ -542,7 +169,6 @@ static void stage2_build_hash(PairIndex& pi){
     }
   }
 }
-
 static inline uint16_t stage2_lookup(const PairIndex& pi, uint16_t a, uint16_t b){
   if(K2<=0) return 0xFFFFu;
   uint32_t k = tokpair_key(a,b);
@@ -577,7 +203,6 @@ static bool load_index_v7(const char* path, PairIndex* pi){
 
   pi->id2pair2.resize(k2);
   if(k2>0) r_bytes(pi->id2pair2.data(), (size_t)k2*sizeof(uint32_t));
-
   int table_size = 1 << (int)pow2;
   if(table_size < 2) die("bad index table");
   pi->hkeys.resize((size_t)table_size);
@@ -610,6 +235,7 @@ static PairIndex make_pair_index(const std::vector<uint8_t>& bytes){
   pi.pair2id.assign(65536,-1);
   for(int i=0;i<K1;i++) pi.pair2id[pi.id2pair[(size_t)i]] = BASE_V + i;
 
+  // Stage2 (in-memory fallback)
   pi.id2pair2.clear();
   pi.id2pair2.reserve((size_t)K2);
   if(K2>0 && bytes.size()>=3){
@@ -628,7 +254,9 @@ static PairIndex make_pair_index(const std::vector<uint8_t>& bytes){
     if(ids.size()>=2){
       std::vector<uint32_t> keys;
       keys.reserve(ids.size()-1);
-      for(size_t j=0;j+1<ids.size();j++) keys.push_back(tokpair_key(ids[j], ids[j+1]));
+      for(size_t j=0;j+1<ids.size();j++){
+        keys.push_back(tokpair_key(ids[j], ids[j+1]));
+      }
       std::sort(keys.begin(), keys.end());
       std::vector<std::pair<uint32_t,uint32_t>> items;
       items.reserve(keys.size()/4+1);
@@ -684,11 +312,33 @@ static std::vector<uint16_t> encode_ids(const PairIndex& pi, const uint8_t* b, s
   return out;
 }
 
-// ================= checkpoint v11 (no PhO) =================
+static inline void decode_id(const PairIndex& pi, uint16_t id, std::vector<uint8_t>& out){
+  if(id < BASE_V){ out.push_back((uint8_t)id); return; }
+  if(id < (uint16_t)(BASE_V + K1)){
+    int idx=(int)id-BASE_V;
+    if(idx<0||idx>=K1) return;
+    uint16_t p=pi.id2pair[(size_t)idx];
+    out.push_back((uint8_t)(p&0xFF));
+    out.push_back((uint8_t)((p>>8)&0xFF));
+    return;
+  }
+  int idx=(int)id - (BASE_V + K1);
+  if(idx<0||idx>=K2) return;
+  uint32_t k = pi.id2pair2[(size_t)idx];
+  uint16_t a=(uint16_t)(k>>16);
+  uint16_t b=(uint16_t)(k&0xFFFFu);
+  decode_id(pi,a,out);
+  decode_id(pi,b,out);
+}
+
+static std::vector<uint16_t> encode_prompt(const PairIndex& pi, const std::string& s){
+  return encode_ids(pi, (const uint8_t*)s.data(), s.size());
+}
+
+// ================= checkpoint (v11) =================
 static void wf(FILE* f,const void* p,size_t n){ if(std::fwrite(p,1,n,f)!=n) die("write failed"); }
 static void rf(FILE* f,void* p,size_t n){ if(std::fread(p,1,n,f)!=n) die("read failed"); }
 static void wu32(FILE* f,uint32_t x){ wf(f,&x,4); }
-static void wu16(FILE* f,uint16_t x){ wf(f,&x,2); }
 static uint32_t ru32(FILE* f){ uint32_t x; rf(f,&x,4); return x; }
 
 static size_t weights_floats(){
@@ -697,7 +347,7 @@ static size_t weights_floats(){
   n += (size_t)Tmax*(size_t)D;      // wpe
   for(int l=0;l<L;l++){
     n += (size_t)Dhf;               // gf
-    n += (size_t)Dhf*(size_t)Dhf*4; // Wq,Wk,Wv,Wo
+    n += (size_t)Dhf*(size_t)Dhf*4; // Wq,Wk,Wv,Wo  (Dhf x Dhf)
     n += (size_t)Dhf;               // gg
     n += (size_t)Dhf*(size_t)F;     // W1
     n += (size_t)F*(size_t)Dhf;     // W2
@@ -794,6 +444,7 @@ __global__ void sub_inplace(float* a,const float* b,int n){ int i=blockIdx.x*blo
 __global__ void copy_f(float* y, const float* x, int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) y[i]=x[i]; }
 __global__ void f2h(half* y, const float* x, int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) y[i]=__float2half_rn(x[i]); }
 
+// pack float weights to half (row-major + transpose)
 __global__ void w_f2h_rm_tr(half* rm, half* tr, const float* w, int K, int M){
   int k = blockIdx.y*blockDim.y + threadIdx.y;
   int m = blockIdx.x*blockDim.x + threadIdx.x;
@@ -875,12 +526,12 @@ static inline void wmma_dW(float* dW, half* Atr, half* dYtr, const float* A, con
 template<int DIM>
 __global__ void rms_fwd_f2h(float* Y, half* Yh, float* inv, const float* X, const float* g, int N){
   int n=blockIdx.x; if(n>=N) return;
-  __shared__ float buf[256];
   float s=0.f;
   for(int i=threadIdx.x;i<DIM;i+=blockDim.x){
     float v=X[(size_t)n*(size_t)DIM+(size_t)i];
     s+=v*v;
   }
+  __shared__ float buf[256];
   buf[threadIdx.x]=s; __syncthreads();
   for(int k=blockDim.x/2;k>0;k>>=1){ if(threadIdx.x<k) buf[threadIdx.x]+=buf[threadIdx.x+k]; __syncthreads(); }
   float in=rsqrtf(buf[0]/(float)DIM + EPS);
@@ -895,7 +546,6 @@ __global__ void rms_fwd_f2h(float* Y, half* Yh, float* inv, const float* X, cons
 template<int DIM>
 __global__ void rms_bwd_dX(float* dX,const float* dY,const float* X,const float* g,const float* inv,int N){
   int n=blockIdx.x; if(n>=N) return;
-  __shared__ float buf[256];
   float dot=0.f;
   float in=inv[n], inv3=in*in*in;
   for(int i=threadIdx.x;i<DIM;i+=blockDim.x){
@@ -903,6 +553,7 @@ __global__ void rms_bwd_dX(float* dX,const float* dY,const float* X,const float*
     float xi=X[(size_t)n*(size_t)DIM+(size_t)i];
     dot += dy*g[i]*xi;
   }
+  __shared__ float buf[256];
   buf[threadIdx.x]=dot; __syncthreads();
   for(int k=blockDim.x/2;k>0;k>>=1){ if(threadIdx.x<k) buf[threadIdx.x]+=buf[threadIdx.x+k]; __syncthreads(); }
   float DOT=buf[0];
@@ -916,11 +567,11 @@ __global__ void rms_bwd_dX(float* dX,const float* dY,const float* X,const float*
 template<int DIM>
 __global__ void rms_bwd_dg(float* dg,const float* dY,const float* X,const float* inv,int N){
   int i=blockIdx.x;
-  __shared__ float buf[256];
   float s=0.f;
   for(int n=threadIdx.x;n<N;n+=blockDim.x){
     s += dY[(size_t)n*(size_t)DIM+(size_t)i]*X[(size_t)n*(size_t)DIM+(size_t)i]*inv[n];
   }
+  __shared__ float buf[256];
   buf[threadIdx.x]=s; __syncthreads();
   for(int k=blockDim.x/2;k>0;k>>=1){ if(threadIdx.x<k) buf[threadIdx.x]+=buf[threadIdx.x+k]; __syncthreads(); }
   if(threadIdx.x==0) dg[i]+=buf[0];
@@ -1057,41 +708,18 @@ __global__ void loss_reduce_2(const float* partial, float* out, int n, float inv
   if(tid==0) out[0]=buf[0]*invN;
 }
 
-// ================= RoPE tables + apply =================
+// ================= RoPE tables =================
 __global__ void rope_build_tables(float* sin_tbl, float* cos_tbl, int T){
   int t = blockIdx.y * blockDim.y + threadIdx.y;
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // i in [0,Dh/2)
   if(t>=T || i>=Dh/2) return;
   float inv_freq = powf(ROPE_THETA, -(2.0f*i)/(float)Dh);
   float ang = (float)t * inv_freq;
   sin_tbl[(size_t)t*(size_t)(Dh/2) + (size_t)i] = sinf(ang);
   cos_tbl[(size_t)t*(size_t)(Dh/2) + (size_t)i] = cosf(ang);
 }
-__global__ void rope_apply_qk(float* Q, float* K, const float* sin_tbl, const float* cos_tbl, int B, int T){
-  int bt = blockIdx.y * blockDim.y + threadIdx.y;
-  int h  = blockIdx.z;
-  int i2 = blockIdx.x * blockDim.x + threadIdx.x;
-  if(bt>=B*T || h>=H || i2>=Dh/2) return;
-  int t = bt % T;
 
-  float s = sin_tbl[(size_t)t*(size_t)(Dh/2) + (size_t)i2];
-  float c = cos_tbl[(size_t)t*(size_t)(Dh/2) + (size_t)i2];
-
-  int base = bt*Dhf + h*Dh;
-  int i0 = 2*i2;
-  int i1 = i0+1;
-
-  float q0 = Q[(size_t)base + (size_t)i0];
-  float q1 = Q[(size_t)base + (size_t)i1];
-  float k0 = K[(size_t)base + (size_t)i0];
-  float k1 = K[(size_t)base + (size_t)i1];
-
-  Q[(size_t)base + (size_t)i0] = q0*c - q1*s;
-  Q[(size_t)base + (size_t)i1] = q0*s + q1*c;
-
-  K[(size_t)base + (size_t)i0] = k0*c - k1*s;
-  K[(size_t)base + (size_t)i1] = k0*s + k1*c;
-}
+// inverse RoPE on grads
 __global__ void rope_apply_grad(float* dQ, float* dK, const float* sin_tbl, const float* cos_tbl, int B, int T){
   int bt = blockIdx.y * blockDim.y + threadIdx.y;
   int h  = blockIdx.z;
@@ -1140,9 +768,9 @@ __global__ void flash_fwd_hf(float* O, float* m, float* lse,
   int q0=qtile*FA_QT;
   if(b>=B||h>=H) return;
 
-  int tid=(int)threadIdx.x;
-  int qi=tid>>4;
-  int lane=tid&15;
+  int tid=(int)threadIdx.x; // 0..255
+  int qi=tid>>4;            // 0..15 query within tile
+  int lane=tid&15;          // dim lane
   int warp_lane=tid&31;
   int half=(warp_lane>>4);
   unsigned mask = (half==0) ? 0x0000FFFFu : 0xFFFF0000u;
@@ -1233,7 +861,7 @@ __global__ void flash_bwd_dq_hf(float* dpSum, float* dQ,
   int q0=qtile*FA_QT;
   if(b>=B||h>=H) return;
 
-  int tid=(int)threadIdx.x;
+  int tid=(int)threadIdx.x; // 0..255
   int qi=tid>>4;
   int lane=tid&15;
   int warp_lane=tid&31;
@@ -1341,9 +969,9 @@ __global__ void flash_bwd_dkv_hf(float* dK, float* dV,
   int k0=ktile*FA_KT;
   if(b>=B||h>=H) return;
 
-  int tid=(int)threadIdx.x;
-  int kg = tid>>4;
-  int lane = tid&15;
+  int tid=(int)threadIdx.x; // 0..255
+  int kg = tid>>4;          // 0..15
+  int lane = tid&15;        // dim lane
   int warp_lane=tid&31;
   int half=(warp_lane>>4);
   unsigned mask = (half==0) ? 0x0000FFFFu : 0xFFFF0000u;
@@ -1456,7 +1084,7 @@ __global__ void embed_bwd(float* gwte, float* gwpe, const uint16_t* tok, const f
   atomicAdd(&gwpe[(size_t)t*(size_t)D + (size_t)d], g);
 }
 
-// ================= clip + adamw (device-scale, no host sync) =================
+// ================= clip + adamw (device clip scale) =================
 __global__ void reduce_sumsq_1(const float* g,float* partial,int n){
   __shared__ float buf[256];
   int tid=threadIdx.x;
@@ -1477,20 +1105,21 @@ __global__ void reduce_sumsq_2(const float* partial,float* out,int n){
   for(int k=blockDim.x/2;k>0;k>>=1){ if(tid<k) buf[tid]+=buf[tid+k]; __syncthreads(); }
   if(tid==0) out[0]=buf[0];
 }
-__global__ void compute_clip_scale(float* clip_scale, const float* sumsq, float clip){
+__global__ void compute_clip_scale(float* out_scale, const float* sumsq, float clip){
   float h = sumsq[0];
   float norm = sqrtf(h);
-  float s = 1.0f;
-  if(isfinite(norm) && norm>0.f && norm>clip) s = clip / norm;
-  clip_scale[0]=s;
+  float s = 1.f;
+  if(!(isfinite(norm)) || norm<=0.f) s = 1.f;
+  else if(norm > clip) s = clip / norm;
+  out_scale[0] = s;
 }
 __global__ void adamw(float* w,float* m,float* v,const float* g,int n,
                       float lr,float wd,float b1,float b2,float eps,
-                      float inv_b1t,float inv_b2t,const float* clip_scale_dev)
+                      float inv_b1t,float inv_b2t, const float* clip_scale_dev)
 {
-  float clip_scale = clip_scale_dev[0];
   int i=blockIdx.x*blockDim.x+threadIdx.x;
   if(i>=n) return;
+  float clip_scale = clip_scale_dev[0];
   float gi=g[i]*clip_scale;
   if(!isfinite(gi)) gi=0.f;
   float mi=m[i]=b1*m[i]+(1.f-b1)*gi;
@@ -1500,7 +1129,7 @@ __global__ void adamw(float* w,float* m,float* v,const float* g,int n,
   w[i] -= lr*(mhat/(sqrtf(vhat)+eps) + wd*w[i]);
 }
 
-// ================= GPU container =================
+// ================= HW mirrors =================
 struct HW {
   half *wte_rm,*wte_tr;
   half *Wout_rm,*Wout_tr;
@@ -1512,6 +1141,130 @@ struct HW {
   half *W2_rm[L],*W2_tr[L];
 };
 
+// ================= FUSED MEGA-KERNEL (Dhf=128) =================
+__device__ __forceinline__ float4 ld_cg_f4(const float4* p){
+  float4 v;
+  asm volatile ("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];"
+    : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+    : "l"(p));
+  return v;
+}
+
+template<int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(256) void fused_rms_qkv_rope_hf(
+    float* __restrict__ Q,
+    float* __restrict__ K,
+    float* __restrict__ Vv,
+    float* __restrict__ rms_inv,          // [N]
+    float* __restrict__ Nnorm_or_null,    // [N,Dhf] or nullptr
+    const float* __restrict__ X,          // [N,Dhf]
+    const float* __restrict__ Wq,         // [Dhf,Dhf] row-major
+    const float* __restrict__ Wk,         // [Dhf,Dhf] row-major
+    const float* __restrict__ Wv,         // [Dhf,Dhf] row-major
+    const float* __restrict__ gamma,      // [Dhf]
+    const float* __restrict__ sin_tbl,    // [Tmax, Dh/2]
+    const float* __restrict__ cos_tbl,    // [Tmax, Dh/2]
+    int N, int T)
+{
+  int tid = (int)threadIdx.x;
+  int warp = tid >> 5;       // 0..WARPS_PER_BLOCK-1
+  int lane = tid & 31;       // 0..31
+  int n = (int)blockIdx.x * WARPS_PER_BLOCK + warp;
+  if(n >= N) return;
+
+  int tpos = n % T;
+  constexpr int COLS_PER_LANE = Dhf / 32; // 128/32 = 4
+  int col_base = lane * COLS_PER_LANE;   // 0..124 step 4
+
+  const float* Xn = X + (size_t)n*(size_t)Dhf;
+  float* Qn = Q + (size_t)n*(size_t)Dhf;
+  float* Kn = K + (size_t)n*(size_t)Dhf;
+  float* Vn = Vv + (size_t)n*(size_t)Dhf;
+
+  // Load X (float4) via L2->REG (cg)
+  const float4* Xf4 = (const float4*)Xn;
+  float4 x4 = ld_cg_f4(Xf4 + lane);
+
+  // RMS sumsq
+  float ss = x4.x*x4.x + x4.y*x4.y + x4.z*x4.z + x4.w*x4.w;
+  #pragma unroll
+  for(int off=16; off>0; off>>=1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);
+  float sumsq = __shfl_sync(0xFFFFFFFFu, ss, 0);
+
+  float inv = rsqrtf(sumsq * (1.0f/(float)Dhf) + EPS);
+  if(lane==0) rms_inv[n] = inv;
+
+  // Apply gamma (safe scalar loads)
+  float g0 = gamma[col_base+0];
+  float g1 = gamma[col_base+1];
+  float g2 = gamma[col_base+2];
+  float g3 = gamma[col_base+3];
+
+  float xn0 = x4.x * inv * g0;
+  float xn1 = x4.y * inv * g1;
+  float xn2 = x4.z * inv * g2;
+  float xn3 = x4.w * inv * g3;
+
+  // Optionally write normalized vector for backward Wq/Wk/Wv gradients
+  if(Nnorm_or_null){
+    float4* Nf4 = (float4*)(Nnorm_or_null + (size_t)n*(size_t)Dhf);
+    Nf4[lane] = make_float4(xn0,xn1,xn2,xn3);
+  }
+
+  // Warp-broadcast x[k] for k=0..127
+  float q0=0.f,q1=0.f,q2=0.f,q3=0.f;
+  float k0=0.f,k1=0.f,k2=0.f,k3=0.f;
+  float v0=0.f,v1=0.f,v2=0.f,v3=0.f;
+
+  for(int k=0;k<Dhf;k++){
+    int src_lane = k >> 2;      // 0..31
+    int off = k & 3;            // 0..3
+    float xk;
+    if(off==0) xk = __shfl_sync(0xFFFFFFFFu, xn0, src_lane);
+    else if(off==1) xk = __shfl_sync(0xFFFFFFFFu, xn1, src_lane);
+    else if(off==2) xk = __shfl_sync(0xFFFFFFFFu, xn2, src_lane);
+    else            xk = __shfl_sync(0xFFFFFFFFu, xn3, src_lane);
+
+    const float4* wqf4 = (const float4*)(Wq + (size_t)k*(size_t)Dhf + (size_t)col_base);
+    const float4* wkf4 = (const float4*)(Wk + (size_t)k*(size_t)Dhf + (size_t)col_base);
+    const float4* wvf4 = (const float4*)(Wv + (size_t)k*(size_t)Dhf + (size_t)col_base);
+
+    float4 wq4 = ld_cg_f4(wqf4);
+    float4 wk4 = ld_cg_f4(wkf4);
+    float4 wv4 = ld_cg_f4(wvf4);
+
+    q0 = fmaf(xk, wq4.x, q0); q1 = fmaf(xk, wq4.y, q1); q2 = fmaf(xk, wq4.z, q2); q3 = fmaf(xk, wq4.w, q3);
+    k0 = fmaf(xk, wk4.x, k0); k1 = fmaf(xk, wk4.y, k1); k2 = fmaf(xk, wk4.z, k2); k3 = fmaf(xk, wk4.w, k3);
+    v0 = fmaf(xk, wv4.x, v0); v1 = fmaf(xk, wv4.y, v1); v2 = fmaf(xk, wv4.z, v2); v3 = fmaf(xk, wv4.w, v3);
+  }
+
+  // RoPE (pairs within head) on (col_base+0,col_base+1) and (col_base+2,col_base+3)
+  // Dh=16 => Dh/2=8 per head
+  auto rope_pair = [&](int d_even, float& a0, float& a1, float& b0, float& b1){
+    int within = d_even & (Dh-1);     // 0..15
+    int i2 = within >> 1;            // 0..7
+    float s = sin_tbl[(size_t)tpos*(size_t)(Dh/2) + (size_t)i2];
+    float c = cos_tbl[(size_t)tpos*(size_t)(Dh/2) + (size_t)i2];
+    float qa=a0, qb=a1;
+    float ka=b0, kb=b1;
+    a0 = qa*c - qb*s;
+    a1 = qa*s + qb*c;
+    b0 = ka*c - kb*s;
+    b1 = ka*s + kb*c;
+  };
+  rope_pair(col_base+0, q0,q1, k0,k1);
+  rope_pair(col_base+2, q2,q3, k2,k3);
+
+  // Store Q/K/V
+  float4* Qf4 = (float4*)Qn;
+  float4* Kf4 = (float4*)Kn;
+  float4* Vf4 = (float4*)Vn;
+  Qf4[lane] = make_float4(q0,q1,q2,q3);
+  Kf4[lane] = make_float4(k0,k1,k2,k3);
+  Vf4[lane] = make_float4(v0,v1,v2,v3);
+}
+
+// ================= GPU container =================
 struct GPU {
   int dev;
   int B,T,N;
@@ -1522,6 +1275,7 @@ struct GPU {
 
   uint16_t *tok,*tgt;
 
+  // pinned host staging for graph-captured H2D copies
   uint16_t *htok_h,*htgt_h;
 
   float *y1,*y2,*x1,*x2;
@@ -1561,6 +1315,7 @@ struct GPU {
 
   cudaStream_t comm = nullptr;
 
+  // CUDA Graph
   int graph_built = 0;
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t graphExec = nullptr;
@@ -1596,6 +1351,7 @@ static void gpu_alloc(GPU* g,int dev,int B,int T){
   CUDA_CHECK(cudaMalloc(&g->tok,(size_t)g->N*sizeof(uint16_t)));
   CUDA_CHECK(cudaMalloc(&g->tgt,(size_t)g->N*sizeof(uint16_t)));
 
+  g->htok_h=nullptr; g->htgt_h=nullptr;
   CUDA_CHECK(cudaHostAlloc(&g->htok_h, (size_t)g->N*sizeof(uint16_t), cudaHostAllocDefault));
   CUDA_CHECK(cudaHostAlloc(&g->htgt_h, (size_t)g->N*sizeof(uint16_t), cudaHostAllocDefault));
 
@@ -1640,6 +1396,7 @@ static void gpu_alloc(GPU* g,int dev,int B,int T){
   mal(&g->Xnorm,(size_t)g->N*(size_t)D);
   mal(&g->invF,(size_t)g->N);
   malh(&g->Xnorm_h,(size_t)g->N*(size_t)D);
+
   mal(&g->Loss,(size_t)g->N);
   mal(&g->row_max,(size_t)g->N);
   mal(&g->row_sum,(size_t)g->N);
@@ -1672,6 +1429,7 @@ static void gpu_alloc(GPU* g,int dev,int B,int T){
   KERNEL_CHECK();
 
   g->ring_tmp=nullptr;
+  g->comm=nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&g->comm, cudaStreamNonBlocking));
 
   auto malw=[&](half** p,size_t n){ CUDA_CHECK(cudaMalloc(p,n*sizeof(half))); };
@@ -1736,38 +1494,26 @@ static void gpu_free(GPU* g){
 static void refresh_half_weights(GPU* g){
   CUDA_CHECK(cudaSetDevice(g->dev));
   dim3 blk(16,16);
+
   dim3 grdWte((D+15)/16,(Vpad+15)/16);
   w_f2h_rm_tr<<<grdWte,blk>>>(g->Hw.wte_rm, g->Hw.wte_tr, g->W.wte, Vpad, D); KERNEL_CHECK();
+
   dim3 grdWout((Vpad+15)/16,(D+15)/16);
   w_f2h_rm_tr<<<grdWout,blk>>>(g->Hw.Wout_rm, g->Hw.Wout_tr, g->W.Wout, D, Vpad); KERNEL_CHECK();
+
   for(int l=0;l<L;l++){
     dim3 grdHH((Dhf+15)/16,(Dhf+15)/16);
     w_f2h_rm_tr<<<grdHH,blk>>>(g->Hw.Wq_rm[l], g->Hw.Wq_tr[l], g->W.Wq[l], Dhf, Dhf); KERNEL_CHECK();
     w_f2h_rm_tr<<<grdHH,blk>>>(g->Hw.Wk_rm[l], g->Hw.Wk_tr[l], g->W.Wk[l], Dhf, Dhf); KERNEL_CHECK();
     w_f2h_rm_tr<<<grdHH,blk>>>(g->Hw.Wv_rm[l], g->Hw.Wv_tr[l], g->W.Wv[l], Dhf, Dhf); KERNEL_CHECK();
     w_f2h_rm_tr<<<grdHH,blk>>>(g->Hw.Wo_rm[l], g->Hw.Wo_tr[l], g->W.Wo[l], Dhf, Dhf); KERNEL_CHECK();
+
     dim3 grdW1((F+15)/16,(Dhf+15)/16);
     w_f2h_rm_tr<<<grdW1,blk>>>(g->Hw.W1_rm[l], g->Hw.W1_tr[l], g->W.W1[l], Dhf, F); KERNEL_CHECK();
+
     dim3 grdW2((Dhf+15)/16,(F+15)/16);
     w_f2h_rm_tr<<<grdW2,blk>>>(g->Hw.W2_rm[l], g->Hw.W2_tr[l], g->W.W2[l], F, Dhf); KERNEL_CHECK();
   }
-}
-
-static void adam_step(GPU* g, int step, float lr, float wd, float clip){
-  CUDA_CHECK(cudaSetDevice(g->dev));
-  const float b1=0.9f,b2=0.999f,eps=1e-8f;
-  float b1t=1.f-powf(b1,(float)step);
-  float b2t=1.f-powf(b2,(float)step);
-  float inv_b1t=1.f/b1t, inv_b2t=1.f/b2t;
-
-  int blocks=256;
-  int n=(int)weights_floats();
-  reduce_sumsq_1<<<blocks,256>>>(g->dG, g->partial, n); KERNEL_CHECK();
-  reduce_sumsq_2<<<1,256>>>(g->partial, g->sumsq, blocks); KERNEL_CHECK();
-  compute_clip_scale<<<1,1>>>(g->clip_scale_dev, g->sumsq, clip); KERNEL_CHECK();
-
-  adamw<<<(n+255)/256,256>>>(g->dW,g->mW,g->vW,g->dG,n,lr,wd,b1,b2,eps,inv_b1t,inv_b2t,g->clip_scale_dev);
-  KERNEL_CHECK();
 }
 
 // ===== DP reduce/bcast =====
@@ -1808,8 +1554,6 @@ static bool p2p_allreduce(std::vector<GPU>& gpus){
     }
   }
 
-  // NOTE: NO cudaDeviceSynchronize() here. train_step already syncs its stream.
-  // reduce-scatter
   for(int s=0; s<G-1; s++){
     for(int r=0; r<G; r++){
       int prev = (r-1+G)%G;
@@ -1832,7 +1576,6 @@ static bool p2p_allreduce(std::vector<GPU>& gpus){
     }
   }
 
-  // all-gather
   for(int s=0; s<G-1; s++){
     for(int r=0; r<G; r++){
       int prev = (r-1+G)%G;
@@ -1892,6 +1635,22 @@ static void broadcast_weights_from0(std::vector<GPU>& gpus){
   for(int i=0;i<G;i++) refresh_half_weights(&gpus[i]);
 }
 
+static void adam_step(GPU* g, int step, float lr, float wd, float clip){
+  CUDA_CHECK(cudaSetDevice(g->dev));
+  int blocks=256;
+  int n=(int)weights_floats();
+  reduce_sumsq_1<<<blocks,256>>>(g->dG, g->partial, n); KERNEL_CHECK();
+  reduce_sumsq_2<<<1,256>>>(g->partial, g->sumsq, blocks); KERNEL_CHECK();
+  compute_clip_scale<<<1,1>>>(g->clip_scale_dev, g->sumsq, clip); KERNEL_CHECK();
+
+  const float b1=0.9f,b2=0.999f,eps=1e-8f;
+  float b1t=1.f-powf(b1,(float)step);
+  float b2t=1.f-powf(b2,(float)step);
+  float inv_b1t=1.f/b1t, inv_b2t=1.f/b2t;
+  adamw<<<(n+255)/256,256>>>(g->dW,g->mW,g->vW,g->dG,n,lr,wd,b1,b2,eps,inv_b1t,inv_b2t,g->clip_scale_dev);
+  KERNEL_CHECK();
+}
+
 // ================= train step (device-only, capturable) =================
 static void train_step_device(GPU* g){
   int B=g->B, T=g->T, N=g->N;
@@ -1903,15 +1662,19 @@ static void train_step_device(GPU* g){
   dim3 grdE((D+15)/16,(N+15)/16);
   embed_split<<<grdE,blk2>>>(g->y1,g->y2,g->W.wte,g->W.wpe,g->tok,N,T); KERNEL_CHECK();
 
+  // Forward
   for(int l=0;l<L;l++){
-    rms_fwd_f2h<Dhf><<<N,256>>>(g->n, g->n_h, g->inv, g->y2, g->W.gf[l], N); KERNEL_CHECK();
-    wmma_fwd(g->Q, g->n_h, g->Hw.Wq_tr[l], N, Dhf, Dhf);
-    wmma_fwd(g->K, g->n_h, g->Hw.Wk_tr[l], N, Dhf, Dhf);
-    wmma_fwd(g->Vh,g->n_h, g->Hw.Wv_tr[l], N, Dhf, Dhf);
-
-    dim3 rblk(16,16);
-    dim3 rgrd((Dh/2+15)/16, ((B*T)+15)/16, H);
-    rope_apply_qk<<<rgrd,rblk>>>(g->Q, g->K, g->sin_tbl, g->cos_tbl, B, T); KERNEL_CHECK();
+    // ===== FULL-BLAST FUSED STRIKE (replaces RMS + QKV WMMA + RoPE) =====
+    // No need to write g->n in forward; pass nullptr.
+    constexpr int WPB = 8;
+    int blocks = (N + WPB - 1) / WPB;
+    fused_rms_qkv_rope_hf<WPB><<<blocks,256>>>(g->Q, g->K, g->Vh, g->inv, (float*)nullptr,
+                                              g->y2,
+                                              g->W.Wq[l], g->W.Wk[l], g->W.Wv[l],
+                                              g->W.gf[l],
+                                              g->sin_tbl, g->cos_tbl,
+                                              N, T);
+    KERNEL_CHECK();
 
     dim3 grid(B,H,(T+FA_QT-1)/FA_QT);
     flash_fwd_hf<<<grid,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
@@ -1928,6 +1691,7 @@ static void train_step_device(GPU* g){
     add_inplace<<<(N*Dhf+255)/256,256>>>(g->y2, g->gout, N*Dhf); KERNEL_CHECK();
   }
 
+  // Head forward (streaming chunks)
   concat_full<<<dim3((D+15)/16,(N+15)/16),blk2>>>(g->Xfull, g->y1, g->y2, N); KERNEL_CHECK();
   rms_fwd_f2h<D><<<N,256>>>(g->Xnorm, g->Xnorm_h, g->invF, g->Xfull, g->W.gout, N); KERNEL_CHECK();
 
@@ -1963,7 +1727,9 @@ static void train_step_device(GPU* g){
   rms_bwd_dg<D><<<D,256>>>(g->G.gout, g->dXnorm, g->Xfull, g->invF, N); KERNEL_CHECK();
   split_full<<<dim3((D+15)/16,(N+15)/16),blk2>>>(g->dy1, g->dy2, g->dXfull, N); KERNEL_CHECK();
 
+  // Reversible backward
   for(int l=L-1;l>=0;l--){
+    // ---- g backward ----
     rms_fwd_f2h<Dhf><<<N,256>>>(g->n, g->n_h, g->inv, g->y1, g->W.gg[l], N); KERNEL_CHECK();
     wmma_fwd(g->U, g->n_h, g->Hw.W1_tr[l], N, F, Dhf);
     gelu_fwd<<<(N*F+255)/256,256>>>(g->A, g->U, N*F); KERNEL_CHECK();
@@ -1984,14 +1750,17 @@ static void train_step_device(GPU* g){
     rms_bwd_dX<Dhf><<<N,256>>>(g->dy1, g->dQ, g->y1, g->W.gg[l], g->inv, N); KERNEL_CHECK();
     rms_bwd_dg<Dhf><<<Dhf,256>>>(g->G.gg[l], g->dQ, g->y1, g->inv, N); KERNEL_CHECK();
 
-    rms_fwd_f2h<Dhf><<<N,256>>>(g->n, g->n_h, g->inv, g->x2, g->W.gf[l], N); KERNEL_CHECK();
-    wmma_fwd(g->Q, g->n_h, g->Hw.Wq_tr[l], N, Dhf, Dhf);
-    wmma_fwd(g->K, g->n_h, g->Hw.Wk_tr[l], N, Dhf, Dhf);
-    wmma_fwd(g->Vh,g->n_h, g->Hw.Wv_tr[l], N, Dhf, Dhf);
-
-    dim3 rblk(16,16);
-    dim3 rgrd((Dh/2+15)/16, ((B*T)+15)/16, H);
-    rope_apply_qk<<<rgrd,rblk>>>(g->Q, g->K, g->sin_tbl, g->cos_tbl, B, T); KERNEL_CHECK();
+    // ---- f backward ----
+    // Recompute fused RMS+QKV+RoPE for x2, and WRITE g->n for dW(Q/K/V).
+    constexpr int WPB = 8;
+    int blocks = (N + WPB - 1) / WPB;
+    fused_rms_qkv_rope_hf<WPB><<<blocks,256>>>(g->Q, g->K, g->Vh, g->inv, g->n,
+                                              g->x2,
+                                              g->W.Wq[l], g->W.Wk[l], g->W.Wv[l],
+                                              g->W.gf[l],
+                                              g->sin_tbl, g->cos_tbl,
+                                              N, T);
+    KERNEL_CHECK();
 
     dim3 grid(B,H,(T+FA_QT-1)/FA_QT);
     flash_fwd_hf<<<grid,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
@@ -2014,6 +1783,8 @@ static void train_step_device(GPU* g){
     flash_bwd_dq_hf<<<dim3(B,H,(T+FA_QT-1)/FA_QT),256>>>(g->dp, g->dQ, g->dOattn, g->Q, g->K, g->Vh, g->matt, g->latt, B, T); KERNEL_CHECK();
     flash_bwd_dkv_hf<<<dim3(B,H,(T+FA_KT-1)/FA_KT),256>>>(g->dK, g->dVh, g->dOattn, g->Q, g->K, g->Vh, g->matt, g->latt, g->dp, B, T); KERNEL_CHECK();
 
+    dim3 rblk(16,16);
+    dim3 rgrd((Dh/2+15)/16, ((B*T)+15)/16, H);
     rope_apply_grad<<<rgrd,rblk>>>(g->dQ, g->dK, g->sin_tbl, g->cos_tbl, B, T); KERNEL_CHECK();
 
     wmma_dW(g->G.Wq[l], g->Atr, g->dYtr, g->n, g->dQ, N, Dhf, Dhf);
@@ -2083,6 +1854,11 @@ static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int6
     }
   }
 
+  if(!use_graph){
+    CUDA_CHECK(cudaMemcpyAsync(g->tok, g->htok_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(g->tgt, g->htgt_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
+  }
+
   if(use_graph){
     if(!g->graph_built){
       ensure_train_graph(g);
@@ -2092,8 +1868,6 @@ static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int6
       CUDA_CHECK(cudaStreamSynchronize(0));
     }
   }else{
-    CUDA_CHECK(cudaMemcpyAsync(g->tok, g->htok_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
-    CUDA_CHECK(cudaMemcpyAsync(g->tgt, g->htgt_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
     train_step_device(g);
     CUDA_CHECK(cudaStreamSynchronize(0));
   }
@@ -2160,6 +1934,7 @@ int main(int argc,char** argv){
   PairIndex pi;
   std::vector<float> winit;
   bool has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
+
   if(!has_ckpt){
     if(!load_index_v7(index_path, &pi)) pi = make_pair_index(bytes);
   }
@@ -2250,7 +2025,6 @@ int main(int argc,char** argv){
       std::fflush(stdout);
       if(!std::isfinite((float)Lm)) die("loss NaN/Inf");
     }
-
     if(save_every>0 && (step%save_every)==0){
       CUDA_CHECK(cudaSetDevice(0));
       CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyDeviceToHost));
@@ -2268,26 +2042,3 @@ int main(int argc,char** argv){
   for(int i=0;i<G;i++) gpu_free(&gpus[(size_t)i]);
   return 0;
 }
-CU
-
-echo "[*] Building: $BIN (sm_75)"
-nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread --use_fast_math -lineinfo --expt-relaxed-constexpr \
-  -DPAIR_K="$PAIR_K" -DPAIR_K1="$PAIR_K1" -DVCHUNK="$VCHUNK" -DDMODEL="$DMODEL" -DNHEAD="$NHEAD" -DNLAY="$NLAY" -DFFN="$FFN" -DTMAX="$TMAX" \
-  "$TMP_CU_DIR/$CU" -o "$TMP_CU_DIR/temp_bin"
-
-mv "$TMP_CU_DIR/temp_bin" "$BIN"
-rm -rf "$TMP_CU_DIR"
-
-echo
-echo "[*] TRAIN example:"
-echo "  ./$BIN --train --data \"$DATA_FILE\" --ckpt ckpt.bin --steps 20000 --batch 256 --seq 512 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 1000 --measure"
-echo
-echo "[*] Default smoke-run:"and 
-echo "  ./$BIN --train --data \"$DATA_FILE\" --index \"$INDEX_BIN\" --ckpt ckpt.bin --steps 2000 --batch 64 --seq 128 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 500"
-echo
-
-if [[ "$#" -gt 0 ]]; then
-  ./"$BIN" --data "$DATA_FILE" --index "$INDEX_BIN" "$@"
-else
-  ./"$BIN" --train --data "$DATA_FILE" --index "$INDEX_BIN" --ckpt ckpt.bin --steps 2000 --batch 64 --seq 128 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 500
-fi
