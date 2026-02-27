@@ -38,10 +38,11 @@ cd "$WORKDIR"
 
 DATA_FILE="${DATA_FILE:-tinyshakespeare.txt}"
 URL="https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-if [[ ! -f "$DATA_FILE" ]]; then
+if [[ ! -s "$DATA_FILE" ]]; then
   echo "[*] Downloading Tiny Shakespeare..."
-  curl -L "$URL" -o "$DATA_FILE"
+  curl -L --fail "$URL" -o "$DATA_FILE"
 fi
+[[ -s "$DATA_FILE" ]] || { echo "FATAL: corpus empty: $DATA_FILE" >&2; exit 1; }
 
 : "${PAIR_K:=16384}"
 : "${PAIR_K1:=8192}"
@@ -49,7 +50,8 @@ fi
 
 # ------------------ Deterministic v7 index builder (K1 bytepairs + K2 tokenpair macros) ------------------
 INDEX_INPUTS="${INDEX_INPUTS:-$DATA_FILE}"   # colon-separated corpus files (e.g. code+multilingual)
-INDEX_BIN="${INDEX_BIN:-index_v7.bin}"
+K2=$((PAIR_K-PAIR_K1))
+INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}.bin}"
 ABS_INPUT="$(absify_inputs "$INDEX_INPUTS")"
 FORCE_INDEX="${FORCE_INDEX:-0}"
 
@@ -348,11 +350,6 @@ CPP
   g++ -O3 -std=c++17 "$TMP_BUILD_DIR/index_build_v7.cpp" -o "$TMP_BUILD_DIR/index_build_v7"
   echo "[*] Building deterministic index: $INDEX_BIN (K1=$PAIR_K1 K2=$((PAIR_K-PAIR_K1)))"
   
-  # Ensure input files are absolute so the binary in the temp dir can find them
-  ABS_INPUT=$INDEX_INPUTS
-  if [[ ! "$ABS_INPUT" = /* ]]; then
-    ABS_INPUT="$WORKDIR/$INDEX_INPUTS"
-  fi
   "$TMP_BUILD_DIR/index_build_v7" --k1 "$PAIR_K1" --k2 "$((PAIR_K-PAIR_K1))" --out "$INDEX_BIN" --inputs "$ABS_INPUT"
   
   # Cleanup index builder
@@ -501,17 +498,32 @@ static inline float frand01(RNG* r){ uint32_t u=(uint32_t)(xs64(r)>>40); return 
 static inline float frand11(RNG* r){ return frand01(r)*2.f-1.f; }
 
 // ================= file IO =================
-static std::vector<uint8_t> read_file_bytes(const char* path){
-  FILE* f=std::fopen(path,"rb");
-  if(!f) die("could not open data file");
-  std::fseek(f,0,SEEK_END);
-  long n=std::ftell(f);
-  std::fseek(f,0,SEEK_SET);
-  if(n<=0) die("empty data");
-  std::vector<uint8_t> buf((size_t)n);
-  if(std::fread(buf.data(),1,(size_t)n,f)!=(size_t)n) die("read failed");
-  std::fclose(f);
-  return buf;
+// Helper to read and concatenate multiple files (colon-separated)
+static std::vector<uint8_t> read_file_bytes(const char* paths_s){
+  std::vector<uint8_t> all_bytes;
+  std::string s(paths_s);
+  size_t i=0;
+  while(i<s.size()){
+    size_t j=s.find(':', i);
+    if(j==std::string::npos) j=s.size();
+    std::string path = s.substr(i, j-i);
+    if(!path.empty()){
+      FILE* f=std::fopen(path.c_str(),"rb");
+      if(!f){ std::fprintf(stderr,"FATAL: could not open data file: %s\n", path.c_str()); std::exit(1); }
+      std::fseek(f,0,SEEK_END);
+      long n=std::ftell(f);
+      std::fseek(f,0,SEEK_SET);
+      if(n>0){
+        size_t prev_size = all_bytes.size();
+        all_bytes.resize(prev_size + (size_t)n);
+        if(std::fread(all_bytes.data() + prev_size,1,(size_t)n,f)!=(size_t)n) die("read failed");
+      }
+      std::fclose(f);
+    }
+    i=j+1;
+  }
+  if(all_bytes.empty()) die("empty data");
+  return all_bytes;
 }
 
 // ================= PairIndex tokenizer =================
@@ -2875,7 +2887,7 @@ echo "  # If 'ckpt.bin' doesn't exist, starts training automatically on '$DATA_F
 echo "  ./$BIN --data \"$DATA_FILE\" --ckpt ckpt.bin"
 echo
 if [[ "$#" -gt 0 ]]; then
-  ./"$BIN" "$@"
+  ./"$BIN" --data "$DATA_FILE" --index "$INDEX_BIN" "$@"
 else
-  ./"$BIN" --train --data "$DATA_FILE" --ckpt ckpt.bin --steps 2000 --batch 64 --seq 128 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 500
+  ./"$BIN" --train --data "$DATA_FILE" --index "$INDEX_BIN" --ckpt ckpt.bin --steps 2000 --batch 64 --seq 128 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 500
 fi

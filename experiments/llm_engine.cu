@@ -125,17 +125,32 @@ static inline float frand01(RNG* r){ uint32_t u=(uint32_t)(xs64(r)>>40); return 
 static inline float frand11(RNG* r){ return frand01(r)*2.f-1.f; }
 
 // ================= file IO =================
-static std::vector<uint8_t> read_file_bytes(const char* path){
-  FILE* f=std::fopen(path,"rb");
-  if(!f) die("could not open data file");
-  std::fseek(f,0,SEEK_END);
-  long n=std::ftell(f);
-  std::fseek(f,0,SEEK_SET);
-  if(n<=0) die("empty data");
-  std::vector<uint8_t> buf((size_t)n);
-  if(std::fread(buf.data(),1,(size_t)n,f)!=(size_t)n) die("read failed");
-  std::fclose(f);
-  return buf;
+// Helper to read and concatenate multiple files (colon-separated)
+static std::vector<uint8_t> read_file_bytes(const char* paths_s){
+  std::vector<uint8_t> all_bytes;
+  std::string s(paths_s);
+  size_t i=0;
+  while(i<s.size()){
+    size_t j=s.find(':', i);
+    if(j==std::string::npos) j=s.size();
+    std::string path = s.substr(i, j-i);
+    if(!path.empty()){
+      FILE* f=std::fopen(path.c_str(),"rb");
+      if(!f){ std::fprintf(stderr,"FATAL: could not open data file: %s\n", path.c_str()); std::exit(1); }
+      std::fseek(f,0,SEEK_END);
+      long n=std::ftell(f);
+      std::fseek(f,0,SEEK_SET);
+      if(n>0){
+        size_t prev_size = all_bytes.size();
+        all_bytes.resize(prev_size + (size_t)n);
+        if(std::fread(all_bytes.data() + prev_size,1,(size_t)n,f)!=(size_t)n) die("read failed");
+      }
+      std::fclose(f);
+    }
+    i=j+1;
+  }
+  if(all_bytes.empty()) die("empty data");
+  return all_bytes;
 }
 
 
