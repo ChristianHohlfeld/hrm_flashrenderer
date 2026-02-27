@@ -32,7 +32,12 @@ absify_inputs() {
   echo "$out"
 }
 
-WORKDIR="${WORKDIR:-$PWD}"
+# Prioritize experiments folder if it exists
+if [[ -d "/home/chris/tmp/hrm_flashrenderer/experiments" ]]; then
+  WORKDIR="/home/chris/tmp/hrm_flashrenderer/experiments"
+else
+  WORKDIR="${WORKDIR:-$PWD}"
+fi
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
@@ -1926,7 +1931,7 @@ struct GPU {
   int dev;
   int B,T,N;
 
-  float *dW,*dG,*mW,*vW;
+  float *dW,*dG,*dGacc,*mW,*vW; // dG = per-microstep grad, dGacc = accumulated grad
   WView W,G,MW,VW;
   HW Hw;
 
@@ -1982,6 +1987,38 @@ struct GPU {
 
 };
 
+static float clip_scale(GPU* g, float clip){
+  CUDA_CHECK(cudaSetDevice(g->dev));
+  int blocks=256;
+  int n=(int)weights_floats();
+
+  // NOTE: clip on accumulated gradient
+  reduce_sumsq_1<<<blocks,256>>>(g->dGacc, g->partial, n); KERNEL_CHECK();
+  reduce_sumsq_2<<<1,256>>>(g->partial, g->sumsq, blocks); KERNEL_CHECK();
+
+  float h=0.f;
+  CUDA_CHECK(cudaMemcpy(&h, g->sumsq, sizeof(float), cudaMemcpyDeviceToHost));
+  float norm=sqrtf(h);
+  if(!isfinite(norm) || norm<=0.f) return 1.f;
+  return (norm>clip)? (clip/norm) : 1.f;
+}
+
+static void adam_step(GPU* g, int step, float lr, float wd, float clip){
+  CUDA_CHECK(cudaSetDevice(g->dev));
+  float scale=clip_scale(g, clip);
+
+  const float b1=0.9f,b2=0.999f,eps=1e-8f;
+  float b1t=1.f-powf(b1,(float)step);
+  float b2t=1.f-powf(b2,(float)step);
+  float inv_b1t=1.f/b1t, inv_b2t=1.f/b2t;
+
+  int n=(int)weights_floats();
+
+  // NOTE: update using accumulated gradient
+  adamw<<<(n+255)/256,256>>>(g->dW,g->mW,g->vW,g->dGacc,n,lr,wd,b1,b2,eps,inv_b1t,inv_b2t,scale);
+  KERNEL_CHECK();
+}
+
 static void init_weights_cpu(std::vector<float>& w, uint64_t seed){
   RNG r{seed?seed:123ULL};
   for(size_t i=0;i<w.size();i++) w[i]=frand11(&r)*0.02f;
@@ -1997,15 +2034,21 @@ static void gpu_alloc(GPU* g,int dev,int B,int T){
   CUDA_CHECK(cudaSetDevice(dev));
 
   size_t Wn=weights_floats();
-  CUDA_CHECK(cudaMalloc(&g->dW, Wn*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&g->dG, Wn*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&g->mW, Wn*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&g->vW, Wn*sizeof(float)));
-  CUDA_CHECK(cudaMemset(g->dG,0,Wn*sizeof(float)));
-  CUDA_CHECK(cudaMemset(g->mW,0,Wn*sizeof(float)));
-  CUDA_CHECK(cudaMemset(g->vW,0,Wn*sizeof(float)));
-  pack_W(g->dW,&g->W); pack_W(g->dG,&g->G);
-  pack_W(g->mW,&g->MW); pack_W(g->vW,&g->VW);
+  CUDA_CHECK(cudaMalloc(&g->dW,   Wn*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&g->dG,   Wn*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&g->dGacc,Wn*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&g->mW,   Wn*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&g->vW,   Wn*sizeof(float)));
+
+  CUDA_CHECK(cudaMemset(g->dG,   0, Wn*sizeof(float)));
+  CUDA_CHECK(cudaMemset(g->dGacc,0, Wn*sizeof(float)));
+  CUDA_CHECK(cudaMemset(g->mW,   0, Wn*sizeof(float)));
+  CUDA_CHECK(cudaMemset(g->vW,   0, Wn*sizeof(float)));
+
+  pack_W(g->dW,&g->W);
+  pack_W(g->dG,&g->G);          // per-microstep grad views (kernels write here)
+  pack_W(g->mW,&g->MW);
+  pack_W(g->vW,&g->VW);
 
   CUDA_CHECK(cudaMalloc(&g->tok,(size_t)g->N*sizeof(uint16_t)));
   CUDA_CHECK(cudaMalloc(&g->tgt,(size_t)g->N*sizeof(uint16_t)));
@@ -2107,7 +2150,7 @@ static void gpu_alloc(GPU* g,int dev,int B,int T){
 static void gpu_free(GPU* g){
   CUDA_CHECK(cudaSetDevice(g->dev));
   auto cf=[&](void* p){ if(p) cudaFree(p); };
-  cf(g->dW); cf(g->dG); cf(g->mW); cf(g->vW);
+  cf(g->dW); cf(g->dG); cf(g->dGacc); cf(g->mW); cf(g->vW);
   cf(g->tok); cf(g->tgt);
   if(g->htok_h) CUDA_CHECK(cudaFreeHost(g->htok_h));
   if(g->htgt_h) CUDA_CHECK(cudaFreeHost(g->htgt_h));
@@ -2168,28 +2211,7 @@ static void refresh_half_weights(GPU* g){
   }
 }
 
-static float clip_scale(GPU* g, float clip){
-  CUDA_CHECK(cudaSetDevice(g->dev));
-  int blocks=256;
-  int n=(int)weights_floats();
-  reduce_sumsq_1<<<blocks,256>>>(g->dG, g->partial, n); KERNEL_CHECK();
-  reduce_sumsq_2<<<1,256>>>(g->partial, g->sumsq, blocks); KERNEL_CHECK();
-  float h=0.f; CUDA_CHECK(cudaMemcpy(&h, g->sumsq, sizeof(float), cudaMemcpyDeviceToHost));
-  float norm=sqrtf(h);
-  if(!isfinite(norm) || norm<=0.f) return 1.f;
-  return (norm>clip)? (clip/norm) : 1.f;
-}
-static void adam_step(GPU* g, int step, float lr, float wd, float clip){
-  CUDA_CHECK(cudaSetDevice(g->dev));
-  float scale=clip_scale(g, clip);
-  const float b1=0.9f,b2=0.999f,eps=1e-8f;
-  float b1t=1.f-powf(b1,(float)step);
-  float b2t=1.f-powf(b2,(float)step);
-  float inv_b1t=1.f/b1t, inv_b2t=1.f/b2t;
-  int n=(int)weights_floats();
-  adamw<<<(n+255)/256,256>>>(g->dW,g->mW,g->vW,g->dG,n,lr,wd,b1,b2,eps,inv_b1t,inv_b2t,scale);
-  KERNEL_CHECK();
-}
+
 
 // ===== DP reduce/bcast =====
 __global__ void add_inplace_kernel(float* a, const float* b, int n){
@@ -2231,7 +2253,7 @@ static bool p2p_allreduce(std::vector<GPU>& gpus){
     }
   }
 
-  // ensure all training kernels on default stream are complete before comm
+  // IMPORTANT: keep the strong barrier (per-thread default stream across threads)
   for(int r=0;r<G;r++){
     CUDA_CHECK(cudaSetDevice(gpus[(size_t)r].dev));
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -2249,9 +2271,11 @@ static bool p2p_allreduce(std::vector<GPU>& gpus){
       CUDA_CHECK(cudaSetDevice(gpus[(size_t)r].dev));
       CUDA_CHECK(cudaMemcpyPeerAsync(
         gpus[(size_t)r].ring_tmp, gpus[(size_t)r].dev,
-        gpus[(size_t)prev].dG + off, gpus[(size_t)prev].dev,
+        gpus[(size_t)prev].dGacc + off, gpus[(size_t)prev].dev,
         cnt*sizeof(float), gpus[(size_t)r].comm));
-      add_inplace_kernel<<<(int)((cnt+255)/256),256,0,gpus[(size_t)r].comm>>>(gpus[(size_t)r].dG + off, gpus[(size_t)r].ring_tmp, (int)cnt);
+
+      add_inplace_kernel<<<(int)((cnt+255)/256),256,0,gpus[(size_t)r].comm>>>(
+        gpus[(size_t)r].dGacc + off, gpus[(size_t)r].ring_tmp, (int)cnt);
       KERNEL_CHECK();
     }
     for(int r=0;r<G;r++){
@@ -2271,8 +2295,8 @@ static bool p2p_allreduce(std::vector<GPU>& gpus){
 
       CUDA_CHECK(cudaSetDevice(gpus[(size_t)r].dev));
       CUDA_CHECK(cudaMemcpyPeerAsync(
-        gpus[(size_t)r].dG + off, gpus[(size_t)r].dev,
-        gpus[(size_t)prev].dG + off, gpus[(size_t)prev].dev,
+        gpus[(size_t)r].dGacc + off, gpus[(size_t)r].dev,
+        gpus[(size_t)prev].dGacc + off, gpus[(size_t)prev].dev,
         cnt*sizeof(float), gpus[(size_t)r].comm));
     }
     for(int r=0;r<G;r++){
@@ -2283,24 +2307,34 @@ static bool p2p_allreduce(std::vector<GPU>& gpus){
 
   return true;
 }
+
 static void host_allreduce(std::vector<GPU>& gpus){
   size_t Wn=weights_floats();
   std::vector<float> sum(Wn,0.f);
+
   for(auto& g: gpus){
     CUDA_CHECK(cudaSetDevice(g.dev));
     std::vector<float> tmp(Wn);
-    CUDA_CHECK(cudaMemcpy(tmp.data(), g.dG, Wn*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(tmp.data(), g.dGacc, Wn*sizeof(float), cudaMemcpyDeviceToHost));
     for(size_t i=0;i<Wn;i++) sum[i]+=tmp[i];
   }
   for(auto& g: gpus){
     CUDA_CHECK(cudaSetDevice(g.dev));
-    CUDA_CHECK(cudaMemcpy(g.dG, sum.data(), Wn*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g.dGacc, sum.data(), Wn*sizeof(float), cudaMemcpyHostToDevice));
   }
 }
 static void broadcast_weights_from0(std::vector<GPU>& gpus){
   int G=(int)gpus.size();
-  if(G<=1) return;
+
+  // Always refresh GPU0 half weights after its Adam update
+  if(G<=1){
+    refresh_half_weights(&gpus[0]);
+    return;
+  }
+
   size_t Wn=weights_floats();
+
+  // broadcast float weights
   bool p2p=true;
   for(int i=1;i<G;i++){
     int can=0; CUDA_CHECK(cudaDeviceCanAccessPeer(&can,i,0));
@@ -2317,7 +2351,14 @@ static void broadcast_weights_from0(std::vector<GPU>& gpus){
       CUDA_CHECK(cudaMemcpy(gpus[i].dW, hw.data(), Wn*sizeof(float), cudaMemcpyHostToDevice));
     }
   }
-  for(int i=0;i<G;i++) refresh_half_weights(&gpus[i]);
+
+  // BIG UTIL FIX: refresh half weights on all GPUs IN PARALLEL (no per-GPU serialization)
+  std::vector<std::thread> th;
+  th.reserve((size_t)G);
+  for(int i=0;i<G;i++){
+    th.emplace_back([&,i](){ refresh_half_weights(&gpus[(size_t)i]); });
+  }
+  for(auto& t: th) t.join();
 }
 
 // ================= train step (reversible) =================
@@ -2530,24 +2571,30 @@ static float train_step(GPU* g, const std::vector<uint16_t>& ids, int step, int6
     }
   }
 
+  // If not using graph, do H2D copies here
   if(!use_graph){
     CUDA_CHECK(cudaMemcpyAsync(g->tok, g->htok_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
     CUDA_CHECK(cudaMemcpyAsync(g->tgt, g->htgt_h, (size_t)N*sizeof(uint16_t), cudaMemcpyHostToDevice, 0));
   }
 
+  // Launch the step (graph or normal)
   if(use_graph){
     if(!g->graph_built){
-      // First call: capture executes the step once while building the graph (warmup).
-      ensure_train_graph(g);
-      CUDA_CHECK(cudaStreamSynchronize(0));
+      ensure_train_graph(g); // captures + runs once
     }else{
       CUDA_CHECK(cudaGraphLaunch(g->graphExec, 0));
-      CUDA_CHECK(cudaStreamSynchronize(0));
     }
   }else{
     train_step_device(g);
-    CUDA_CHECK(cudaStreamSynchronize(0));
   }
+
+  // Accumulate: dGacc += dG  (same stream, so it’s ordered)
+  int nW = (int)weights_floats();
+  add_inplace_kernel<<<(nW+255)/256,256>>>(g->dGacc, g->dG, nW);
+  KERNEL_CHECK();
+
+  // One sync for correctness (loss_mean + grad accumulation ready)
+  CUDA_CHECK(cudaStreamSynchronize(0));
 
   float loss=0.f;
   CUDA_CHECK(cudaMemcpy(&loss, g->loss_mean, sizeof(float), cudaMemcpyDeviceToHost));
@@ -2995,7 +3042,7 @@ int main(int argc,char** argv){
   const char* data_path="tinyshakespeare.txt";
   const char* ckpt_path="ckpt.bin";
   const char* index_path="index_v7.bin";
-  int steps=2000,batch=64,seq=128,gpus_req=2;
+  int steps=2000,batch=64,seq=128,gpus_req=2,accum=4; // accum = microsteps per optimizer step
   float lr=3e-4f,wd=0.01f,clip=1.0f;
   int log_every=50,save_every=500;
   uint64_t seed=123;
@@ -3033,24 +3080,32 @@ else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++
     else if(!std::strcmp(argv[i],"--no_graph")) use_graph=0;
     else if(!std::strcmp(argv[i],"--pho")){ pho_req=true; pho_req_set=true; }
     else if(!std::strcmp(argv[i],"--no_pho")){ pho_req=false; pho_req_set=true; }
-        else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
+    else if(!std::strcmp(argv[i],"--accum") && i+1<argc) accum=std::atoi(argv[++i]);
+    else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
   }
   if(!do_train && !do_chat) do_train=true;
 
   if((seq%16)!=0) die("--seq must be multiple of 16");
   if(seq<16 || seq>Tmax) die("--seq out of range");
+  if(accum<1) die("--accum must be >= 1");
 
   auto bytes_raw=read_file_bytes(data_path);
 
   // If training from scratch but file exists, prevent overwrite
   std::string actual_ckpt_path = ckpt_path;
   if (!do_continue && !do_chat) {
-    int suffix = 1;
-    while (true) {
-      FILE* tst = std::fopen(actual_ckpt_path.c_str(), "rb");
-      if (!tst) break; // Free name found
-      std::fclose(tst);
-      actual_ckpt_path = std::string(ckpt_path) + "." + std::to_string(suffix++);
+    FILE* exist = std::fopen(ckpt_path, "rb");
+    if (exist) {
+      std::fclose(exist);
+      std::printf("[*] Found existing '%s'. To resume, use --continue.\n", ckpt_path);
+      std::printf("[*] Auto-versioning to avoid overwrite...\n");
+      int suffix = 1;
+      while (true) {
+        FILE* tst = std::fopen(actual_ckpt_path.c_str(), "rb");
+        if (!tst) break; // Free name found
+        std::fclose(tst);
+        actual_ckpt_path = std::string(ckpt_path) + "." + std::to_string(suffix++);
+      }
     }
   }
   ckpt_path = actual_ckpt_path.c_str();
@@ -3143,46 +3198,93 @@ if(use_graph){
   std::chrono::time_point<std::chrono::high_resolution_clock> t0;
   if(do_measure) t0 = std::chrono::high_resolution_clock::now();
 
-  for(int step=1; step<=steps; step++){
-    std::vector<float> losses((size_t)G,0.f);
-    std::vector<std::thread> th; th.reserve((size_t)G);
-    int64_t base = (int64_t)step * 1315423911LL;
-    for(int i=0;i<G;i++){
-      th.emplace_back([&,i](){ losses[(size_t)i]=train_step(&gpus[(size_t)i], ids, step, base + (int64_t)i*9973LL, seed, use_graph); });
-    }
-    for(auto& t: th) t.join();
+  // microstep counter drives RNG deterministically
+  int micro_step = 0;
 
+  for(int opt_step=1; opt_step<=steps; opt_step++){
+    // zero accumulated grads for this optimizer step
+    int nW=(int)weights_floats();
+    for(int i=0;i<G;i++){
+      CUDA_CHECK(cudaSetDevice(i));
+      zero_f<<<(nW+255)/256,256>>>(gpus[(size_t)i].dGacc, nW);
+      KERNEL_CHECK();
+    }
+    // strong barrier (per-thread default streams across threads)
+    for(int i=0;i<G;i++){
+      CUDA_CHECK(cudaSetDevice(i));
+      CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    double loss_sum = 0.0;
+
+    // accumulate over microsteps
+    for(int a=0;a<accum;a++){
+      micro_step++;
+
+      std::vector<float> losses((size_t)G,0.f);
+      std::vector<std::thread> th; th.reserve((size_t)G);
+
+      int64_t base = (int64_t)micro_step * 1315423911LL;
+      for(int i=0;i<G;i++){
+        th.emplace_back([&,i](){
+          losses[(size_t)i]=train_step(&gpus[(size_t)i], ids, micro_step,
+                                       base + (int64_t)i*9973LL, seed, use_graph);
+        });
+      }
+      for(auto& t: th) t.join();
+
+      for(int i=0;i<G;i++) loss_sum += (double)losses[(size_t)i];
+    }
+
+    // allreduce accumulated grads (dGacc)
     if(G>1){
       if(!p2p_allreduce(gpus)) host_allreduce(gpus);
+
+      // scale ONLY on GPU0 (others not used for Adam)
       CUDA_CHECK(cudaSetDevice(0));
-      int nW=(int)weights_floats();
-      scale_f<<<(nW+255)/256,256>>>(gpus[0].dG, 1.0f/(float)G, nW);
+      float s = 1.0f / ((float)G * (float)accum);
+      scale_f<<<(nW+255)/256,256>>>(gpus[0].dGacc, s, nW);
+      KERNEL_CHECK();
+    }else{
+      CUDA_CHECK(cudaSetDevice(0));
+      float s = 1.0f / (float)accum;
+      scale_f<<<(nW+255)/256,256>>>(gpus[0].dGacc, s, nW);
       KERNEL_CHECK();
     }
 
-    adam_step(&gpus[0], step, lr, wd, clip);
+    // optimizer step on GPU0 using accumulated gradient
+    adam_step(&gpus[0], opt_step, lr, wd, clip);
+
+    // broadcast weights + refresh half weights in parallel
     broadcast_weights_from0(gpus);
 
-    if (step == 1 && do_measure) {
+    if (opt_step == 1 && do_measure) {
       t0 = std::chrono::high_resolution_clock::now();
     }
 
-    if(log_every>0 && (step%log_every)==0){
-      double Lm=0.0; for(int i=0;i<G;i++) Lm += (double)losses[(size_t)i]; Lm/=(double)G;
-      
+    if(log_every>0 && (opt_step%log_every)==0){
+      double Lm = loss_sum / (double)(G * accum);
+
       if(do_measure){
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
-        double tok_sec = (double)(log_every * G * batch * seq) / elapsed;
-        t0 = t1; // reset for next window
-        std::printf("step %d/%d loss=%.6f ppl=%.3f tok/s=%.1f\n", step, steps, (float)Lm, (float)std::exp(Lm), tok_sec);
+
+        // tokens processed over this log window:
+        double toks = (double)(log_every * accum * G * batch * seq);
+        double tok_sec = toks / elapsed;
+
+        t0 = t1;
+        std::printf("step %d/%d loss=%.6f ppl=%.3f tok/s=%.1f (accum=%d)\n",
+                    opt_step, steps, (float)Lm, (float)std::exp(Lm), tok_sec, accum);
       } else {
-        std::printf("step %d/%d loss=%.6f ppl=%.3f\n", step, steps, (float)Lm, (float)std::exp(Lm));
+        std::printf("step %d/%d loss=%.6f ppl=%.3f (accum=%d)\n",
+                    opt_step, steps, (float)Lm, (float)std::exp(Lm), accum);
       }
       std::fflush(stdout);
       if(!std::isfinite((float)Lm)) die("loss NaN/Inf");
     }
-    if(save_every>0 && (step%save_every)==0){
+
+    if(save_every>0 && (opt_step%save_every)==0){
       CUDA_CHECK(cudaSetDevice(0));
       CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyDeviceToHost));
       save_ckpt(ckpt_path, pi, hostW.data(), pho, pho_on);
