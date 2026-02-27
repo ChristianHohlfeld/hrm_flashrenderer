@@ -208,6 +208,8 @@ static Stage1 build_stage1(const std::vector<std::string>& inputs, int K1){
   std::stable_sort(all.begin(), all.end(), [&](uint16_t a,uint16_t b){
     uint64_t ca=cnt[a], cb=cnt[b];
     if(ca!=cb) return ca>cb;
+    return a<b;
+  });
   if((int)all.size()<K1){
     std::fprintf(stderr, "[index] WARNING: K1 (%d) is larger than unique pairs in corpus (%d). Scaling K1 down to %d.\n", K1, (int)all.size(), (int)all.size());
     K1 = (int)all.size();
