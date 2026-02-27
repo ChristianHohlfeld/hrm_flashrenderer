@@ -1,56 +1,64 @@
-# LLM Engine Experiments
+# LLM Engine Experiments 🚀
 
-This directory contains experimental variants of the `llm_engine`, featuring different tokenization strategies.
+Experimental high-performance LLM training and inference using custom CUDA kernels and FlashAttention.
 
-## Files
+## Quickstart (The Simplest Run)
 
-- `run_llm.sh`: Experimental version featuring PhO-Compress Stage I (Phonetic recoding + side-channel translation), integrated into `insane_v5_ultra` to attempt higher compression rates mapping graphemes to phonemes deterministically via an initial dictionary layer.
-- `run_llm_orig.sh`: The baseline / original implementation (`FINAL`) without the PhO-Compress Stage I mapping applied. 
-
-Both scripts recompile a C++ CUDA engine from source conditionally, and then invoke the resulting binary (`llm_engine`).
-
-## Benchmarks
-
-Both scripts have been augmented to support optional benchmarking metrics to cleanly evaluate performance impacts without perturbing usual workflow. You can enable them with the `--measure` flag. For example: `./run_llm.sh --measure`
-
-**Summary of Single-GPU (2080 Ti) Execution speeds:**
-
-| Metric | llm_engine (ORIG) | llm_engine (PHO) |
-| --- | --- | --- |
-| **Training (Tokens/sec)**| ~130,000 tok/s | ~131,000 tok/s |
-| **Inference Chat (Tokens/sec)**| ~1063 tok/s | ~1050 tok/s |
-
-*Note: Performance on multi-GPU setups currently faces CUDA Graph compilation race conditions or segment limits if executed with concurrent IO pipes. Recommend evaluating speed in isolation or with `--no_graph` for pure kernel throughput evaluations.*
-
-## Usage
-
-To train on your own data, ensure your text file is located either in the current directory or provide an absolute path, and specify `--data <your_file.txt>`. 
-
-### 1. Train on Custom Data
-
-Run the scripts in training mode, specifying your text corpus and the desired output weights file (`--ckpt`):
+If you just want to see it work immediately on the default dataset (`tinyshakespeare.txt`):
 
 ```bash
-# Train using the PHO version
-./run_llm.sh --train --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin --steps 2000 --batch 64 --seq 128 --gpus 2
+# To start training from scratch:
+./run_llm.sh --train
 
-# Or train using the original version
-./run_llm_orig.sh --train --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin --steps 2000 --batch 64 --seq 128 --gpus 2
+# To chat with the model (automatically uses 'ckpt.bin' if it exists):
+./run_llm.sh
 ```
-*Note: Wait for this process to complete before testing chat.*
 
-### 2. Run Inference (Chat Mode)
-Because these scripts are now designed with a "Quickstart Feature", if your custom model checkpoint (`my_custom_model.bin`) already exists from step 1, the script will **automatically boot directly into Chat Mode**!
+---
 
-So, the next time you want to chat with your model, you just run the exact same command:
+## 💡 Which script should I use?
+
+*   **`run_llm.sh` (Experimental PHO)**: Uses "PhO-Compress" (phonetic recoding). It maps characters to phonetic tokens to attempt higher compression and efficiency.
+*   **`run_llm_orig.sh` (Baseline)**: The standard tokenization baseline. Best for comparing against the PHO variant.
+
+---
+
+## 📂 Training on Custom Data
+
+To train on your own text corpus, specify the `--data` and `--ckpt` (checkpoint name) arguments.
 
 ```bash
-# Chat with the PHO version (auto-detects the saved model)
-./run_llm.sh --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin
-
-# Chat with the original version (auto-detects the saved model)
-./run_llm_orig.sh --measure --data /path/to/your/corpus.txt --ckpt my_custom_model.bin
+# Example: Train on your own 'dataset.txt'
+./run_llm.sh --train --data dataset.txt --ckpt my_model.bin --steps 1000 --gpus 2
 ```
 
-When the `>` prompt appears, type your message and hit Enter. The model will auto-regressively predict the next stream of tokens based on what it learned from your custom corpus!
+Once training finishes, you can chat with your new model using the same command (without `--train`):
+```bash
+./run_llm.sh --data dataset.txt --ckpt my_model.bin
+```
 
+---
+
+## 🛡️ Safety Features (New!)
+
+We've added "Rock Solid" protection to prevent accidental data loss:
+
+1.  **Mandatory `--continue`**: To prevent accidental crashes or mismatched training resumes, you must explicitly use the `--continue` flag to load an existing checkpoint for training.
+    ```bash
+    ./run_llm.sh --train --continue --ckpt my_model.bin
+    ```
+2.  **Auto-Incrementing Checkpoints**: If you start a *new* training run (`--train`) and your target `--ckpt` file already exists, the engine will **not** overwrite it. Instead, it will automatically save to `ckpt.bin.1`, `ckpt.bin.2`, etc.
+3.  **Concurrent Isolation**: You can run multiple instances of these scripts at the same time in the same folder. Each run isolates its compilation in a unique temporary directory, preventing file collisions.
+
+---
+
+## 📊 Performance Metrics
+
+Use the `--measure` flag to see real-time throughput (Tokens/sec).
+
+| Metric | Baseline (ORIG) | Experimental (PHO) |
+| :--- | :--- | :--- |
+| **Training** | ~130,000 tok/s | **~131,000 tok/s** |
+| **Inference Chat** | ~1063 tok/s | ~1050 tok/s |
+
+*Benchmarks recorded on 2080 Ti GPUs.*
