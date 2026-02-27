@@ -2725,18 +2725,7 @@ else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++
 
   auto bytes=read_file_bytes(data_path);
 
-  // If training from scratch but file exists, prevent overwrite
-  std::string actual_ckpt_path = ckpt_path;
-  if (!do_continue && !do_chat) {
-    int suffix = 1;
-    while (true) {
-      FILE* tst = std::fopen(actual_ckpt_path.c_str(), "rb");
-      if (!tst) break; // Free name found
-      std::fclose(tst);
-      actual_ckpt_path = std::string(ckpt_path) + "." + std::to_string(suffix++);
-    }
-  }
-  ckpt_path = actual_ckpt_path.c_str();
+
 
   PairIndex pi;
   std::vector<float> winit;
@@ -2876,18 +2865,88 @@ nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread --use_fast_math -lin
 mv "$TMP_CU_DIR/temp_bin" "$BIN"
 rm -rf "$TMP_CU_DIR"
 
-echo
-echo "[*] TRAIN example:"
-echo "  ./$BIN --train --data \"$DATA_FILE\" --ckpt ckpt.bin --steps 20000 --batch 256 --seq 512 --gpus 4 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 1000"
-echo
-echo
-echo "[*] Quickstart / Default behavior:"
-echo "  # If 'ckpt.bin' exists, runs in chat mode automatically."
-echo "  # If 'ckpt.bin' doesn't exist, starts training automatically on '$DATA_FILE'."
-echo "  ./$BIN --data \"$DATA_FILE\" --ckpt ckpt.bin"
-echo
-if [[ "$#" -gt 0 ]]; then
-  ./"$BIN" --data "$DATA_FILE" --index "$INDEX_BIN" "$@"
+# =============================================================================
+# Deterministic Hash-based Checkpointing
+# =============================================================================
+# Create a deterministic MD5 hash based on the structural hyperparameters.
+# This ensures checkpoints are strictly tied to the exact architecture they
+# were trained on, preventing shape-mismatch crashes.
+HASH_STR="${BIN}_K${PAIR_K}_D${DMODEL}_H${NHEAD}_L${NLAY}_F${FFN}_T${TMAX}"
+CKPT_HASH=$(echo -n "$HASH_STR" | md5sum | head -c 8)
+DEFAULT_CKPT_FILE="${WORKDIR}/ckpt_${BIN}_${CKPT_HASH}.bin"
+
+# Parse bash-level arguments
+FORCE_NEW=0
+USER_PASSED_CKPT=0
+declare -a PASSED_ARGS
+for arg in "$@"; do
+  if [[ "$arg" == "--force-new" ]]; then
+    FORCE_NEW=1
+  elif [[ "$arg" == "--ckpt" ]]; then
+    USER_PASSED_CKPT=1
+    PASSED_ARGS+=("$arg")
+  else
+    PASSED_ARGS+=("$arg")
+  fi
+done
+
+# If the user didn't explicitly provide a --ckpt, we inject our deterministic one
+if [[ $USER_PASSED_CKPT -eq 0 ]]; then
+  CKPT_FILE="$DEFAULT_CKPT_FILE"
+  # Inject it so the C++ engine knows where to look/save
+  PASSED_ARGS+=("--ckpt" "$CKPT_FILE")
 else
-  ./"$BIN" --train --data "$DATA_FILE" --index "$INDEX_BIN" --ckpt ckpt.bin --steps 2000 --batch 64 --seq 128 --gpus 2 --lr 0.0003 --wd 0.01 --clip 1.0 --log_every 50 --save_every 500
+  # The user passed a custom ckpt path, we'll respect it but extract it to check existence
+  # Actually, parsing it out of bash arrays robustly is slightly tricky here, so we'll
+  # assume if they pass a custom path they know what they're doing with --continue
+  CKPT_FILE="" # Unused in explicit check below
 fi
+
+if [[ $FORCE_NEW -eq 1 ]]; then
+  echo "[*] --force-new passed. Ensuring a fresh start."
+  if [[ $USER_PASSED_CKPT -eq 0 && -f "$CKPT_FILE" ]]; then
+    rm -f "$CKPT_FILE"
+    echo "[*] Deleted existing checkpoint: $CKPT_FILE"
+  fi
+  # If they passed custom ckpt, we assume they wiped it themselves or we just pass through
+fi
+
+# Auto-continue logic
+# If we have a known CKPT_FILE and it exists, default to --continue
+has_train_flag=0
+has_chat_flag=0
+has_continue_flag=0
+for arg in "${PASSED_ARGS[@]}"; do
+  if [[ "$arg" == "--train" ]]; then has_train_flag=1; fi
+  if [[ "$arg" == "--chat" ]]; then has_chat_flag=1; fi
+  if [[ "$arg" == "--continue" ]]; then has_continue_flag=1; fi
+done
+
+if [[ $USER_PASSED_CKPT -eq 0 && -f "$CKPT_FILE" ]]; then
+  echo "[*] Found deterministic checkpoint: $CKPT_FILE"
+  if [[ $has_chat_flag -eq 0 && $has_train_flag -eq 0 ]]; then
+     echo "[*] Auto-entering Chat mode."
+     PASSED_ARGS+=("--chat" "--chat_prompt" "Hello")
+  elif [[ $has_train_flag -eq 1 && $has_continue_flag -eq 0 && $FORCE_NEW -eq 0 ]]; then
+     echo "[*] Auto-appending --continue to training."
+     PASSED_ARGS+=("--continue")
+  fi
+elif [[ $USER_PASSED_CKPT -eq 0 && ! -f "$CKPT_FILE" ]]; then
+  echo "[*] No checkpoint found for hash [${CKPT_HASH}]. Starting fresh."
+  if [[ $has_chat_flag -eq 0 && $has_train_flag -eq 0 ]]; then
+     echo "[*] Auto-entering Train mode."
+     PASSED_ARGS+=("--train")
+  fi
+fi
+
+echo
+echo "================================================================="
+echo "  Run Settings (Hash: $CKPT_HASH)"
+echo "  cmd: ./$BIN --data \"$DATA_FILE\" --index \"$INDEX_BIN\" ${PASSED_ARGS[@]}"
+echo "================================================================="
+echo
+
+# Set default parameters if not provided in PASSED_ARGS.
+# The user's array over-rides anything added later inside C++, but we must provide --data & --index.
+./"$BIN" --data "$DATA_FILE" --index "$INDEX_BIN" "${PASSED_ARGS[@]}"
+
