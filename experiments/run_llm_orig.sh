@@ -2659,12 +2659,14 @@ int main(int argc,char** argv){
   bool do_train=false;
   bool do_chat=false;
   bool do_measure=false;
+  bool do_continue=false;
   const char* chat_prompt="";
   int use_graph=1; // 1=CUDA Graph capture, 0=normal launches
 
   for(int i=1;i<argc;i++){
     if(!std::strcmp(argv[i],"--train")) do_train=true;
     else if(!std::strcmp(argv[i],"--chat")) do_chat=true;
+    else if(!std::strcmp(argv[i],"--continue")) do_continue=true;
     else if(!std::strcmp(argv[i],"--measure")) do_measure=true;
     else if(!std::strcmp(argv[i],"--chat_prompt") && i+1<argc) chat_prompt=argv[++i];
     else if(!std::strcmp(argv[i],"--data") && i+1<argc) data_path=argv[++i];
@@ -2691,9 +2693,25 @@ else if(!std::strcmp(argv[i],"--graph") && i+1<argc) use_graph=std::atoi(argv[++
 
   auto bytes=read_file_bytes(data_path);
 
+  // If training from scratch but file exists, prevent overwrite
+  std::string actual_ckpt_path = ckpt_path;
+  if (!do_continue && !do_chat) {
+    int suffix = 1;
+    while (true) {
+      FILE* tst = std::fopen(actual_ckpt_path.c_str(), "rb");
+      if (!tst) break; // Free name found
+      std::fclose(tst);
+      actual_ckpt_path = std::string(ckpt_path) + "." + std::to_string(suffix++);
+    }
+  }
+  ckpt_path = actual_ckpt_path.c_str();
+
   PairIndex pi;
   std::vector<float> winit;
-  bool has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
+  bool has_ckpt = false;
+  if(!do_train || do_chat || do_continue){
+    has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
+  }
   if(!has_ckpt){
     if(!load_index_v7(index_path, &pi)) pi = make_pair_index(bytes);
   }
