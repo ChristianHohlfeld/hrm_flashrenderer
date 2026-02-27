@@ -17,6 +17,21 @@ need nvcc || { echo "FATAL: nvcc not found (install CUDA toolkit)."; exit 1; }
 need g++  || { echo "FATAL: g++ not found (sudo apt install build-essential)."; exit 1; }
 need curl || { echo "FATAL: curl not found"; exit 1; }
 
+# Helper to expand colon-separated paths relative to WORKDIR if not absolute
+absify_inputs() {
+  local s="$1" out="" part
+  IFS=':' read -ra parts <<< "$s"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    if [[ "$part" = /* ]]; then
+      out+="${out:+:}$part"
+    else
+      out+="${out:+:}$WORKDIR/$part"
+    fi
+  done
+  echo "$out"
+}
+
 WORKDIR="${WORKDIR:-$PWD}"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -35,6 +50,7 @@ fi
 # ------------------ Deterministic v7 index builder (K1 bytepairs + K2 tokenpair macros) ------------------
 INDEX_INPUTS="${INDEX_INPUTS:-$DATA_FILE}"   # colon-separated corpus files (e.g. code+multilingual)
 INDEX_BIN="${INDEX_BIN:-index_v7.bin}"
+ABS_INPUT="$(absify_inputs "$INDEX_INPUTS")"
 FORCE_INDEX="${FORCE_INDEX:-0}"
 
 if [[ "$FORCE_INDEX" == "1" || ! -f "$INDEX_BIN" ]]; then
@@ -121,9 +137,13 @@ static Stage1 build_stage1(const std::vector<std::string>& inputs, int K1){
     return a<b;
   });
   if((int)all.size()<K1){
-    std::fprintf(stderr, "[index] WARNING: K1 (%d) is larger than unique pairs in corpus (%d). Scaling K1 down to %d.\n", K1, (int)all.size(), (int)all.size());
-    K1 = (int)all.size();
-    s1.K1 = K1;
+    // Pad K1 with unused byte-pairs so the file format remains fixed-size.
+    // We pick pairs that didn't appear in the corpus.
+    std::vector<bool> used(65536, false);
+    for(uint16_t p : all) used[p] = true;
+    for(uint32_t p=0; p<65536 && (int)all.size()<K1; p++){
+      if(!used[p]) all.push_back((uint16_t)p);
+    }
   }
   s1.id2pair.assign(all.begin(), all.begin()+K1);
   for(int i=0;i<K1;i++) s1.pair2id[s1.id2pair[(size_t)i]] = 256 + i;

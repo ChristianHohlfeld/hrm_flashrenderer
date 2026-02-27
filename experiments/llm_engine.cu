@@ -326,7 +326,7 @@ static bool load_index_v7(const char* path, PairIndex* pi){
   r_u32(ver); r_u32(k1); r_u32(k2); r_u32(pow2); r_u32(res);
   (void)res;
   if(ver!=1u) die("bad index ver");
-  if((int)k1 > K1 || (int)k2 > K2) die("index K mismatch (index larger than max macros)");
+  if((int)k1 != K1 || (int)k2 != K2) die("index K mismatch (must equal compile-time K1/K2)");
   pi->id2pair.resize(k1);
   r_bytes(pi->id2pair.data(), (size_t)k1*sizeof(uint16_t));
   pi->pair2id.assign(65536,-1);
@@ -926,6 +926,11 @@ __global__ void dy_loss_from_logits(float* dY, float* loss,
   float lg = logits[(size_t)idx];
   float p = expf(lg - row_max[n]) / row_sum[n];
   int y = (int)tgt[n];
+  if((unsigned)y >= (unsigned)V){
+    if(v == v0){ loss[n] = 50.f; } // clamp loss to high value for bad target
+    dY[(size_t)idx] = 0.f;
+    return;
+  }
   dY[(size_t)idx] = (p - ((v==y)?1.f:0.f)) * invN;
   if(v==y){
     loss[n] = -((lg - row_max[n]) - logf(row_sum[n]));
