@@ -1,0 +1,4 @@
+runner,corpus,last_tok_s,elapsed_sec
+orig,shakespeare,43347.6,5.41
+llm,shakespeare,42193.1,6.80
+llm_pho,shakespeare,43808.7,6.83

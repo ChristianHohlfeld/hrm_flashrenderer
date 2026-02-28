@@ -58,7 +58,18 @@ fi
 K2=$((PAIR_K-PAIR_K1))
 INDEX_INPUTS="${INDEX_INPUTS:-$DATA_FILE}"   # colon-separated corpus files
 ABS_INPUTS="$(absify_inputs "$INDEX_INPUTS")"
-INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}.bin}"
+
+PHO_FLAG=""
+for _a in "$@"; do
+  if [[ "$_a" == "--pho" ]]; then PHO_FLAG="--pho"; fi
+done
+
+if [[ -n "$PHO_FLAG" ]]; then
+  INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}_pho.bin}"
+else
+  INDEX_BIN="${INDEX_BIN:-index_v7_k1${PAIR_K1}_k2${K2}.bin}"
+fi
+
 FORCE_INDEX="${FORCE_INDEX:-0}"
 
 BIN="${BIN:-runbeast_engine}"
@@ -144,6 +155,50 @@ static std::vector<std::string> split_inputs(const std::string& s){
   return out;
 }
 
+// ================= PhO Stage I compression =================
+static bool g_pho = false;
+
+struct R{ const char* grapheme; uint8_t code; };
+static R phonemes[] = {
+  {"ch",1},{"sh",2},{"th",3},{"ph",4},{"ck",5},{"ng",6},{"qu",7},{"wh",8},
+  {"ar",9},{"er",10},{"ir",11},{"or",12},{"ur",13},{"ou",14},{"ow",15},{"oo",16},
+  {"ee",17},{"ea",18},{"ai",19},{"ay",20},{"oa",21},{"oi",22},{"oy",23},{"aw",24},
+  {"au",25},{"ew",26},{"igh",27},{"eigh",28},{"ought",29},{"aught",30},
+  {"tion",31},{"sion",32},{"tious",33},{"cious",34},{"ing",35},{"ed",36}
+};
+static std::vector<uint8_t> pho_encode(const std::vector<uint8_t>& in){
+  std::vector<uint8_t> out;
+  out.reserve(in.size());
+  size_t n = in.size();
+  size_t i = 0;
+  size_t num_r = sizeof(phonemes)/sizeof(R);
+  while(i < n){
+    bool matched=false;
+    for(size_t r=0; r<num_r; r++){
+      size_t len = std::strlen(phonemes[r].grapheme);
+      if(i+len <= n && std::memcmp(in.data()+i, phonemes[r].grapheme, len)==0){
+        out.push_back(phonemes[r].code);
+        i+=len;
+        matched=true;
+        break;
+      }
+    }
+    if(!matched){
+      uint8_t c = in[i++];
+      if(c==0){ out.push_back(0); out.push_back(0); } // escape literal 0x00
+      else {
+        bool collides=false;
+        for(size_t r=0; r<num_r; r++){
+          if(c==phonemes[r].code){ collides=true; break; }
+        }
+        if(collides){ out.push_back(0); out.push_back(c); }
+        else out.push_back(c);
+      }
+    }
+  }
+  return out;
+}
+
 struct Stage1 {
   int K1;
   std::vector<uint16_t> id2pair; // K1 packed bytepair
@@ -157,6 +212,7 @@ static Stage1 build_stage1(const std::vector<std::string>& inputs, int K1){
 
   for(const auto& p: inputs){
     auto b=read_all(p);
+    if(g_pho) b = pho_encode(b);
     if(b.size()<2) continue;
     for(size_t i=0;i+1<b.size();i++){
       uint16_t k=(uint16_t)b[i] | (uint16_t)((uint16_t)b[i+1]<<8);
@@ -232,6 +288,7 @@ static void build_stage2_external(const std::vector<std::string>& inputs, const 
 
   for(const auto& p: inputs){
     auto b=read_all(p);
+    if(g_pho) b = pho_encode(b);
     if(b.size()<3) continue;
     size_t i=0; bool have=false; uint16_t prev=0;
     while(true){
@@ -353,6 +410,7 @@ int main(int argc, char** argv){
     else if(!std::strcmp(argv[i],"--k2") && i+1<argc) K2=std::atoi(argv[++i]);
     else if(!std::strcmp(argv[i],"--out") && i+1<argc) out=argv[++i];
     else if(!std::strcmp(argv[i],"--inputs") && i+1<argc) inputs_s=argv[++i];
+    else if(!std::strcmp(argv[i],"--pho")) g_pho=true;
     else { std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2; }
   }
   if(inputs_s.empty()) die("--inputs required");
@@ -398,7 +456,7 @@ CPP
   g++ -O3 -std=c++17 "$tmpdir/index_build_v7.cpp" -o "$tmpdir/index_build_v7"
 
   echo "[*] Building deterministic index: $INDEX_BIN (K1=$PAIR_K1 K2=$K2)"
-  "$tmpdir/index_build_v7" --k1 "$PAIR_K1" --k2 "$K2" --out "$INDEX_BIN" --inputs "$ABS_INPUTS"
+  "$tmpdir/index_build_v7" --k1 "$PAIR_K1" --k2 "$K2" --out "$INDEX_BIN" --inputs "$ABS_INPUTS" $PHO_FLAG
 
   rm -rf "$tmpdir"
 }
@@ -573,6 +631,118 @@ static std::vector<uint8_t> read_file_bytes(const char* paths_s){
   return all_bytes;
 }
 
+// ================= PhO-Compress Stage I (G2P + lossless Side-Channel U) =================
+// The paper abstracts TG2PU as a (many-to-one) grapheme→phoneme map plus a lossless
+// side-channel U that enables perfect reconstruction.
+static constexpr uint8_t PHO_ESC = 0x00;
+
+struct PhoEntry { uint8_t code; const char* pat; };
+static const PhoEntry PHO_TABLE[] = {
+  { 1, "the" }, { 2, "and" }, { 3, "ing" }, { 4, "tion" }, { 5, "ment" }, { 6, "ions" },
+  { 7, "that" }, { 8, "with" }, { 9, "have" }, {10, "this" }, {11, "from" }, {12, "were" },
+  {13, "tion " }, {14, "ing " }, {15, " of " }, {16, " to " }, {17, " in " }, {18, " for " },
+  {19, "sch" }, {20, "th" }, {21, "sh" }, {22, "ch" }, {23, "ph" }, {24, "wh" }, {25, "qu" },
+  {26, "ck" }, {27, "ng" }, {28, "oo" }, {29, "ee" }, {30, "ea" }, {31, "ou" }, {32, "ai" },
+  {33, "ie" }, {34, "ei" },
+  {35, "und" }, {36, "der" }, {37, "die" }, {38, "nicht" }, {39, "ich" },
+  {40, "#include" }, {41, "return " }, {42, "static " }, {43, "const " }, {44, "struct " }, {45, "class " },
+  {46, "template" }, {47, "uint32_t" }, {48, "uint16_t" }, {49, "float " }, {50, "int " }, {51, "size_t" },
+  {52, "->" }, {53, "::" }, {54, "==" }, {55, "!=" }, {56, ">=" }, {57, "<=" }, {58, "&&" }, {59, "||" },
+  {60, "++" }, {61, "--" }, {62, "/*" }, {63, "*/" }, {64, "//" },
+};
+
+struct PhoU {
+  uint8_t esc = PHO_ESC;
+  bool is_code[256]{};
+  std::vector<uint8_t> codes;
+  std::vector<std::vector<uint8_t>> exp;
+  struct Pat { uint8_t code; std::vector<uint8_t> s; };
+  std::vector<Pat> pats;
+};
+
+static PhoU pho_default(){
+  PhoU u;
+  u.exp.resize(256);
+  std::fill(std::begin(u.is_code), std::end(u.is_code), false);
+
+  const int N = (int)(sizeof(PHO_TABLE)/sizeof(PHO_TABLE[0]));
+  u.codes.reserve((size_t)N);
+  u.pats.reserve((size_t)N);
+  for(int i=0;i<N;i++){
+    uint8_t c = PHO_TABLE[i].code;
+    const char* p = PHO_TABLE[i].pat;
+    u.is_code[c]=true;
+    u.codes.push_back(c);
+    u.exp[(size_t)c] = std::vector<uint8_t>((const uint8_t*)p, (const uint8_t*)p + std::strlen(p));
+    PhoU::Pat pat; pat.code=c; pat.s=u.exp[(size_t)c];
+    u.pats.push_back(std::move(pat));
+  }
+  std::sort(u.codes.begin(), u.codes.end());
+  std::stable_sort(u.pats.begin(), u.pats.end(), [](const PhoU::Pat& a, const PhoU::Pat& b){
+    if(a.s.size()!=b.s.size()) return a.s.size()>b.s.size();
+    const size_t n=std::min(a.s.size(), b.s.size());
+    int c=std::memcmp(a.s.data(), b.s.data(), n);
+    if(c!=0) return c<0;
+    return a.code < b.code;
+  });
+  return u;
+}
+
+static std::vector<uint8_t> pho_encode_bytes(const PhoU& u, const uint8_t* in, size_t n){
+  std::vector<uint8_t> out;
+  out.reserve(n);
+  size_t i=0;
+  while(i<n){
+    uint8_t b=in[i];
+    if(b==u.esc || u.is_code[b]){
+      out.push_back(u.esc);
+      out.push_back(b);
+      i++;
+      continue;
+    }
+    bool matched=false;
+    for(const auto& pat: u.pats){
+      const size_t L=pat.s.size();
+      if(L==0 || i+L>n) continue;
+      if(std::memcmp(in+i, pat.s.data(), L)==0){
+        out.push_back(pat.code);
+        i+=L;
+        matched=true;
+        break;
+      }
+    }
+    if(!matched){ out.push_back(b); i++; }
+  }
+  return out;
+}
+static std::vector<uint8_t> pho_encode_bytes(const PhoU& u, const std::vector<uint8_t>& in){
+  return pho_encode_bytes(u, in.data(), in.size());
+}
+
+struct PhoDec { bool esc_pending=false; };
+
+static void pho_decode_stream(const PhoU& u, PhoDec* st, const uint8_t* in, size_t n, std::vector<uint8_t>& out){
+  size_t i=0;
+  while(i<n){
+    uint8_t b=in[i++];
+    if(st->esc_pending){
+      out.push_back(b);
+      st->esc_pending=false;
+      continue;
+    }
+    if(b==u.esc){
+      st->esc_pending=true;
+      continue;
+    }
+    if(u.is_code[b]){
+      const auto& e = u.exp[(size_t)b];
+      out.insert(out.end(), e.begin(), e.end());
+    }else{
+      out.push_back(b);
+    }
+  }
+}
+
 // ================= PairIndex tokenizer =================
 struct PairIndex{
   std::vector<uint16_t> id2pair;   // size K1
@@ -681,8 +851,10 @@ static inline void decode_id(const PairIndex& pi, uint16_t id, std::vector<uint8
   decode_id(pi,a,out);
   decode_id(pi,b,out);
 }
-static std::vector<uint16_t> encode_prompt(const PairIndex& pi, const std::string& s){
-  return encode_ids(pi, (const uint8_t*)s.data(), s.size());
+static std::vector<uint16_t> encode_prompt(const PairIndex& pi, const PhoU* pho, bool pho_on, const std::string& s){
+  std::vector<uint8_t> b((const uint8_t*)s.data(), (const uint8_t*)s.data() + s.size());
+  if(pho_on && pho) b = pho_encode_bytes(*pho, b);
+  return encode_ids(pi, b.data(), b.size());
 }
 
 // ================= checkpoint v11 =================
@@ -734,13 +906,66 @@ static void pack_W(float* base, WView* W){
   if(off!=weights_floats()) die("pack mismatch");
 }
 
-static void save_ckpt(const char* path, const PairIndex& pi, const float* w){
+static void pho_write_u(FILE* f, const PhoU& u){
+  wu32(f, (uint32_t)u.esc);
+  wu32(f, (uint32_t)u.codes.size());
+  for(uint8_t c: u.codes){
+    const auto& e = u.exp[(size_t)c];
+    wf(f, &c, 1);
+    if(e.size()>65535u) die("pho U entry too large");
+    wu16(f, (uint16_t)e.size());
+    if(!e.empty()) wf(f, e.data(), e.size());
+  }
+}
+
+static void pho_read_u(FILE* f, PhoU* u){
+  *u = pho_default(); // start from default
+  uint32_t esc = ru32(f);
+  uint32_t n   = ru32(f);
+  if(esc>255u) die("bad pho esc");
+  u->esc = (uint8_t)esc;
+
+  std::fill(std::begin(u->is_code), std::end(u->is_code), false);
+  u->codes.clear();
+  u->exp.assign(256, {});
+  u->pats.clear();
+
+  for(uint32_t i=0;i<n;i++){
+    uint8_t c=0; rf(f,&c,1);
+    uint16_t L=ru16(f);
+    std::vector<uint8_t> s((size_t)L);
+    if(L) rf(f, s.data(), (size_t)L);
+    if(c==u->esc) die("pho: code collides with esc");
+    u->is_code[c]=true;
+    u->codes.push_back(c);
+    u->exp[(size_t)c]=s;
+    PhoU::Pat pat; pat.code=c; pat.s=s;
+    u->pats.push_back(std::move(pat));
+  }
+  std::sort(u->codes.begin(), u->codes.end());
+  std::stable_sort(u->pats.begin(), u->pats.end(), [](const PhoU::Pat& a, const PhoU::Pat& b){
+    if(a.s.size()!=b.s.size()) return a.s.size()>b.s.size();
+    const size_t n=std::min(a.s.size(), b.s.size());
+    int c=std::memcmp(a.s.data(), b.s.data(), n);
+    if(c!=0) return c<0;
+    return a.code < b.code;
+  });
+}
+
+static void save_ckpt(const char* path, const PairIndex& pi, const float* w, const PhoU& pho, bool pho_on){
   FILE* f=std::fopen(path,"wb");
   if(!f) die("open ckpt write failed");
-  wu32(f,0x43484452u); wu32(f,11u);
+  wu32(f,0x43484452u);
+  wu32(f, pho_on ? 12u : 11u);
+
   wu32(f,(uint32_t)K1); wu32(f,(uint32_t)K2);
   wu32(f,(uint32_t)D); wu32(f,(uint32_t)H);
   wu32(f,(uint32_t)L); wu32(f,(uint32_t)F); wu32(f,(uint32_t)Tmax);
+
+  if(pho_on){
+    wu32(f, 1u);         // pho_enabled
+    pho_write_u(f, pho);
+  }
 
   wf(f, pi.id2pair.data(), (size_t)K1*sizeof(uint16_t));
   if(K2>0) wf(f, pi.id2pair2.data(), (size_t)K2*sizeof(uint32_t));
@@ -755,14 +980,24 @@ static void save_ckpt(const char* path, const PairIndex& pi, const float* w){
   std::fclose(f);
 }
 
-static bool load_ckpt(const char* path, PairIndex* pi, std::vector<float>* w){
+static bool load_ckpt(const char* path, PairIndex* pi, std::vector<float>* w, PhoU* pho, bool* pho_on){
   FILE* f=std::fopen(path,"rb");
   if(!f) return false;
   uint32_t magic=ru32(f), ver=ru32(f);
   if(magic!=0x43484452u) die("bad ckpt magic");
-  if(ver!=11u) die("unsupported ckpt version");
+  if(ver!=11u && ver!=12u) die("unsupported ckpt version");
+
   uint32_t k1=ru32(f), k2=ru32(f), d=ru32(f), h=ru32(f), nl=ru32(f), ff=ru32(f), tm=ru32(f);
   if(k1!=K1||k2!=K2||d!=D||h!=H||nl!=L||ff!=F||tm!=Tmax) die("ckpt dims mismatch");
+
+  bool pho_enabled=false;
+  *pho = pho_default();
+  if(ver==12u){
+    uint32_t pe=ru32(f);
+    pho_enabled = (pe!=0u);
+    if(pho_enabled) pho_read_u(f, pho);
+  }
+  *pho_on = pho_enabled;
 
   pi->id2pair.resize(K1);
   rf(f, pi->id2pair.data(), (size_t)K1*sizeof(uint16_t));
@@ -1656,229 +1891,332 @@ __device__ __forceinline__ float4 ld_cg_f4(const float4* p){
 }
 
 template<int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(256) void fused_rms_qkv_rope_hf(
+__global__ __launch_bounds__(256) void fused_rms_qkv_rope_wmma(
     float* __restrict__ Q,
     float* __restrict__ K,
     float* __restrict__ Vv,
-    float* __restrict__ rms_inv,          // [N]
-    float* __restrict__ Nnorm_or_null,    // [N,Dhf] or nullptr
-    const float* __restrict__ X,          // [N,Dhf]
-    const float* __restrict__ Wq,         // [Dhf,Dhf] row-major
-    const float* __restrict__ Wk,         // [Dhf,Dhf] row-major
-    const float* __restrict__ Wv,         // [Dhf,Dhf] row-major
-    const float* __restrict__ gamma,      // [Dhf]
-    const float* __restrict__ sin_tbl,    // [Tmax, Dh/2]
-    const float* __restrict__ cos_tbl,    // [Tmax, Dh/2]
-    int N, int T)
+    float* __restrict__ rms_inv,
+    float* __restrict__ Nnorm_or_null,
+    const float* __restrict__ X,
+    const half* __restrict__ Wq_rm,
+    const half* __restrict__ Wk_rm,
+    const half* __restrict__ Wv_rm,
+    const float* __restrict__ gamma,
+    const float* __restrict__ sin_tbl,
+    const float* __restrict__ cos_tbl,
+    int N_total, int T)
 {
-  int tid = (int)threadIdx.x;
+  int n_start = blockIdx.x * 16;
+  if(n_start >= N_total) return;
+
+  int tid = threadIdx.x;
   int warp = tid >> 5;
   int lane = tid & 31;
-  int n = (int)blockIdx.x * WARPS_PER_BLOCK + warp;
-  if(n >= N) return;
 
-  int tpos = n % T;
-  constexpr int COLS_PER_LANE = Dhf / 32; // 4
-  int col_base = lane * COLS_PER_LANE;
+  __shared__ float X_sh[16][128];
+  __shared__ half Xnorm_sh[16][128];
+  __shared__ float sumsq[16];
 
-  const float* Xn = X + (size_t)n*(size_t)Dhf;
-  float* Qn = Q + (size_t)n*(size_t)Dhf;
-  float* Kn = K + (size_t)n*(size_t)Dhf;
-  float* Vn = Vv + (size_t)n*(size_t)Dhf;
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        if (n_start + r < N_total) {
+           X_sh[r][c] = X[(size_t)(n_start + r)*128 + c];
+        } else {
+           X_sh[r][c] = 0.f;
+        }
+     }
+  }
+  
+  if (tid < 16) sumsq[tid] = 0.f;
+  __syncthreads();
 
-  const float4* Xf4 = (const float4*)Xn;
-  float4 x4 = ld_cg_f4(Xf4 + lane);
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        float val = X_sh[r][c];
+        atomicAdd(&sumsq[r], val*val);
+     }
+  }
+  __syncthreads();
 
-  float ss = x4.x*x4.x + x4.y*x4.y + x4.z*x4.z + x4.w*x4.w;
-  #pragma unroll
-  for(int off=16; off>0; off>>=1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);
-  float sumsq = __shfl_sync(0xFFFFFFFFu, ss, 0);
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        float inv = rsqrtf(sumsq[r] / 128.0f + 1e-6f);
+        if (c == 0 && tid < 16*16) rms_inv[n_start + r] = inv;
+        float xn_val = X_sh[r][c] * inv * gamma[c];
+        Xnorm_sh[r][c] = __float2half_rn(xn_val);
+        if (Nnorm_or_null && (n_start + r < N_total)) {
+           Nnorm_or_null[(size_t)(n_start + r)*128 + c] = xn_val;
+        }
+     }
+  }
+  __syncthreads();
 
-  float inv = rsqrtf(sumsq * (1.0f/(float)Dhf) + EPS);
-  if(lane==0) rms_inv[n] = inv;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_q;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_k;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_v;
+  wmma::fill_fragment(acc_q, 0.0f);
+  wmma::fill_fragment(acc_k, 0.0f);
+  wmma::fill_fragment(acc_v, 0.0f);
 
-  float g0 = gamma[col_base+0];
-  float g1 = gamma[col_base+1];
-  float g2 = gamma[col_base+2];
-  float g3 = gamma[col_base+3];
+  int w_col = warp * 16;
+  for (int k = 0; k < 128; k += 16) {
+     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_xn;
+     wmma::load_matrix_sync(frag_xn, &Xnorm_sh[0][k], 128);
 
-  float xn0 = x4.x * inv * g0;
-  float xn1 = x4.y * inv * g1;
-  float xn2 = x4.z * inv * g2;
-  float xn3 = x4.w * inv * g3;
+     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_wq;
+     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_wk;
+     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_wv;
+     
+     wmma::load_matrix_sync(frag_wq, &Wq_rm[k * 128 + w_col], 128);
+     wmma::load_matrix_sync(frag_wk, &Wk_rm[k * 128 + w_col], 128);
+     wmma::load_matrix_sync(frag_wv, &Wv_rm[k * 128 + w_col], 128);
 
-  if(Nnorm_or_null){
-    float4* Nf4 = (float4*)(Nnorm_or_null + (size_t)n*(size_t)Dhf);
-    Nf4[lane] = make_float4(xn0,xn1,xn2,xn3);
+     wmma::mma_sync(acc_q, frag_xn, frag_wq, acc_q);
+     wmma::mma_sync(acc_k, frag_xn, frag_wk, acc_k);
+     wmma::mma_sync(acc_v, frag_xn, frag_wv, acc_v);
   }
 
-  float q0=0.f,q1=0.f,q2=0.f,q3=0.f;
-  float k0=0.f,k1v=0.f,k2v=0.f,k3v=0.f;
-  float v0=0.f,v1=0.f,v2=0.f,v3=0.f;
+  __shared__ float temp_q[8][16][16];
+  __shared__ float temp_k[8][16][16];
+  __shared__ float temp_v[8][16][16];
 
-  for(int kk=0; kk<Dhf; kk++){
-    int src_lane = kk >> 2;
-    int off = kk & 3;
-    float xk;
-    if(off==0) xk = __shfl_sync(0xFFFFFFFFu, xn0, src_lane);
-    else if(off==1) xk = __shfl_sync(0xFFFFFFFFu, xn1, src_lane);
-    else if(off==2) xk = __shfl_sync(0xFFFFFFFFu, xn2, src_lane);
-    else            xk = __shfl_sync(0xFFFFFFFFu, xn3, src_lane);
+  wmma::store_matrix_sync(&temp_q[warp][0][0], acc_q, 16, wmma::mem_row_major);
+  wmma::store_matrix_sync(&temp_k[warp][0][0], acc_k, 16, wmma::mem_row_major);
+  wmma::store_matrix_sync(&temp_v[warp][0][0], acc_v, 16, wmma::mem_row_major);
 
-    const float4* wqf4 = (const float4*)(Wq + (size_t)kk*(size_t)Dhf + (size_t)col_base);
-    const float4* wkf4 = (const float4*)(Wk + (size_t)kk*(size_t)Dhf + (size_t)col_base);
-    const float4* wvf4 = (const float4*)(Wv + (size_t)kk*(size_t)Dhf + (size_t)col_base);
+  __syncwarp();
 
-    float4 wq4 = ld_cg_f4(wqf4);
-    float4 wk4 = ld_cg_f4(wkf4);
-    float4 wv4 = ld_cg_f4(wvf4);
+  if (lane < 16) {
+     int r = lane;
+     if (n_start + r < N_total) {
+        int t_pos = (n_start + r) % T;
+        for (int i2 = 0; i2 < 8; i2++) {
+           float s = sin_tbl[(size_t)t_pos*(size_t)(16/2) + (size_t)i2];
+           float c = cos_tbl[(size_t)t_pos*(size_t)(16/2) + (size_t)i2];
+           
+           int c0 = i2 * 2;
+           int c1 = c0 + 1;
 
-    q0 = fmaf(xk, wq4.x, q0); q1 = fmaf(xk, wq4.y, q1); q2 = fmaf(xk, wq4.z, q2); q3 = fmaf(xk, wq4.w, q3);
-    k0 = fmaf(xk, wk4.x, k0); k1v= fmaf(xk, wk4.y, k1v); k2v= fmaf(xk, wk4.z, k2v); k3v= fmaf(xk, wk4.w, k3v);
-    v0 = fmaf(xk, wv4.x, v0); v1 = fmaf(xk, wv4.y, v1); v2 = fmaf(xk, wv4.z, v2); v3 = fmaf(xk, wv4.w, v3);
+           float q0 = temp_q[warp][r][c0];
+           float q1 = temp_q[warp][r][c1];
+           float k0 = temp_k[warp][r][c0];
+           float k1 = temp_k[warp][r][c1];
+
+           float rope_q0 = q0 * c - q1 * s;
+           float rope_q1 = q0 * s + q1 * c;
+           float rope_k0 = k0 * c - k1 * s;
+           float rope_k1 = k0 * s + k1 * c;
+
+           Q[(size_t)(n_start + r)*128 + w_col + c0] = rope_q0;
+           Q[(size_t)(n_start + r)*128 + w_col + c1] = rope_q1;
+           K[(size_t)(n_start + r)*128 + w_col + c0] = rope_k0;
+           K[(size_t)(n_start + r)*128 + w_col + c1] = rope_k1;
+           
+           Vv[(size_t)(n_start + r)*128 + w_col + c0] = temp_v[warp][r][c0];
+           Vv[(size_t)(n_start + r)*128 + w_col + c1] = temp_v[warp][r][c1];
+        }
+     }
   }
-
-  auto rope_pair = [&](int d_even, float& qa0, float& qa1, float& ka0, float& ka1){
-    int within = d_even & (Dh-1);
-    int i2 = within >> 1;
-    float s = sin_tbl[(size_t)tpos*(size_t)(Dh/2) + (size_t)i2];
-    float c = cos_tbl[(size_t)tpos*(size_t)(Dh/2) + (size_t)i2];
-    float qx=qa0, qy=qa1;
-    float kx=ka0, ky=ka1;
-    qa0 = qx*c - qy*s;
-    qa1 = qx*s + qy*c;
-    ka0 = kx*c - ky*s;
-    ka1 = kx*s + ky*c;
-  };
-  rope_pair(col_base+0, q0,q1, k0,k1v);
-  rope_pair(col_base+2, q2,q3, k2v,k3v);
-
-  float4* Qf4 = (float4*)Qn;
-  float4* Kf4 = (float4*)Kn;
-  float4* Vf4 = (float4*)Vn;
-  Qf4[lane] = make_float4(q0,q1,q2,q3);
-  Kf4[lane] = make_float4(k0,k1v,k2v,k3v);
-  Vf4[lane] = make_float4(v0,v1,v2,v3);
 }
 
 // ================= FUSED MEGA-KERNEL (Attn-Epilogue + RMS + FFN on Dhf=128) =================
 template<int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(256) void fused_rms_gelu_ffn_hf(
-    float* __restrict__ Y1,               // [N,Dhf]
-    float* __restrict__ Y2,               // [N,Dhf]
-    float* __restrict__ rms_inv,          // [N]
-    float* __restrict__ Nnorm_or_null,    // [N,Dhf] or nullptr
-    const float* __restrict__ AttentionO, // [N,Dhf]
-    const float* __restrict__ Wo_rm,      // [Dhf,Dhf] row-major
-    const float* __restrict__ W1_rm,      // [F,Dhf] row-major
-    const float* __restrict__ W2_rm,      // [Dhf,F] row-major
-    const float* __restrict__ gamma,      // [Dhf]
-    int N, int F_dim)
+__global__ __launch_bounds__(256) void fused_rms_gelu_ffn_wmma(
+    float* __restrict__ Y1,
+    float* __restrict__ Y2,
+    float* __restrict__ rms_inv,
+    float* __restrict__ Nnorm_or_null,
+    const float* __restrict__ AttentionO,
+    const half* __restrict__ Wo_rm,
+    const half* __restrict__ W1_rm,
+    const half* __restrict__ W2_rm,
+    const float* __restrict__ gamma,
+    int N_total, int F_dim)
 {
-  int tid = (int)threadIdx.x;
+  int n_start = blockIdx.x * 16;
+  if (n_start >= N_total) return;
+  int tid = threadIdx.x;
   int warp = tid >> 5;
   int lane = tid & 31;
-  int n = (int)blockIdx.x * WARPS_PER_BLOCK + warp;
-  if(n >= N) return;
 
-  constexpr int COLS_PER_LANE = Dhf / 32; // 4
-  int col_base = lane * COLS_PER_LANE;
+  union SharedBuf {
+    struct {
+      float Y1_sh[16][128];
+      half O_sh[16][128];
+      float temp_y1[8][16][16];
+    } s1;
+    struct {
+      half Xnorm_sh[16][128];
+      half U_warp_half[8][16][16];
+      float V_full_sh[16][128];
+      float U_warp_temp[8][16][16];
+    } s2;
+  };
+  __shared__ SharedBuf sm;
+  __shared__ float sumsq[16];
 
-  const float* On = AttentionO + (size_t)n*(size_t)Dhf;
-  float* Y1n = Y1 + (size_t)n*(size_t)Dhf;
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        if (n_start + r < N_total) {
+           sm.s1.Y1_sh[r][c] = Y1[(size_t)(n_start + r)*128 + c];
+           sm.s1.O_sh[r][c]  = __float2half_rn(AttentionO[(size_t)(n_start + r)*128 + c]);
+        } else {
+           sm.s1.Y1_sh[r][c] = 0.f;
+           sm.s1.O_sh[r][c]  = __float2half_rn(0.f);
+        }
+     }
+  }
+  __syncthreads();
 
-  float4 o4 = ld_cg_f4((const float4*)(On + col_base));
-  float o_col0 = o4.x, o_col1 = o4.y, o_col2 = o4.z, o_col3 = o4.w;
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_o;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_wo;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_y1;
+  wmma::fill_fragment(acc_y1, 0.0f);
 
-  float wo0=0.f, wo1=0.f, wo2=0.f, wo3=0.f;
-
-  for(int kk=0; kk<Dhf; kk++){
-    int src_lane = kk >> 2;
-    int off = kk & 3;
-    float ok;
-    if(off==0) ok = __shfl_sync(0xFFFFFFFFu, o_col0, src_lane);
-    else if(off==1) ok = __shfl_sync(0xFFFFFFFFu, o_col1, src_lane);
-    else if(off==2) ok = __shfl_sync(0xFFFFFFFFu, o_col2, src_lane);
-    else            ok = __shfl_sync(0xFFFFFFFFu, o_col3, src_lane);
-
-    float4 wo_row = ld_cg_f4((const float4*)(Wo_rm + (size_t)kk*(size_t)Dhf + (size_t)col_base));
-    wo0 = fmaf(ok, wo_row.x, wo0);
-    wo1 = fmaf(ok, wo_row.y, wo1);
-    wo2 = fmaf(ok, wo_row.z, wo2);
-    wo3 = fmaf(ok, wo_row.w, wo3);
+  int w_col = warp * 16;
+  for (int k = 0; k < 128; k += 16) {
+     wmma::load_matrix_sync(frag_o, &sm.s1.O_sh[0][k], 128);
+     wmma::load_matrix_sync(frag_wo, &Wo_rm[k * 128 + w_col], 128);
+     wmma::mma_sync(acc_y1, frag_o, frag_wo, acc_y1);
   }
 
-  float4 y1_in = ld_cg_f4((const float4*)(Y1n + col_base));
-  float y1_0 = y1_in.x + wo0;
-  float y1_1 = y1_in.y + wo1;
-  float y1_2 = y1_in.z + wo2;
-  float y1_3 = y1_in.w + wo3;
-  ((float4*)(Y1n + col_base))[0] = make_float4(y1_0, y1_1, y1_2, y1_3);
+  wmma::store_matrix_sync(&sm.s1.temp_y1[warp][0][0], acc_y1, 16, wmma::mem_row_major);
+  __syncwarp();
+  if (lane < 16) {
+     for(int c=0; c<16; c++) {
+        sm.s1.Y1_sh[lane][w_col + c] += sm.s1.temp_y1[warp][lane][c];
+     }
+  }
+  __syncthreads();
 
-  float ss = y1_0*y1_0 + y1_1*y1_1 + y1_2*y1_2 + y1_3*y1_3;
-  #pragma unroll
-  for(int off=16; off>0; off>>=1) ss += __shfl_down_sync(0xFFFFFFFFu, ss, off);
-  float sumsq = __shfl_sync(0xFFFFFFFFu, ss, 0);
-
-  float inv = rsqrtf(sumsq * (1.0f/(float)Dhf) + EPS);
-  if(lane==0) rms_inv[n] = inv;
-
-  float g0 = gamma[col_base+0];
-  float g1 = gamma[col_base+1];
-  float g2 = gamma[col_base+2];
-  float g3 = gamma[col_base+3];
-
-  float xn0 = y1_0 * inv * g0;
-  float xn1 = y1_1 * inv * g1;
-  float xn2 = y1_2 * inv * g2;
-  float xn3 = y1_3 * inv * g3;
-
-  if(Nnorm_or_null){
-    float4* Nf4 = (float4*)(Nnorm_or_null + (size_t)n*(size_t)Dhf);
-    Nf4[lane] = make_float4(xn0,xn1,xn2,xn3);
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        if (n_start + r < N_total) {
+           Y1[(size_t)(n_start + r)*128 + c] = sm.s1.Y1_sh[r][c];
+        }
+     }
   }
 
-  const float c=0.7978845608f;
-  float ffn_out[4] = {0.f};
+  if (tid < 16) sumsq[tid] = 0.f;
+  __syncthreads();
 
-  for(int f0=0; f0<F_dim; f0+=32){
-    int fcol = f0 + lane;
-    float dotW1 = 0.f;
-    for(int kk=0; kk<Dhf; kk++){
-      int src_lane = kk >> 2;
-      int off = kk & 3;
-      float xk;
-      if(off==0) xk = __shfl_sync(0xFFFFFFFFu, xn0, src_lane);
-      else if(off==1) xk = __shfl_sync(0xFFFFFFFFu, xn1, src_lane);
-      else if(off==2) xk = __shfl_sync(0xFFFFFFFFu, xn2, src_lane);
-      else            xk = __shfl_sync(0xFFFFFFFFu, xn3, src_lane);
-      float w1_val = W1_rm[(size_t)kk*(size_t)F_dim + (size_t)fcol];
-      dotW1 = fmaf(xk, w1_val, dotW1);
-    }
-    
-    float x_gelu = dotW1;
-    float x3 = x_gelu*x_gelu*x_gelu;
-    float u = 0.5f*x_gelu*(1.f+tanhf(c*(x_gelu+0.044715f*x3)));
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        float val = sm.s1.Y1_sh[r][c];
+        atomicAdd(&sumsq[r], val*val);
+     }
+  }
+  __syncthreads();
 
-    for(int i=0; i<4; i++){
-      float w2_val = W2_rm[(size_t)fcol*(size_t)Dhf + (size_t)col_base + i];
-      ffn_out[i] = fmaf(u, w2_val, ffn_out[i]);
-    }
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        float inv = rsqrtf(sumsq[r] / 128.0f + 1e-6f);
+        if (c == 0 && tid < 16*16) rms_inv[n_start + r] = inv;
+        float xn_val = sm.s1.Y1_sh[r][c] * inv * gamma[c];
+        sm.s2.Xnorm_sh[r][c] = __float2half_rn(xn_val);
+        if (Nnorm_or_null && (n_start + r < N_total)) {
+           Nnorm_or_null[(size_t)(n_start + r)*128 + c] = xn_val;
+        }
+     }
+  }
+  __syncthreads();
+
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        sm.s2.V_full_sh[idx / 128][idx % 128] = 0.f;
+     }
+  }
+  const float c_gelu=0.7978845608f;
+
+  int u_col_start = warp * 128;
+  
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_v[8];
+  for(int v_tile=0; v_tile<8; v_tile++){
+      wmma::fill_fragment(acc_v[v_tile], 0.0f);
   }
 
-  __shfl_sync(0xFFFFFFFFu, 0, 0); // barrier safety
-  float f0=0.f, f1=0.f, f2=0.f, f3=0.f;
-  for(int l=0; l<32; l++){
-    float fo0 = __shfl_sync(0xFFFFFFFFu, ffn_out[0], l);
-    float fo1 = __shfl_sync(0xFFFFFFFFu, ffn_out[1], l);
-    float fo2 = __shfl_sync(0xFFFFFFFFu, ffn_out[2], l);
-    float fo3 = __shfl_sync(0xFFFFFFFFu, ffn_out[3], l);
-    f0 += fo0; f1 += fo1; f2 += fo2; f3 += fo3;
+  for (int tile = 0; tile < 8; tile++) {
+     int c_tile = u_col_start + tile * 16;
+     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_u;
+     wmma::fill_fragment(acc_u, 0.0f);
+
+     for (int k = 0; k < 128; k += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_xn;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_w1;
+        wmma::load_matrix_sync(frag_xn, &sm.s2.Xnorm_sh[0][k], 128);
+        wmma::load_matrix_sync(frag_w1, &W1_rm[k * F_dim + c_tile], F_dim);
+        wmma::mma_sync(acc_u, frag_xn, frag_w1, acc_u);
+     }
+
+     wmma::store_matrix_sync(&sm.s2.U_warp_temp[warp][0][0], acc_u, 16, wmma::mem_row_major);
+     __syncwarp();
+     
+     if (lane < 16) {
+        for (int c = 0; c < 16; c++) {
+           float x_gelu = sm.s2.U_warp_temp[warp][lane][c];
+           float x3 = x_gelu*x_gelu*x_gelu;
+           float u_val = 0.5f*x_gelu*(1.f+tanhf(c_gelu*(x_gelu+0.044715f*x3)));
+           sm.s2.U_warp_half[warp][lane][c] = __float2half_rn(u_val);
+        }
+     }
+     __syncwarp();
+
+     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_u;
+     wmma::load_matrix_sync(frag_u, &sm.s2.U_warp_half[warp][0][0], 16);
+
+     for(int v_tile=0; v_tile<8; v_tile++){
+         wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_w2;
+         wmma::load_matrix_sync(frag_w2, &W2_rm[c_tile * 128 + v_tile * 16], 128);
+         wmma::mma_sync(acc_v[v_tile], frag_u, frag_w2, acc_v[v_tile]);
+     }
   }
 
-  float* Y2n = Y2 + (size_t)n*(size_t)Dhf;
-  float4 y2_in = ld_cg_f4((const float4*)(Y2n + col_base));
-  ((float4*)(Y2n + col_base))[0] = make_float4(y2_in.x + f0, y2_in.y + f1, y2_in.z + f2, y2_in.w + f3);
+  for(int v_tile=0; v_tile<8; v_tile++){
+      wmma::store_matrix_sync(&sm.s2.U_warp_temp[warp][0][0], acc_v[v_tile], 16, wmma::mem_row_major);
+      __syncwarp();
+      if (lane < 16) {
+          for (int c = 0; c < 16; c++) {
+              atomicAdd(&sm.s2.V_full_sh[lane][v_tile*16 + c], sm.s2.U_warp_temp[warp][lane][c]);
+          }
+      }
+      __syncwarp();
+  }
+
+  __syncthreads();
+
+  for (int i=0; i<8; i++){
+     int idx = tid + i*256;
+     if (idx < 16 * 128) {
+        int r = idx / 128;
+        int c = idx % 128;
+        if (n_start + r < N_total) {
+           float y2_val = Y2[(size_t)(n_start + r)*128 + c];
+           Y2[(size_t)(n_start + r)*128 + c] = y2_val + sm.s2.V_full_sh[r][c];
+        }
+     }
+  }
 }
 
 // ================= GPU container =================
@@ -2274,13 +2612,13 @@ static void train_step_device(GPU* g){
 
   for(int l=0;l<L;l++){
     constexpr int WPB = 8;
-    int blocks = (N + WPB - 1) / WPB;
-    fused_rms_qkv_rope_hf<WPB><<<blocks,256>>>(
+    int blocks = (N + 15) / 16;
+    fused_rms_qkv_rope_wmma<WPB><<<blocks,256>>>(
       g->Q, g->K, g->Vh,
       g->inv,
       (float*)nullptr,
       g->y2,
-      g->W.Wq[l], g->W.Wk[l], g->W.Wv[l],
+      g->Hw.Wq_rm[l], g->Hw.Wk_rm[l], g->Hw.Wv_rm[l],
       g->W.gf[l],
       g->sin_tbl, g->cos_tbl,
       N, T
@@ -2290,10 +2628,10 @@ static void train_step_device(GPU* g){
     dim3 grid_fwd(B,H,(T+127)/128);
     flash_fwd_wmma_hf<<<grid_fwd,256>>>(g->O, g->matt, g->latt, g->Q, g->K, g->Vh, B, T); KERNEL_CHECK();
 
-    int blocks_ffn = (N + WPB - 1) / WPB;
-    fused_rms_gelu_ffn_hf<WPB><<<blocks_ffn,256>>>(
+    int blocks_ffn = (N + 15) / 16;
+    fused_rms_gelu_ffn_wmma<WPB><<<blocks_ffn,256>>>(
       g->y1, g->y2, g->inv, g->n, g->O,
-      g->W.Wo[l], g->W.W1[l], g->W.W2[l], g->W.gg[l],
+      g->Hw.Wo_rm[l], g->Hw.W1_rm[l], g->Hw.W2_rm[l], g->W.gg[l],
       N, F
     );
     KERNEL_CHECK();
@@ -2339,13 +2677,13 @@ static void train_step_device(GPU* g){
     rms_bwd_dg<Dhf><<<Dhf,256>>>(g->G.gg[l], g->dQ, g->y1, g->inv, N); KERNEL_CHECK();
 
     constexpr int WPB = 8;
-    int blocks = (N + WPB - 1) / WPB;
-    fused_rms_qkv_rope_hf<WPB><<<blocks,256>>>(
+    int blocks = (N + 15) / 16;
+    fused_rms_qkv_rope_wmma<WPB><<<blocks,256>>>(
       g->Q, g->K, g->Vh,
       g->inv,
       g->n,        // write normalized vector for dW(QKV)
       g->x2,
-      g->W.Wq[l], g->W.Wk[l], g->W.Wv[l],
+      g->Hw.Wq_rm[l], g->Hw.Wk_rm[l], g->Hw.Wv_rm[l],
       g->W.gf[l],
       g->sin_tbl, g->cos_tbl,
       N, T
@@ -3044,7 +3382,7 @@ int main(int argc,char** argv){
 
     if(save_every>0 && (step%save_every)==0){
       CUDA_CHECK(cudaSetDevice(0));
-      CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyHostToDevice));
       save_ckpt(ckpt_path, pi, hostW.data());
       std::printf("[*] saved: %s\n", ckpt_path);
       std::fflush(stdout);
@@ -3052,7 +3390,7 @@ int main(int argc,char** argv){
   }
 
   CUDA_CHECK(cudaSetDevice(0));
-  CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyHostToDevice));
   save_ckpt(ckpt_path, pi, hostW.data());
   std::printf("[*] saved final: %s\n", ckpt_path);
 

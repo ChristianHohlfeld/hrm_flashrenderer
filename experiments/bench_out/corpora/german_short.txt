@@ -1,0 +1,2 @@
+Dies ist ein kurzer deutscher Testkorpus für reproduzierbare Benchmarks.
+Wir wollen verschiedene Skripte unter identischen Bedingungen vergleichen.
