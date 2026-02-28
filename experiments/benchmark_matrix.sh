@@ -19,7 +19,6 @@ mkdir -p "$OUT_DIR"
 CORPUS_DIR="$OUT_DIR/corpora"
 mkdir -p "$CORPUS_DIR"
 
-# small corpora
 [[ -s "$CORPUS_DIR/shakespeare.txt" ]] || curl -fsSL -o "$CORPUS_DIR/shakespeare.txt" https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 cat > "$CORPUS_DIR/code_snippets.txt" <<'TXT'
 #include <iostream>
@@ -51,22 +50,20 @@ run_one(){
   local log="$OUT_DIR/${rname}__${cname}.log"
   local ckpt="$OUT_DIR/ckpt_${rname}__${cname}.bin"
 
-  INDEX_INPUTS="$cpath" DATA_FILE="$cpath" /usr/bin/time -f 'ELAPSED_SEC=%e'     "$script" --train --force-new --steps "$STEPS" --log_every "$LOG_EVERY" --save_every "$SAVE_EVERY"     --gpus "$GPUS" --seq "$SEQ" --batch "$BATCH" --measure --ckpt "$ckpt" $flag > "$log" 2>&1
+  INDEX_INPUTS="$cpath" DATA_FILE="$cpath" /usr/bin/time -f 'ELAPSED_SEC=%e' \
+    "$script" --train --force-new --steps "$STEPS" --log_every "$LOG_EVERY" --save_every "$SAVE_EVERY" \
+    --gpus "$GPUS" --seq "$SEQ" --batch "$BATCH" --measure --ckpt "$ckpt" $flag > "$log" 2>&1
 
   local tok sec
   tok="$(grep -Eo 'tok/s=[0-9]+(\.[0-9]+)?' "$log" | tail -1 | cut -d= -f2 || echo NA)"
   sec="$(grep -Eo 'ELAPSED_SEC=[0-9]+(\.[0-9]+)?' "$log" | tail -1 | cut -d= -f2 || echo NA)"
-  printf '%-10s %-11s %10s %8s
-' "$rname" "$cname" "$tok" "$sec"
+  printf '%-10s %-11s %10s %8s\n' "$rname" "$cname" "$tok" "$sec"
   echo "$rname,$cname,$tok,$sec" >> "$OUT_DIR/results_signal.csv"
 }
 
 echo 'runner,corpus,last_tok_s,elapsed_sec' > "$OUT_DIR/results_signal.csv"
-printf '
-%-10s %-11s %10s %8s
-' 'runner' 'corpus' 'tok/s' 'sec'
-printf '%s
-' '---------------------------------------------'
+printf '\n%-10s %-11s %10s %8s\n' 'runner' 'corpus' 'tok/s' 'sec'
+printf '%s\n' '---------------------------------------------'
 for c in "${CORPORA[@]}"; do
   cname="${c%%:*}"; cpath="${c#*:}"
   for r in "${RUNNERS[@]}"; do
@@ -81,11 +78,12 @@ from collections import defaultdict
 rows=list(csv.DictReader(open('bench_out/results_signal.csv')))
 acc=defaultdict(lambda:[0.0,0.0,0])
 for r in rows:
-    try:t=float(r['last_tok_s']); s=float(r['elapsed_sec'])
-    except: continue
+    try:
+        t=float(r['last_tok_s']); s=float(r['elapsed_sec'])
+    except:
+        continue
     a=acc[r['runner']]; a[0]+=t; a[1]+=s; a[2]+=1
-print('
-AVG (signal only):')
+print('\nAVG (signal only):')
 print(f"{'runner':<10} {'avg_tok/s':>12} {'avg_sec':>10}")
 for k,(t,s,n) in sorted(acc.items()):
     print(f"{k:<10} {t/n:12.1f} {s/n:10.2f}")

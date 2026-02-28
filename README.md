@@ -136,6 +136,54 @@ hrm-flash generate \
 > [!TIP]
 > Use `--device cpu` to test the pipeline without CUDA. The CLI now performs early validation of HRM models to prevent silent hangs.
 
+
+------------------------------------------------------------------------
+
+## Benchmarking (Unified CLI)
+
+For reproducible, signal-focused comparisons, use the unified benchmark CLI:
+
+```bash
+cd experiments
+./benchmark_cli.sh -h
+```
+
+It prints a compact table directly in the console and ends with a winner line:
+
+- `tok/s` (throughput)
+- `run` (average run time)
+- `total` (total time)
+- `wins` (scenario wins)
+- `🏆 WINNER`
+
+### Common benchmark modes
+
+```bash
+# Quick matrix (small corpora, fast smoke test)
+./benchmark_cli.sh --preset matrix --repeats 1 --steps 60 --lr-list 0.0003
+
+# Decision mode (recommended default for tuning)
+./benchmark_cli.sh --preset decision --repeats 2 --steps 80 --lr-list 0.0001,0.0003,0.001
+
+# Larger-data mode (tiny/medium/large corpus mix)
+./benchmark_cli.sh --preset large --repeats 2 --steps 120
+```
+
+### Key options
+
+- `--preset matrix|decision|large`
+- `--repeats <n>`
+- `--steps <n>`
+- `--lr-list <comma-separated>` (decimal format, e.g. `0.0001,0.0003,0.001`)
+- `--include-beast 0|1`
+- `--out <dir>`
+
+Raw results are written to:
+
+```text
+experiments/bench_cli/raw.csv
+```
+
 ------------------------------------------------------------------------
 
 ## Architecture Overview

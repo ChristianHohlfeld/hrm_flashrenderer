@@ -16,6 +16,36 @@ If you just want to see it work immediately on the default dataset (`tinyshakesp
 
 ---
 
+
+## 🧪 Unified Benchmark CLI (Recommended)
+
+For apples-to-apples comparisons with clean console output, use:
+
+```bash
+./benchmark_cli.sh -h
+```
+
+Examples:
+
+```bash
+# fast matrix
+./benchmark_cli.sh --preset matrix --repeats 1 --steps 60 --lr-list 0.0003
+
+# decision compare (default recommendation)
+./benchmark_cli.sh --preset decision --repeats 2 --steps 80 --lr-list 0.0001,0.0003,0.001
+
+# larger corpus compare
+./benchmark_cli.sh --preset large --repeats 2 --steps 120
+```
+
+Console output is intentionally minimal and ends with:
+
+- Top rows by score
+- `🏆 WINNER`
+- CSV location
+
+---
+
 ## 💡 Which script should I use?
 
 *   **`run_llm.sh` (Experimental PHO)**: Uses "PhO-Compress" (phonetic recoding). It maps characters to phonetic tokens to attempt higher compression and efficiency.
