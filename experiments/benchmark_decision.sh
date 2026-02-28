@@ -145,8 +145,6 @@ for sc in sorted({k[1] for k in by_rs}):
         cand.sort(reverse=True)
         wins[cand[0][1]] += 1
 
-print('\n=== KERNMETRIKEN ===')
-print(f"{'runner@lr':<18} {'avg_tok/s':>10} {'avg_run':>10} {'total':>10} {'tok_cv%':>8} {'wins':>6}")
 report=[]
 for key,data in sorted(per_runner.items()):
     r,lr = key
@@ -156,7 +154,6 @@ for key,data in sorted(per_runner.items()):
     rk=f'{r}@{lr}'
     w=wins.get(rk,0)
     report.append((rk,mt,cvt,ms,cvs,total,w))
-    print(f"{rk:<18} {mt:10.1f} {mmss(ms):>10} {mmss(total):>10} {cvt:8.2f} {w:6d}")
 
 mts=[x[1] for x in report]; mss=[x[3] for x in report]
 min_t,max_t=min(mts),max(mts)
@@ -166,14 +163,19 @@ def norm(x,a,b):
     return 0.5 if a==b else (x-a)/(b-a)
 
 scored=[]
-for r,mt,cvt,ms,cvs,total,w in report:
+for rk,mt,cvt,ms,cvs,total,w in report:
     speed=norm(mt,min_t,max_t)
     time_pen=norm(ms,min_s,max_s)
     stab_pen=(cvt/100.0)*0.15
     score=speed - time_pen - stab_pen + (w*0.05)
-    scored.append((score,r))
+    scored.append((score,rk,mt,ms,total,w))
 scored.sort(reverse=True)
 
-print(f"\nWinner: {scored[0][1]}")
-print('Raw CSV: bench_decision/raw.csv')
+print('\n=== KERNMETRIKEN (MINIMAL) ===')
+print(f"{'runner@lr':<18} {'tok/s':>10} {'run':>8} {'total':>8} {'wins':>6}")
+for _,rk,mt,ms,total,w in scored[:3]:
+    print(f"{rk:<18} {mt:10.1f} {mmss(ms):>8} {mmss(total):>8} {w:6d}")
+
+print(f"\n🏆 WINNER: {scored[0][1]}")
+print('CSV: bench_decision/raw.csv')
 PY
