@@ -1,0 +1,9 @@
+#include <iostream>
+#include <vector>
+int main(){ std::vector<int> v{1,2,3}; for(auto x: v) std::cout<<x<<"\n"; }
+
+def fib(n):
+    a,b=0,1
+    for _ in range(n):
+        a,b=b,a+b
+    return a

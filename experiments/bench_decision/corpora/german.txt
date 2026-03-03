@@ -1,0 +1,2 @@
+Dies ist ein kompakter deutscher Testkorpus zur Vergleichbarkeit von Trainingsläufen.
+Wir messen Durchsatz, Laufzeit und Stabilität über mehrere Wiederholungen.

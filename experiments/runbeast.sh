@@ -861,7 +861,9 @@ static std::vector<uint16_t> encode_prompt(const PairIndex& pi, const PhoU* pho,
 static void wf(FILE* f,const void* p,size_t n){ if(std::fwrite(p,1,n,f)!=n) die("write failed"); }
 static void rf(FILE* f,void* p,size_t n){ if(std::fread(p,1,n,f)!=n) die("read failed"); }
 static void wu32(FILE* f,uint32_t x){ wf(f,&x,4); }
+static void wu16(FILE* f,uint16_t x){ wf(f,&x,2); }
 static uint32_t ru32(FILE* f){ uint32_t x; rf(f,&x,4); return x; }
+static uint16_t ru16(FILE* f){ uint16_t x; rf(f,&x,2); return x; }
 
 static size_t weights_floats(){
   size_t n=0;
@@ -3109,7 +3111,7 @@ static int chat_step(ChatCtx* c, int t, int tok_id){
   return next;
 }
 
-static void chat_repl(const PairIndex& pi, const std::vector<float>& hostW, const char* ckpt_path, const char* prompt, bool do_measure){
+static void chat_repl(const PairIndex& pi, const std::vector<float>& hostW, const char* ckpt_path, const char* prompt, bool do_measure, const PhoU& pho, bool pho_on){
   (void)ckpt_path;
   CUDA_CHECK(cudaSetDevice(0));
 
@@ -3122,7 +3124,7 @@ static void chat_repl(const PairIndex& pi, const std::vector<float>& hostW, cons
   chat_alloc(&ctx, g0);
 
   std::vector<uint16_t> pre;
-  if(prompt && prompt[0]) pre=encode_prompt(pi, std::string(prompt));
+  if(prompt && prompt[0]) pre=encode_prompt(pi, &pho, pho_on, std::string(prompt));
 
   int t=0;
   int next=-1;
@@ -3152,7 +3154,7 @@ static void chat_repl(const PairIndex& pi, const std::vector<float>& hostW, cons
       continue;
     }
 
-    auto ids=encode_prompt(pi, line+"\n");
+    auto ids=encode_prompt(pi, &pho, pho_on, line+"\n");
     for(size_t i=0;i<ids.size();i++){
       next = chat_step(&ctx, t, (int)ids[i]);
       t++;
@@ -3268,8 +3270,9 @@ int main(int argc,char** argv){
 
   PairIndex pi;
   std::vector<float> winit;
-
-  bool has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
+  PhoU pho = pho_default();
+  bool pho_on = false;
+  bool has_ckpt = load_ckpt(ckpt_path, &pi, &winit, &pho, &pho_on);
 
   if(has_ckpt && do_train && !do_continue){
     die("FATAL: checkpoint exists. You must either pass --continue to resume it, or --force-new to delete it.");
@@ -3293,11 +3296,13 @@ int main(int argc,char** argv){
   }
 
   if(do_chat){
-    chat_repl(pi, hostW, ckpt_path, chat_prompt, do_measure);
+    chat_repl(pi, hostW, ckpt_path, chat_prompt, do_measure, pho, pho_on);
     return 0;
   }
 
-  auto ids = encode_ids(pi, bytes.data(), bytes.size());
+  std::vector<uint8_t> encoded_bytes = bytes;
+  if(pho_on) encoded_bytes = pho_encode_bytes(pho, bytes);
+  auto ids = encode_ids(pi, encoded_bytes.data(), encoded_bytes.size());
   if(ids.size() < (size_t)seq+2) die("encoded too small");
 
   int devCount=0; CUDA_CHECK(cudaGetDeviceCount(&devCount));
@@ -3382,16 +3387,16 @@ int main(int argc,char** argv){
 
     if(save_every>0 && (step%save_every)==0){
       CUDA_CHECK(cudaSetDevice(0));
-      CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyHostToDevice));
-      save_ckpt(ckpt_path, pi, hostW.data());
+      CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyDeviceToHost));
+      save_ckpt(ckpt_path, pi, hostW.data(), pho, pho_on);
       std::printf("[*] saved: %s\n", ckpt_path);
       std::fflush(stdout);
     }
   }
 
   CUDA_CHECK(cudaSetDevice(0));
-  CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyHostToDevice));
-  save_ckpt(ckpt_path, pi, hostW.data());
+  CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(float), cudaMemcpyDeviceToHost));
+  save_ckpt(ckpt_path, pi, hostW.data(), pho, pho_on);
   std::printf("[*] saved final: %s\n", ckpt_path);
 
   for(int i=0;i<G;i++) gpu_free(&gpus[(size_t)i]);

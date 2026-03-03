@@ -1,0 +1,10 @@
+runner,scenario,lr,rep,tok_s,elapsed_sec
+orig,shakespeare,0.0003,1,44215.2,4.68
+orig,shakespeare,0.0003,2,44613.5,4.52
+orig,shakespeare,0.0003,3,44473.7,5.01
+llm,shakespeare,0.0003,1,42395.2,6.72
+llm,shakespeare,0.0003,2,44984.4,6.69
+llm,shakespeare,0.0003,3,44858.8,6.77
+llm_pho,shakespeare,0.0003,1,44404.0,6.75
+llm_pho,shakespeare,0.0003,2,43604.3,7.25
+llm_pho,shakespeare,0.0003,3,44658.4,6.71
