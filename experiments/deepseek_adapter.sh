@@ -33,7 +33,7 @@ if [[ ! -d "$LLAMA_DIR" ]]; then
   echo "[*] Lade llama.cpp b8192..."
   curl -L -o /tmp/llama.tar.gz https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8192.tar.gz
   tar -xzf /tmp/llama.tar.gz
-  mv llama.cpp-b8192 "$LLAMA_DIR"
+#   mv llama.cpp-b8192 "$LLAMA_DIR"
 fi
 cd "$LLAMA_DIR"
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF
