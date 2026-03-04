@@ -191,11 +191,24 @@ cat << 'CUEOF' > /tmp/_dsi8_engine.cu
 #include <sys/stat.h>
 #include <unistd.h>
 #include <chrono>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <thread>
+#include <chrono>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <nvml.h>
 
 #define CUDA_CHECK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);}} while(0)
 #define KERNEL_CHECK() { cudaError_t e=cudaGetLastError(); if(e!=cudaSuccess){ \
   fprintf(stderr,"Kernel %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);}}
+#define NVML_CHECK(x) do { nvmlReturn_t r=(x); if(r!=NVML_SUCCESS){ \
+  fprintf(stderr,"NVML Error: %s\n",nvmlErrorString(r)); exit(1);}} while(0)
 
 // ─── Config ───
 struct ModelConfig {
@@ -203,6 +216,27 @@ struct ModelConfig {
   double rope_theta;
   float rms_eps;
   int bos_id, eos_id;
+};
+
+struct TelemetryPacket {
+    uint32_t step;
+    float loss;
+    float cos_sim;
+    float euclid_dist;
+    float proj_x, proj_y, proj_z;
+    float gpu_util[3];
+    float gpu_mem[3];
+    char model_id[64];
+    char prompt[64];
+};
+
+struct TelemetryCtx {
+    int sock;
+    struct sockaddr_in addr;
+    float* d_proj_matrix;
+    float* d_proj_result;
+    nvmlDevice_t nvml_handles[3];
+    bool enabled;
 };
 
 // ─── Tensor types ───
@@ -231,8 +265,9 @@ struct Loader {
     fd = ::open(path, O_RDONLY);
     if(fd<0){ perror("open"); exit(1); }
     struct stat sb; fstat(fd,&sb); sz=sb.st_size;
-    base=(uint8_t*)mmap(nullptr,sz,PROT_READ,MAP_POPULATE|MAP_PRIVATE,fd,0);
+    base=(uint8_t*)mmap(nullptr,sz,PROT_READ,MAP_PRIVATE,fd,0);
     if(base==MAP_FAILED){ perror("mmap"); exit(1); }
+    printf("[*] Mapped %zu bytes. Parsing...\n", sz); fflush(stdout);
     parse();
   }
   void close_() { if(base!=MAP_FAILED) munmap(base,sz); if(fd>=0) ::close(fd); }
@@ -299,11 +334,11 @@ private:
 // CUDA KERNELS — FP32 activations, INT8 weight GEMVs
 // ═══════════════════════════════════════════════════════════════
 
-// ─── RoPE tables (device memory) ───
-static float* d_rope_sin = nullptr;
-static float* d_rope_cos = nullptr;
+// ─── RoPE tables (per-GPU) ───
+static float* d_rope_sin[3] = {nullptr, nullptr, nullptr};
+static float* d_rope_cos[3] = {nullptr, nullptr, nullptr};
 
-static void init_rope_tables(int Dh, int Tmax, double theta) {
+static void init_rope_tables(int Dh, int Tmax, double theta, int n_gpus) {
   int half = Dh / 2;
   size_t n = (size_t)Tmax * half;
   std::vector<float> s(n), c(n);
@@ -316,14 +351,19 @@ static void init_rope_tables(int Dh, int Tmax, double theta) {
     }
   }
   size_t bytes = n * sizeof(float);
-  CUDA_CHECK(cudaMalloc(&d_rope_sin, bytes));
-  CUDA_CHECK(cudaMalloc(&d_rope_cos, bytes));
-  CUDA_CHECK(cudaMemcpy(d_rope_sin, s.data(), bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_rope_cos, c.data(), bytes, cudaMemcpyHostToDevice));
+  for(int i=0; i<n_gpus; i++) {
+    cudaSetDevice(i);
+    CUDA_CHECK(cudaMalloc(&d_rope_sin[i], bytes));
+    CUDA_CHECK(cudaMalloc(&d_rope_cos[i], bytes));
+    CUDA_CHECK(cudaMemcpy(d_rope_sin[i], s.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rope_cos[i], c.data(), bytes, cudaMemcpyHostToDevice));
+  }
 }
 
-// ─── RMSNorm (fp32 → fp32) ───
-__global__ void rmsnorm(float* out, const float* x, const float* gamma, float eps, int D) {
+// ─── RMSNorm then INT8 Quantize (Fused) ───
+// out_q: [D] int8, out_scale: [1] float
+__global__ void rmsnorm_quant(int8_t* out_q, float* out_scale, float* out_f32, 
+                             const float* x, const float* gamma, float eps, int D) {
   __shared__ float shared_ss[32];
   int tid = threadIdx.x;
   int lane = tid % 32;
@@ -343,33 +383,86 @@ __global__ void rmsnorm(float* out, const float* x, const float* gamma, float ep
     if(lane==0) shared_ss[0] = val;
   }
   __syncthreads();
-  float rms = rsqrtf(shared_ss[0] / (float)D + eps);
+  float inv_rms = rsqrtf(shared_ss[0] / (float)D + eps);
+  
+  // Now find absmax for quantization
+  float my_max = 0.0f;
   for(int i = tid; i < D; i += blockDim.x) {
-    out[i] = x[i] * rms * gamma[i];
+      float v = fabsf(x[i] * inv_rms * gamma[i]);
+      if(out_f32) out_f32[i] = x[i] * inv_rms * gamma[i];
+      if(v > my_max) my_max = v;
+  }
+  for(int d=16;d>0;d>>=1) my_max = fmaxf(my_max, __shfl_down_sync(0xFFFFFFFFu, my_max, d));
+  if(lane==0) shared_ss[warp] = my_max;
+  __syncthreads();
+  if(warp==0) {
+      float val = (tid < (blockDim.x+31)/32) ? shared_ss[tid] : 0.0f;
+      for(int d=16;d>0;d>>=1) val = fmaxf(val, __shfl_down_sync(0xFFFFFFFFu, val, d));
+      if(tid==0) {
+          float scale = val / 127.0f;
+          if(scale < 1e-10f) scale = 1e-10f;
+          out_scale[0] = scale;
+      }
+  }
+  __syncthreads();
+  
+  float inv_q_scale = 1.0f / out_scale[0];
+  for(int i = tid; i < D; i += blockDim.x) {
+      float v = (x[i] * inv_rms * gamma[i]) * inv_q_scale;
+      int32_t qi = __float2int_rn(v);
+      if(qi > 127) qi = 127; if(qi < -128) qi = -128;
+      out_q[i] = (int8_t)qi;
   }
 }
 
-// ─── INT8 Weight GEMV: out[row] = dot(x_fp32, W_int8[row]) * scale[row] ───
-// x is fp32, W is int8, scale is fp32 per-row
-// We quantize x to int8 on-the-fly, use DP4A, then rescale
+// ─── Optimized GEMV using pre-quantized x ───
+__global__ void gemv_w8_prequant(float* out, const int8_t* x_q, float x_scale,
+                                const int8_t* W, const float* w_scale, int rows, int cols) {
+  int row = blockIdx.x;
+  if(row >= rows) return;
+  int tid = threadIdx.x;
+  
+  const int8_t* wrow = W + (size_t)row * (size_t)cols;
+  int32_t acc = 0;
+  // Assumes cols is multiple of 4
+  for(int k = tid*4; k < cols; k += blockDim.x*4) {
+      int32_t a = *((const int32_t*)(x_q + k));
+      int32_t b = *((const int32_t*)(wrow + k));
+      acc = __dp4a(a, b, acc);
+  }
+  
+  int lane = tid % 32;
+  for(int d=16;d>0;d>>=1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
+  
+  __shared__ int32_t sh_acc[8];
+  int warp = tid / 32;
+  if(lane==0) sh_acc[warp] = acc;
+  __syncthreads();
+  
+  if(warp==0) {
+    int32_t val = (tid < (blockDim.x+31)/32) ? sh_acc[tid] : 0;
+    for(int d=16;d>0;d>>=1) val += __shfl_down_sync(0xFFFFFFFFu, val, d);
+    if(tid==0) {
+      out[row] = (float)val * x_scale * w_scale[row];
+    }
+  }
+}
+
+// ─── Standard INT8 Weight GEMV (quantizes on-the-fly) ───
 __global__ void gemv_w8(float* out, const float* x, const int8_t* W,
                         const float* w_scale, int rows, int cols) {
   int row = blockIdx.x;
   if(row >= rows) return;
   int tid = threadIdx.x;
-
-  // Step 1: cooperatively quantize x to int8 in shared memory
   extern __shared__ int8_t sh_x[];
   __shared__ float sh_x_scale[1];
 
-  // Find absmax of x
   float my_max = 0.0f;
   for(int i = tid; i < cols; i += blockDim.x) {
     float v = fabsf(x[i]);
     if(v > my_max) my_max = v;
   }
   for(int d=16;d>0;d>>=1) my_max = fmaxf(my_max, __shfl_down_sync(0xFFFFFFFFu, my_max, d));
-  // Cross-warp max
   __shared__ float sh_max[8];
   int lane = tid % 32, warp = tid / 32;
   if(lane==0) sh_max[warp] = my_max;
@@ -388,34 +481,23 @@ __global__ void gemv_w8(float* out, const float* x, const int8_t* W,
     if(qi > 127) qi = 127; if(qi < -128) qi = -128;
     sh_x[i] = (int8_t)qi;
   }
-  // Pad to multiple of 4
-  for(int i = cols + tid; i < ((cols+3)&~3); i += blockDim.x) sh_x[i] = 0;
   __syncthreads();
 
-  // Step 2: DP4A dot product
   const int8_t* wrow = W + (size_t)row * (size_t)cols;
   int32_t acc = 0;
-  int cols4 = (cols + 3) & ~3;
-  for(int k = tid*4; k < cols4; k += blockDim.x*4) {
-    if(k+3 < cols4) {
-      int32_t a = *((const int32_t*)(sh_x + k));
-      int32_t b = *((const int32_t*)(wrow + k));
-      acc = __dp4a(a, b, acc);
-    }
+  for(int k = tid*4; k < cols; k += blockDim.x*4) {
+    int32_t a = *((const int32_t*)(sh_x + k));
+    int32_t b = *((const int32_t*)(wrow + k));
+    acc = __dp4a(a, b, acc);
   }
-  // Warp reduce
   for(int d=16;d>0;d>>=1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
-  // Cross-warp reduce
   __shared__ int32_t sh_acc[8];
   if(lane==0) sh_acc[warp] = acc;
   __syncthreads();
   if(warp==0) {
     int32_t val = (tid < (blockDim.x+31)/32) ? sh_acc[tid] : 0;
     for(int d=16;d>0;d>>=1) val += __shfl_down_sync(0xFFFFFFFFu, val, d);
-    if(tid==0) {
-      float result = (float)val * sh_x_scale[0] * w_scale[row];
-      out[row] = result;
-    }
+    if(tid==0) out[row] = (float)val * sh_x_scale[0] * w_scale[row];
   }
 }
 
@@ -449,38 +531,49 @@ __global__ void kv_store(half* Kc, half* Vc, const float* k, const float* v,
   Vc[(size_t)t*KVDh + i] = __float2half(v[i]);
 }
 
-// ─── Online Softmax Attention (fp32, GQA, 1 block/head) ───
+// ─── Online Softmax Attention (Corrected Decode) ───
 __global__ void attn_decode(float* out, const float* q,
-                            const half* Kc, const half* Vc,
-                            int t, int Dh, int KVH, float inv_sqrt_dh) {
+                             const half* Kc, const half* Vc,
+                             int t, int Dh, int KVH, float inv_sqrt_dh) {
   int head = blockIdx.x;
-  int lane = threadIdx.x;
-  if(lane >= Dh) return;
+  int tid = threadIdx.x;
+  if(tid >= Dh) return;
   int kv_head = head % KVH;
 
   float m = -1e30f, s = 0.0f, acc = 0.0f;
+  const float query_val = q[head * Dh + tid];
 
   for(int kpos = 0; kpos <= t; kpos++) {
-    const half* kvec = Kc + (size_t)kpos*(KVH*Dh) + kv_head*Dh;
-    const half* vvec = Vc + (size_t)kpos*(KVH*Dh) + kv_head*Dh;
+    const half* k_base = Kc + (size_t)kpos * (KVH * Dh) + kv_head * Dh;
+    const half* v_base = Vc + (size_t)kpos * (KVH * Dh) + kv_head * Dh;
 
-    float part = 0.0f;
-    for(int i = lane; i < Dh; i += 32)
-      part += q[head*Dh+i] * __half2float(kvec[i]);
+    float dot = query_val * __half2float(k_base[tid]);
+    // Full block reduction (intra-warp then inter-warp)
+    for(int d=16; d>0; d>>=1) dot += __shfl_down_sync(0xFFFFFFFFu, dot, d);
+    
+    __shared__ float sh_dot[32]; 
+    int lane = tid % 32;
+    int warp = tid / 32;
+    if(lane == 0) sh_dot[warp] = dot;
+    __syncthreads();
+    
+    if(warp == 0) {
+      float v = (tid < (blockDim.x+31)/32) ? sh_dot[tid] : 0.0f;
+      for(int d=16; d>0; d>>=1) v += __shfl_down_sync(0xFFFFFFFFu, v, d);
+      if(tid == 0) sh_dot[0] = v * inv_sqrt_dh;
+    }
+    __syncthreads();
+    float final_dot = sh_dot[0];
 
-    float dot = part;
-    for(int d=16;d>0;d>>=1) dot += __shfl_down_sync(0xFFFFFFFFu, dot, d);
-    dot = __shfl_sync(0xFFFFFFFFu, dot, 0);
-    dot *= inv_sqrt_dh;
-
-    float new_m = fmaxf(m, dot);
+    float new_m = fmaxf(m, final_dot);
     float e_old = expf(m - new_m);
-    float e_new = expf(dot - new_m);
-    acc = acc * e_old + __half2float(vvec[lane]) * e_new;
+    float e_new = expf(final_dot - new_m);
+    
+    acc = acc * e_old + __half2float(v_base[tid]) * e_new;
     s   = s   * e_old + e_new;
     m = new_m;
   }
-  out[head*Dh + lane] = acc / fmaxf(s, 1e-10f);
+  out[head * Dh + tid] = acc / fmaxf(s, 1e-10f);
 }
 
 // ─── SiLU gate × up (fp32) ───
@@ -556,34 +649,172 @@ __global__ void embed_lookup(float* out, const int8_t* table, const float* scale
   out[i] = (float)table[(size_t)tok*D + i] * scale[tok];
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MAIN
-// ═══════════════════════════════════════════════════════════════
+__global__ void random_project_3d_kernel(const float* vec, float* proj, const float* matrix, int D) {
+    int dim = blockIdx.x;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        sum += vec[i] * matrix[dim * D + i];
+    }
+    atomicAdd(&proj[dim], sum);
+}
+
+static char g_model_name[64] = "Unknown Model";
+
+static void init_telemetry(TelemetryCtx* ctx, int D, const char* name) {
+    if (name) strncpy(g_model_name, name, 63);
+    const char* enable = std::getenv("TELEM_ENABLE");
+    if (!enable || std::string(enable) != "1") {
+        ctx->enabled = false;
+        return;
+    }
+    const char* port_s = std::getenv("TELEM_PORT");
+    int port = port_s ? std::atoi(port_s) : 9999;
+    const char* target = std::getenv("TELEM_TARGET");
+    if (!target) target = "127.0.0.1";
+
+    ctx->sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ctx->sock < 0) { ctx->enabled = false; return; }
+    
+    ctx->addr.sin_family = AF_INET;
+    ctx->addr.sin_port = htons(port);
+    ctx->addr.sin_addr.s_addr = inet_addr(target);
+    
+    ctx->enabled = true;
+
+    NVML_CHECK(nvmlInit());
+    for(int i=0; i<3; i++) {
+        NVML_CHECK(nvmlDeviceGetHandleByIndex(i, &ctx->nvml_handles[i]));
+    }
+
+    CUDA_CHECK(cudaMalloc(&ctx->d_proj_matrix, 3 * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_proj_result, 3 * sizeof(float)));
+
+    std::vector<float> h_matrix(3 * D);
+    for (int i=0; i < 3*D; i++) h_matrix[i] = ((float)rand()/RAND_MAX) * 2.0f - 1.0f;
+    CUDA_CHECK(cudaMemcpy(ctx->d_proj_matrix, h_matrix.data(), h_matrix.size() * sizeof(float), cudaMemcpyHostToDevice));
+    
+    std::printf("[*] Telemetry enabled (with NVML) on %s:%d\n", target, port);
+}
+
+static void send_telemetry(TelemetryCtx* ctx, float loss, int step, float* d_vec, int D, const char* prompt_text) {
+    if (!ctx->enabled) return;
+    
+    float h_proj[3] = {0,0,0};
+    if (d_vec) {
+        CUDA_CHECK(cudaMemset(ctx->d_proj_result, 0, 3 * sizeof(float)));
+        random_project_3d_kernel<<<3, 256>>>(d_vec, ctx->d_proj_result, ctx->d_proj_matrix, D);
+        CUDA_CHECK(cudaMemcpy(h_proj, ctx->d_proj_result, 3 * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+
+    static float last_x = 0, last_y = 0, last_z = 0;
+    float dx = h_proj[0] - last_x, dy = h_proj[1] - last_y, dz = h_proj[2] - last_z;
+    float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+    float dot = h_proj[0]*last_x + h_proj[1]*last_y + h_proj[2]*last_z;
+    float mag1 = std::sqrt(h_proj[0]*h_proj[0] + h_proj[1]*h_proj[1] + h_proj[2]*h_proj[2]);
+    float mag2 = std::sqrt(last_x*last_x + last_y*last_y + last_z*last_z);
+    float cos_sim = (mag1 > 1e-9 && mag2 > 1e-9) ? (dot / (mag1 * mag2)) : 1.0f;
+    last_x = h_proj[0]; last_y = h_proj[1]; last_z = h_proj[2];
+
+    TelemetryPacket p;
+    memset(&p, 0, sizeof(p));
+    p.step = (uint32_t)step; p.loss = loss; p.cos_sim = cos_sim; p.euclid_dist = dist;
+    p.proj_x = h_proj[0]; p.proj_y = h_proj[1]; p.proj_z = h_proj[2];
+    
+    for(int i=0; i<3; i++) {
+        nvmlUtilization_t util;
+        nvmlMemory_t mem;
+        if(nvmlDeviceGetUtilizationRates(ctx->nvml_handles[i], &util) == NVML_SUCCESS) p.gpu_util[i] = (float)util.gpu;
+        if(nvmlDeviceGetMemoryInfo(ctx->nvml_handles[i], &mem) == NVML_SUCCESS) p.gpu_mem[i] = (float)mem.used / (float)mem.total * 100.0f;
+    }
+
+    if (prompt_text) strncpy(p.prompt, prompt_text, 63);
+    else strncpy(p.prompt, "SYSTEM_IDLE", 63);
+    strncpy(p.model_id, g_model_name, 63);
+    sendto(ctx->sock, &p, sizeof(p), 0, (struct sockaddr*)&ctx->addr, sizeof(ctx->addr));
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MULTI-GPU & INTERACTIVE INFRASTRUCTURE
+// ─────────────────────────────────────────────────────────────────
+
+struct GPUBuffer {
+    float *d_hidden;
+    float *d_norm_out;
+    int8_t *d_x_q;      // Pre-quantized x for GEMVs
+    float *d_x_scale;   // Scale for x_q
+    float *d_q, *d_k, *d_v;
+    float *d_attn_out;
+    float *d_buf;
+    float *d_gate, *d_up;
+    half *d_Kc_ptr, *d_Vc_ptr; // KV cache for this GPU's layers
+};
+
+static void check_prompt_file(char* buffer, size_t size) {
+    FILE* f = fopen("/tmp/deepseek_prompt.txt", "r");
+    if (f) {
+        if (fgets(buffer, size, f)) {
+            // strip newline
+            char* nl = strchr(buffer, '\n');
+            if (nl) *nl = 0;
+        }
+        fclose(f);
+        remove("/tmp/deepseek_prompt.txt");
+    } else {
+        buffer[0] = 0;
+    }
+}
 int main(int argc, char** argv) {
   if(argc<2){ fprintf(stderr,"Usage: %s <model_q8.bin> [prompt_text]\n",argv[0]); return 1; }
 
-  printf("[*] DeepSeek INT8 Persistent Decode Engine (Hybrid FP32/INT8)\n");
+  printf("[*] DeepSeek INT8 Persistent Decode Engine (Hybrid Multi-GPU)\n");
   printf("[*] (C) 2026 Christian Heinrich Hohlfeld, Konstanz\n");
 
   Loader ldr;
   ldr.open(argv[1]);
   auto& C = ldr.cfg;
+  
+  TelemetryCtx telem;
+  init_telemetry(&telem, C.D, argc > 2 ? argv[2] : "DeepSeek-1.5B-Q8");
   printf("[*] Model: D=%d H=%d KVH=%d Dh=%d F=%d V=%d L=%d Tmax=%d\n",
          C.D, C.H, C.KVH, C.Dh, C.F, C.V, C.L, C.Tmax);
-  printf("[*] rope_theta=%.1f rms_eps=%e bos=%d eos=%d\n", C.rope_theta, C.rms_eps, C.bos_id, C.eos_id);
+  fflush(stdout);
 
-  init_rope_tables(C.Dh, C.Tmax, C.rope_theta);
   int KVDh = C.KVH * C.Dh;
   float inv_sqrt_dh = 1.0f / sqrtf((float)C.Dh);
 
-  // ─── Upload weights to GPU ───
+  int n_gpus = 0;
+  cudaGetDeviceCount(&n_gpus);
+  if (n_gpus > 3) n_gpus = 3;
+  printf("[*] Using %d GPUs for Layer Splitting\n", n_gpus);
+  fflush(stdout);
+
+  init_rope_tables(C.Dh, C.Tmax, C.rope_theta, n_gpus);
+
+  for(int i=0; i<n_gpus; i++) {
+    for(int j=0; j<n_gpus; j++) {
+      if(i != j) {
+        cudaSetDevice(i);
+        int can_access = 0;
+        cudaDeviceCanAccessPeer(&can_access, i, j);
+        if(can_access) {
+          cudaDeviceEnablePeerAccess(j, 0);
+          printf("[*] P2P: GPU %d -> %d enabled\n", i, j); fflush(stdout);
+        }
+      }
+    }
+  }
+
   struct LayerW {
     int8_t *d_wq, *d_wk, *d_wv, *d_wo, *d_wgate, *d_wup, *d_wdown;
     float  *d_sq, *d_sk, *d_sv, *d_so, *d_sgate, *d_sup, *d_sdown;
     float  *d_ln1, *d_ln2;
-    float  *d_bq, *d_bk, *d_bv; // bias (nullable)
+    float  *d_bq, *d_bk, *d_bv;
     bool has_bq, has_bk, has_bv;
+    half *d_Kc, *d_Vc;
   };
+
+  std::vector<LayerW> lw(C.L);
+  GPUBuffer gb[3];
 
   auto upload_q8 = [&](const std::string& key, int8_t** d_w, float** d_s) {
     TensorQ8 t = ldr.getq8(key);
@@ -606,205 +837,173 @@ int main(int argc, char** argv) {
     return true;
   };
 
-  printf("[*] Uploading weights to GPU...\n");
-  auto t0 = std::chrono::high_resolution_clock::now();
-
-  int8_t *d_embed_w, *d_lmhead_w;
-  float  *d_embed_s, *d_lmhead_s;
-  upload_q8("model.embed_tokens.weight", &d_embed_w, &d_embed_s);
-  upload_q8("lm_head.weight", &d_lmhead_w, &d_lmhead_s);
-
-  float *d_lnf;
-  upload_f32("model.norm.weight", &d_lnf);
-
-  std::vector<LayerW> lw(C.L);
-  for(int l=0;l<C.L;l++){
-    char buf[256];
-    auto mk=[&](const char* s)->std::string{ snprintf(buf,256,"model.layers.%d.%s",l,s); return buf; };
-    upload_f32(mk("input_layernorm.weight"), &lw[l].d_ln1);
-    upload_q8(mk("self_attn.q_proj.weight"), &lw[l].d_wq, &lw[l].d_sq);
-    upload_q8(mk("self_attn.k_proj.weight"), &lw[l].d_wk, &lw[l].d_sk);
-    upload_q8(mk("self_attn.v_proj.weight"), &lw[l].d_wv, &lw[l].d_sv);
-    upload_q8(mk("self_attn.o_proj.weight"), &lw[l].d_wo, &lw[l].d_so);
-    upload_f32(mk("post_attention_layernorm.weight"), &lw[l].d_ln2);
-    upload_q8(mk("mlp.gate_proj.weight"), &lw[l].d_wgate, &lw[l].d_sgate);
-    upload_q8(mk("mlp.up_proj.weight"), &lw[l].d_wup, &lw[l].d_sup);
-    upload_q8(mk("mlp.down_proj.weight"), &lw[l].d_wdown, &lw[l].d_sdown);
-    lw[l].has_bq = try_upload_f32(mk("self_attn.q_proj.bias"), &lw[l].d_bq);
-    lw[l].has_bk = try_upload_f32(mk("self_attn.k_proj.bias"), &lw[l].d_bk);
-    lw[l].has_bv = try_upload_f32(mk("self_attn.v_proj.bias"), &lw[l].d_bv);
+  printf("[*] Allocating buffers and uploading weights...\n");
+  for(int i=0; i<n_gpus; i++) {
+    cudaSetDevice(i);
+    CUDA_CHECK(cudaMalloc(&gb[i].d_hidden, C.D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_norm_out, C.D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_x_q, C.D * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_x_scale, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_q, C.D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_k, KVDh * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_v, KVDh * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_attn_out, C.D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_buf, C.D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_gate, C.F * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&gb[i].d_up,   C.F * sizeof(float)));
   }
 
-  auto t1 = std::chrono::high_resolution_clock::now();
-  double load_ms = std::chrono::duration<double,std::milli>(t1-t0).count();
-  printf("[*] Weights uploaded in %.1f ms\n", load_ms);
-
-  // ─── Scratch Buffers (all fp32) ───
-  float *d_hidden, *d_norm_out, *d_q, *d_k, *d_v, *d_attn_out, *d_buf;
-  float *d_gate, *d_up, *d_logits;
-  CUDA_CHECK(cudaMalloc(&d_hidden,   C.D*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_norm_out, C.D*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_q,        C.D*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_k,        KVDh*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_v,        KVDh*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_attn_out, C.D*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_buf,      C.D*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_gate,     C.F*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_up,       C.F*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_logits,   C.V*sizeof(float)));
-
-  // KV cache: fp16 [L][Tmax][KVH*Dh]
-  std::vector<half*> d_Kc(C.L), d_Vc(C.L);
   size_t kv_layer = (size_t)C.Tmax * KVDh * sizeof(half);
-  for(int l=0;l<C.L;l++){
-    CUDA_CHECK(cudaMalloc(&d_Kc[l], kv_layer));
-    CUDA_CHECK(cudaMalloc(&d_Vc[l], kv_layer));
+  for(int l=0; l<C.L; l++) {
+    int target_gpu = (l < 10) ? 0 : (l < 19 ? 1 : 2);
+    if (target_gpu >= n_gpus) target_gpu = n_gpus - 1;
+    cudaSetDevice(target_gpu);
+
+    char pfix[128]; snprintf(pfix, 128, "model.layers.%d.", l);
+    upload_f32(std::string(pfix)+"input_layernorm.weight", &lw[l].d_ln1);
+    upload_q8(std::string(pfix)+"self_attn.q_proj.weight", &lw[l].d_wq, &lw[l].d_sq);
+    upload_q8(std::string(pfix)+"self_attn.k_proj.weight", &lw[l].d_wk, &lw[l].d_sk);
+    upload_q8(std::string(pfix)+"self_attn.v_proj.weight", &lw[l].d_wv, &lw[l].d_sv);
+    upload_q8(std::string(pfix)+"self_attn.o_proj.weight", &lw[l].d_wo, &lw[l].d_so);
+    upload_f32(std::string(pfix)+"post_attention_layernorm.weight", &lw[l].d_ln2);
+    upload_q8(std::string(pfix)+"mlp.gate_proj.weight",   &lw[l].d_wgate,&lw[l].d_sgate);
+    upload_q8(std::string(pfix)+"mlp.up_proj.weight",     &lw[l].d_wup,  &lw[l].d_sup);
+    upload_q8(std::string(pfix)+"mlp.down_proj.weight",   &lw[l].d_wdown,&lw[l].d_sdown);
+    lw[l].has_bq = try_upload_f32(std::string(pfix)+"self_attn.q_proj.bias", &lw[l].d_bq);
+    lw[l].has_bk = try_upload_f32(std::string(pfix)+"self_attn.k_proj.bias", &lw[l].d_bk);
+    lw[l].has_bv = try_upload_f32(std::string(pfix)+"self_attn.v_proj.bias", &lw[l].d_bv);
+    
+    CUDA_CHECK(cudaMalloc(&lw[l].d_Kc, kv_layer));
+    CUDA_CHECK(cudaMalloc(&lw[l].d_Vc, kv_layer));
   }
 
+  cudaSetDevice(0);
+  int8_t *d_embed_w, *d_lmhead_w;
+  float *d_embed_s, *d_lnf, *d_lmhead_s, *d_logits, *d_loss;
   int *d_next_tok;
+  upload_q8("model.embed_tokens.weight", &d_embed_w, &d_embed_s);
+  upload_f32("model.norm.weight", &d_lnf);
+  upload_q8("lm_head.weight", &d_lmhead_w, &d_lmhead_s);
+  CUDA_CHECK(cudaMalloc(&d_logits, (size_t)C.V*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_next_tok, sizeof(int)));
 
-  // Shared memory for gemv_w8
   int gemv_smem = ((C.D + 3) & ~3) * sizeof(int8_t) + 64;
+  int lm_smem = ((C.D + 3) & ~3) * sizeof(int8_t) + 64;
+  int down_smem = ((C.F + 3) & ~3) * sizeof(int8_t) + 64;
 
-  printf("[*] Ready. Generating tokens (greedy)...\n");
-
-  int cur_tok = C.bos_id; // BOS token from model config
-  int Tgen = 64;
-  float total_loss = 0.0f;
-  int loss_count = 0;
-  float *d_loss;
-  CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
-  auto gen_start = std::chrono::high_resolution_clock::now();
-
-  for(int t=0; t<Tgen; t++) {
-    // Embed
-    embed_lookup<<<(C.D+255)/256, 256>>>(d_hidden, d_embed_w, d_embed_s, cur_tok, C.D);
-    KERNEL_CHECK();
-
-    for(int l=0;l<C.L;l++) {
-      // RMSNorm
-      rmsnorm<<<1, 256>>>(d_norm_out, d_hidden, lw[l].d_ln1, C.rms_eps, C.D);
-      KERNEL_CHECK();
-
-      // QKV projections (INT8 GEMV with DP4A)
-      gemv_w8<<<C.D, 128, gemv_smem>>>(d_q, d_norm_out, lw[l].d_wq, lw[l].d_sq, C.D, C.D);
-      KERNEL_CHECK();
-      gemv_w8<<<KVDh, 128, gemv_smem>>>(d_k, d_norm_out, lw[l].d_wk, lw[l].d_sk, KVDh, C.D);
-      KERNEL_CHECK();
-      gemv_w8<<<KVDh, 128, gemv_smem>>>(d_v, d_norm_out, lw[l].d_wv, lw[l].d_sv, KVDh, C.D);
-      KERNEL_CHECK();
-
-      // Bias
-      if(lw[l].has_bq) { add_bias_f<<<(C.D+255)/256,256>>>(d_q, lw[l].d_bq, C.D); KERNEL_CHECK(); }
-      if(lw[l].has_bk) { add_bias_f<<<(KVDh+255)/256,256>>>(d_k, lw[l].d_bk, KVDh); KERNEL_CHECK(); }
-      if(lw[l].has_bv) { add_bias_f<<<(KVDh+255)/256,256>>>(d_v, lw[l].d_bv, KVDh); KERNEL_CHECK(); }
-
-      // RoPE
-      rope_apply<<<C.H, C.Dh/2>>>(d_q, d_rope_cos, d_rope_sin, t, C.Dh);
-      KERNEL_CHECK();
-      rope_apply<<<C.KVH, C.Dh/2>>>(d_k, d_rope_cos, d_rope_sin, t, C.Dh);
-      KERNEL_CHECK();
-
-      // KV store (fp32 → fp16)
-      kv_store<<<(KVDh+255)/256,256>>>(d_Kc[l], d_Vc[l], d_k, d_v, t, KVDh);
-      KERNEL_CHECK();
-
-      // Attention (online softmax, GQA, 1 block per head)
-      attn_decode<<<C.H, C.Dh>>>(d_attn_out, d_q, d_Kc[l], d_Vc[l], t, C.Dh, C.KVH, inv_sqrt_dh);
-      KERNEL_CHECK();
-
-      // Out projection
-      gemv_w8<<<C.D, 128, gemv_smem>>>(d_buf, d_attn_out, lw[l].d_wo, lw[l].d_so, C.D, C.D);
-      KERNEL_CHECK();
-
-      // Residual
-      add_inplace<<<(C.D+255)/256,256>>>(d_hidden, d_buf, C.D);
-      KERNEL_CHECK();
-
-      // RMSNorm 2
-      rmsnorm<<<1, 256>>>(d_norm_out, d_hidden, lw[l].d_ln2, C.rms_eps, C.D);
-      KERNEL_CHECK();
-
-      // MLP: gate, up, SiLU gate*up, down, residual
-      gemv_w8<<<C.F, 128, gemv_smem>>>(d_gate, d_norm_out, lw[l].d_wgate, lw[l].d_sgate, C.F, C.D);
-      gemv_w8<<<C.F, 128, gemv_smem>>>(d_up,   d_norm_out, lw[l].d_wup,   lw[l].d_sup,  C.F, C.D);
-      KERNEL_CHECK();
-
-      silu_gate_mul<<<(C.F+255)/256,256>>>(d_gate, d_gate, d_up, C.F);
-      KERNEL_CHECK();
-
-      // Down proj: need larger smem for F dims
-      int down_smem = ((C.F + 3) & ~3) * sizeof(int8_t) + 64;
-      gemv_w8<<<C.D, 128, down_smem>>>(d_buf, d_gate, lw[l].d_wdown, lw[l].d_sdown, C.D, C.F);
-      KERNEL_CHECK();
-
-      add_inplace<<<(C.D+255)/256,256>>>(d_hidden, d_buf, C.D);
-      KERNEL_CHECK();
+  printf("[*] Ready. Entering interactive loop...\n"); fflush(stdout);
+  char prompt_buf[512];
+  while(true) {
+    check_prompt_file(prompt_buf, sizeof(prompt_buf));
+    if (prompt_buf[0] == 0) { 
+        send_telemetry(&telem, 0.0f, 0, nullptr, C.D, "AWAITING_PROMPT");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+        continue; 
     }
+    printf("> Received Prompt: %s\n", prompt_buf); fflush(stdout);
 
-    // Final norm
-    rmsnorm<<<1, 256>>>(d_norm_out, d_hidden, d_lnf, C.rms_eps, C.D);
-    KERNEL_CHECK();
+    int cur_tok = C.bos_id; 
+    int Tgen = 64;
+    float total_loss = 0.0f;
+    int loss_count = 0;
+    
+    for(int t=0; t<Tgen; t++) {
+      cudaSetDevice(0);
+      embed_lookup<<<(C.D+255)/256, 256>>>(gb[0].d_hidden, d_embed_w, d_embed_s, cur_tok, C.D);
 
-    // Vocab logits
-    int lm_smem = ((C.D + 3) & ~3) * sizeof(int8_t) + 64;
-    gemv_w8<<<C.V, 128, lm_smem>>>(d_logits, d_norm_out, d_lmhead_w, d_lmhead_s, C.V, C.D);
-    KERNEL_CHECK();
+      for(int l=0; l<C.L; l++) {
+        int target_gpu = (l < 10) ? 0 : (l < 19 ? 1 : 2);
+        if (target_gpu >= n_gpus) target_gpu = n_gpus - 1;
+        int prev_gpu = (l > 0) ? ((l-1 < 10) ? 0 : (l-1 < 19 ? 1 : 2)) : 0;
+        if (prev_gpu >= n_gpus) prev_gpu = n_gpus - 1;
 
-    // Argmax
-    argmax_kernel<<<1, 256>>>(d_logits, d_next_tok, C.V);
-    KERNEL_CHECK();
+        if (target_gpu != prev_gpu) {
+            CUDA_CHECK(cudaMemcpy(gb[target_gpu].d_hidden, gb[prev_gpu].d_hidden, C.D * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        
+        cudaSetDevice(target_gpu);
+        float *h = gb[target_gpu].d_hidden, *n = gb[target_gpu].d_norm_out;
+        int8_t *xq = gb[target_gpu].d_x_q; float *xs = gb[target_gpu].d_x_scale;
+        float *q = gb[target_gpu].d_q,      *k = gb[target_gpu].d_k, *v = gb[target_gpu].d_v;
+        float *ao = gb[target_gpu].d_attn_out, *b = gb[target_gpu].d_buf;
+        float *gt = gb[target_gpu].d_gate, *up = gb[target_gpu].d_up;
 
-    CUDA_CHECK(cudaMemcpy(&cur_tok, d_next_tok, sizeof(int), cudaMemcpyDeviceToHost));
+        // Fused RMS + Quantize
+        rmsnorm_quant<<<1, 256>>>(xq, xs, n, h, lw[l].d_ln1, C.rms_eps, C.D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Use local scale for speed
+        float h_xs; CUDA_CHECK(cudaMemcpy(&h_xs, xs, sizeof(float), cudaMemcpyDeviceToHost));
 
-    // Debug: dump first few logits at t=0
-    if(t == 0) {
-      std::vector<float> h_log(20);
-      CUDA_CHECK(cudaMemcpy(h_log.data(), d_logits, 20*sizeof(float), cudaMemcpyDeviceToHost));
-      printf("  [dbg] logits[0..19]:");
-      for(int i=0;i<20;i++) printf(" %.2f", h_log[i]);
-      printf("\n");
-    }
-
-    // Loss/PPL tracking (cross-entropy of predicted logits vs next token)
-    if(t > 0) {
-      // loss against the token we just predicted
-      cross_entropy_loss<<<1, 256>>>(d_logits, cur_tok, d_loss, C.V);
-      KERNEL_CHECK();
-      float h_loss;
-      CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
-      total_loss += h_loss;
-      loss_count++;
-      if(t % 10 == 0 || t < 5) {
-        float avg_loss = total_loss / loss_count;
-        float ppl = expf(avg_loss);
-        printf("t=%d tok=%d loss=%.4f avg_loss=%.4f ppl=%.1f\n", t, cur_tok, h_loss, avg_loss, ppl);
-        continue;
+        gemv_w8_prequant<<<C.D, 128>>>(q, xq, h_xs, lw[l].d_wq, lw[l].d_sq, C.D, C.D);
+        gemv_w8_prequant<<<KVDh, 128>>>(k, xq, h_xs, lw[l].d_wk, lw[l].d_sk, KVDh, C.D);
+        gemv_w8_prequant<<<KVDh, 128>>>(v, xq, h_xs, lw[l].d_wv, lw[l].d_sv, KVDh, C.D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        if(lw[l].has_bq) add_bias_f<<<(C.D+255)/256,256>>>(q, lw[l].d_bq, C.D);
+        if(lw[l].has_bk) add_bias_f<<<(KVDh+255)/256,256>>>(k, lw[l].d_bk, KVDh);
+        if(lw[l].has_bv) add_bias_f<<<(KVDh+255)/256,256>>>(v, lw[l].d_bv, KVDh);
+        
+        rope_apply<<<C.H, C.Dh/2>>>(q, d_rope_cos[target_gpu], d_rope_sin[target_gpu], t, C.Dh);
+        rope_apply<<<C.KVH, C.Dh/2>>>(k, d_rope_cos[target_gpu], d_rope_sin[target_gpu], t, C.Dh);
+        kv_store<<<(KVDh+255)/256,256>>>(lw[l].d_Kc, lw[l].d_Vc, k, v, t, KVDh);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        attn_decode<<<C.H, C.Dh>>>(ao, q, lw[l].d_Kc, lw[l].d_Vc, t, C.Dh, C.KVH, inv_sqrt_dh);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // O Proj still needs a quant step or we keep it as is (O uses ao as input)
+        gemv_w8<<<C.D, 128, gemv_smem>>>(b, ao, lw[l].d_wo, lw[l].d_so, C.D, C.D);
+        add_inplace<<<(C.D+255)/256,256>>>(h, b, C.D);
+        
+        // MLP Part: Fused RMS + Quant
+        rmsnorm_quant<<<1, 256>>>(xq, xs, n, h, lw[l].d_ln2, C.rms_eps, C.D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(&h_xs, xs, sizeof(float), cudaMemcpyDeviceToHost));
+        
+        gemv_w8_prequant<<<C.F, 128>>>(gt, xq, h_xs, lw[l].d_wgate, lw[l].d_sgate, C.F, C.D);
+        gemv_w8_prequant<<<C.F, 128>>>(up, xq, h_xs, lw[l].d_wup,   lw[l].d_sup,  C.F, C.D);
+        
+        silu_gate_mul<<<(C.F+255)/256,256>>>(gt, gt, up, C.F);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Down projection
+        gemv_w8<<<C.D, 128, down_smem>>>(b, gt, lw[l].d_wdown, lw[l].d_sdown, C.D, C.F);
+        add_inplace<<<(C.D+255)/256,256>>>(h, b, C.D);
+        CUDA_CHECK(cudaDeviceSynchronize());
       }
+
+      int last_gpu = n_gpus - 1;
+      if (last_gpu != 0) CUDA_CHECK(cudaMemcpy(gb[0].d_hidden, gb[last_gpu].d_hidden, C.D * sizeof(float), cudaMemcpyDeviceToDevice));
+      cudaSetDevice(0);
+      
+      // Final Output Head: Fused RMS + Quant
+      rmsnorm_quant<<<1, 256>>>(gb[0].d_x_q, gb[0].d_x_scale, gb[0].d_norm_out, gb[0].d_hidden, d_lnf, C.rms_eps, C.D);
+      float head_xs; CUDA_CHECK(cudaMemcpy(&head_xs, gb[0].d_x_scale, sizeof(float), cudaMemcpyDeviceToHost));
+      gemv_w8_prequant<<<C.V, 128>>>(d_logits, gb[0].d_x_q, head_xs, d_lmhead_w, d_lmhead_s, C.V, C.D);
+      
+      argmax_kernel<<<1, 256>>>(d_logits, d_next_tok, C.V);
+      CUDA_CHECK(cudaMemcpy(&cur_tok, d_next_tok, sizeof(int), cudaMemcpyDeviceToHost));
+
+      float step_loss = 0.0f;
+      if (t > 0) {
+          cross_entropy_loss<<<1, 256>>>(d_logits, cur_tok, d_loss, C.V);
+          CUDA_CHECK(cudaMemcpy(&step_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
+          total_loss += step_loss; loss_count++;
+      }
+      char idbuf[64]; snprintf(idbuf, 64, "TokenID: %d", cur_tok);
+      send_telemetry(&telem, step_loss, t, gb[0].d_hidden, C.D, idbuf);
+      if(t == 0 || t % 10 == 0) printf("t=%d tok=%d\n", t, cur_tok);
     }
-    printf("t=%d tok=%d\n", t, cur_tok);
+    printf("> Generation complete.\n\n> "); fflush(stdout);
   }
-
-  auto gen_end = std::chrono::high_resolution_clock::now();
-  double gen_ms = std::chrono::duration<double,std::milli>(gen_end-gen_start).count();
-  double tps = (double)Tgen / (gen_ms / 1000.0);
-  float final_avg_loss = (loss_count > 0) ? total_loss / loss_count : 0.0f;
-  float final_ppl = expf(final_avg_loss);
-  printf("\n[*] Generated %d tokens in %.1f ms = %.1f tok/s\n", Tgen, gen_ms, tps);
-  printf("[*] Final avg_loss=%.4f ppl=%.1f\n", final_avg_loss, final_ppl);
-  printf("[*] Done.\n");
-
-  ldr.close_();
   return 0;
 }
 CUEOF
 
 # ═══════════════════════════════════════════════════════════════
-# PHASE 3: Ensure Dependencies
-# ═══════════════════════════════════════════════════════════════
-echo "[*] Checking Python deps..."
-"$PIP" install safetensors huggingface_hub numpy --quiet 2>/dev/null
+# PHASE 3: Skip (assume env ready)
 
 # ═══════════════════════════════════════════════════════════════
 # PHASE 4: Export Model (v3 format: Q8 weights + F32 norms/bias)
@@ -819,7 +1018,7 @@ fi
 # ═══════════════════════════════════════════════════════════════
 echo "[*] Compiling engine (sm_$SM, -O3, --use_fast_math)..."
 nvcc -O3 --use_fast_math -Xptxas -O3,-v -arch=sm_$SM \
-     /tmp/_dsi8_engine.cu -o "$ENGINE_BIN"
+     /tmp/_dsi8_engine.cu -o "$ENGINE_BIN" -lnvidia-ml
 
 # ═══════════════════════════════════════════════════════════════
 # PHASE 6: Run
@@ -829,4 +1028,4 @@ echo "  DeepSeek INT8 Persistent Decode Engine (Hybrid FP32/INT8)"
 echo "  Model: $MODEL_REPO"
 echo "  Binary: $MODEL_BIN"
 echo "================================================================="
-./"$ENGINE_BIN" "$MODEL_BIN"
+./"$ENGINE_BIN" "$MODEL_BIN" "$MODEL_REPO"

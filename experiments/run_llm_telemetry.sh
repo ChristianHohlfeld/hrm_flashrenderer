@@ -438,9 +438,10 @@ struct TelemetryPacket {
     float loss;
     float cos_sim;
     float euclid_dist;
-    float proj_x;
-    float proj_y;
-    float proj_z;
+    float proj_x, proj_y, proj_z;
+    float gpu_util[3];
+    float gpu_mem[3];
+    char prompt[64];
 };
 
 struct TelemetryCtx {
@@ -1788,6 +1789,7 @@ static void send_telemetry(TelemetryCtx* ctx, float loss, int step, float* d_gra
     last_x = h_proj[0]; last_y = h_proj[1]; last_z = h_proj[2];
 
     TelemetryPacket p;
+    std::memset(&p, 0, sizeof(p));
     p.step = (uint32_t)step;
     p.loss = loss;
     p.cos_sim = cos_sim;
@@ -1795,6 +1797,8 @@ static void send_telemetry(TelemetryCtx* ctx, float loss, int step, float* d_gra
     p.proj_x = h_proj[0];
     p.proj_y = h_proj[1];
     p.proj_z = h_proj[2];
+    // GPU stats not available in this script without NVML, sending 0s
+    std::strncpy(p.prompt, "llm_engine", 63);
 
     sendto(ctx->sock, &p, sizeof(p), 0, (struct sockaddr*)&ctx->addr, sizeof(ctx->addr));
 }

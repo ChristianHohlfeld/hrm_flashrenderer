@@ -340,21 +340,36 @@ DMODEL="${DMODEL:-256}"
 NHEAD="${NHEAD:-8}"
 NLAY="${NLAY:-6}"
 FFN="${FFN:-1024}"
-TMAX="${TMAX:-512}"
+TMAX="${TMAX:-8192}"
 BIN="${BIN:-llm_engine}"
 
 # If HF model requested, run the Python embedded script to process safetensors
 if [[ "$HF_MODEL" != "" ]]; then
   echo "[*] Bridging HuggingFace Model: $HF_MODEL to Elite INT32 pipeline..."
   cat > "$WORKDIR/hf_converter.py" <<'EOF'
-import os, sys, struct, hashlib
+import os, sys, struct, hashlib, glob
 try:
     import torch
     from huggingface_hub import snapshot_download
-    from safetensors.torch import load_file
+    from safetensors import safe_open
+    
+    def find_tensor(filename, tensor_name):
+        with safe_open(filename, framework="pt") as f:
+            if tensor_name in f.keys():
+                return f.get_tensor(tensor_name)
+        return None
+
 except ImportError:
     print("FATAL: Please install dependencies: pip install torch huggingface_hub safetensors")
     sys.exit(1)
+
+except ImportError:
+    print("FATAL: Please install dependencies: pip install numpy huggingface_hub safetensors")
+    sys.exit(1)
+
+with open("/tmp/deepseek_status.txt", "w") as f:
+    f.write(f"DOWNLOADING {sys.argv[1]}...")
+    
 repo_id = sys.argv[1]
 workdir = sys.argv[2]
 pair_k1 = int(sys.argv[3])
@@ -362,6 +377,9 @@ pair_k2 = int(sys.argv[4])
 index_bin_path = sys.argv[5]
 print(f"[*] Downloading metadata for {repo_id}...")
 model_path = snapshot_download(repo_id, allow_patterns=["*.safetensors", "config.json"])
+
+with open("/tmp/deepseek_status.txt", "w") as f:
+    f.write("LOADING TENSORS...")
 import json
 with open(os.path.join(model_path, "config.json")) as f:
     config = json.load(f)
@@ -391,35 +409,56 @@ if os.path.exists(ckpt_path):
     print(f"[*] Checkpoint {ckpt_path} already exists. Skipping tensor mapping.")
     sys.exit(0)
 print(f"[*] Mapping HuggingFace Safetensors to Elite C++ Layout...")
-tensors = {}
-for file in glob.glob(os.path.join(model_path, "*.safetensors")):
-    tensors.update(load_file(file))
+safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+
 # Reversible architecture requires Dhf = D/2.
 Dhf = D // 2
 def get_t(name, expected_shape=None):
-    if name not in tensors:
+    t_pt = None
+    for file in safetensors_files:
+        t_pt = find_tensor(file, name)
+        if t_pt is not None:
+            break
+            
+    if t_pt is None:
         print(f"Warning: {name} not found. Filling with zeros.")
         if expected_shape: return torch.zeros(expected_shape, dtype=torch.float32)
         return torch.zeros(1, dtype=torch.float32)
-    t = tensors[name].float()
+        
+    t = t_pt.float()
+    del t_pt
+    
     if expected_shape and list(t.shape) != list(expected_shape):
         print(f"Warning: {name} shape mismatch. Expected {expected_shape}, got {t.shape}")
         out = torch.zeros(expected_shape, dtype=torch.float32)
         slices = tuple(slice(0, min(d_out, d_in)) for d_out, d_in in zip(expected_shape, t.shape))
         out[slices] = t[slices]
+        del t
         return out
+        
     return t
+    
 def write_tensor(f, t):
     t_int = (t * 1000.0).to(torch.int32).flatten().numpy()
     f.write(t_int.tobytes())
+    del t_int
+    del t
 with open(index_bin_path, "rb") as idx_f:
     index_data = idx_f.read()
+
+pow2 = struct.unpack("<I", index_data[16:20])[0]
+
 with open(ckpt_path, "wb") as f:
     f.write(struct.pack("<II", 0x43484452, 11))
     f.write(struct.pack("<II", pair_k1, pair_k2))
     f.write(struct.pack("<IIIII", D, H, L, F, Tmax))
    
-    f.write(index_data[24:])
+    id2pair_len = pair_k1 * 2
+    id2pair2_len = pair_k2 * 4
+    f.write(index_data[24 : 24+id2pair_len])
+    f.write(index_data[24+id2pair_len : 24+id2pair_len+id2pair2_len])
+    f.write(struct.pack("<I", pow2))
+    f.write(index_data[24+id2pair_len+id2pair2_len:])
    
     print("[*] Quantizing and writing tensors (INT32)...")
     write_tensor(f, get_t("model.embed_tokens.weight", (v_pad, D)))
@@ -441,6 +480,14 @@ print(f"[*] Successfully built Elite INT32 checkpoint: {ckpt_path}")
 EOF
   python3 "$WORKDIR/hf_converter.py" "$HF_MODEL" "$WORKDIR" "$PAIR_K1" "$K2" "$INDEX_BIN"
   source "$WORKDIR/hf_env.sh"
+  # Cap TMAX for runtime to fit KV cache in available VRAM.
+  # The HF model reports max_position_embeddings=131072, but that would
+  # require ~128GB of KV cache across all layers. Cap to 8192 for 11GB GPUs.
+  MAX_RUNTIME_TMAX=8192
+  if [[ "$TMAX" -gt "$MAX_RUNTIME_TMAX" ]]; then
+    echo "[*] Capping TMAX from $TMAX to $MAX_RUNTIME_TMAX (VRAM-safe)"
+    TMAX="$MAX_RUNTIME_TMAX"
+  fi
 else
   HASH_STR="${BIN}_K${PAIR_K}_D${DMODEL}_H${NHEAD}_L${NLAY}_F${FFN}_T${TMAX}"
   CKPT_HASH=$(echo -n "$HASH_STR" | md5sum | head -c 8)
@@ -477,6 +524,12 @@ cat > "$TMP_CU_DIR/$CU" <<'CU'
 #include <algorithm>
 #include <iostream>
 #include <chrono>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #define CUDA_CHECK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
   std::fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} }while(0)
 #define KERNEL_CHECK() do{ cudaError_t e=cudaGetLastError(); if(e!=cudaSuccess){ \
@@ -520,6 +573,34 @@ static constexpr int F = FFN;
 static constexpr int Tmax = TMAX;
 static constexpr int FA_QT = 16;
 static constexpr int FA_KT = 128;
+struct TelemetryPacket {
+  uint32_t step;
+  float loss;
+  float cos_sim;
+  float euclid_dist;
+  float proj_x, proj_y, proj_z;
+  float gpu_util[3];
+  float gpu_mem[3];
+  char model_id[64];
+  char prompt[64];
+};
+static void send_telemetry(const TelemetryPacket& p){
+  static int sock = -1;
+  static struct sockaddr_in servaddr;
+  if(sock < 0){
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sock < 0) return;
+    std::memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    const char* target = std::getenv("TELEM_TARGET") ? std::getenv("TELEM_TARGET") : "127.0.0.1";
+    int port = std::getenv("TELEM_PORT") ? std::atoi(std::getenv("TELEM_PORT")) : 9999;
+    servaddr.sin_port = htons(port);
+    servaddr.sin_addr.s_addr = inet_addr(target);
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+  }
+  sendto(sock, &p, sizeof(p), 0, (const struct sockaddr*)&servaddr, sizeof(servaddr));
+}
 __device__ __constant__ int32_t exp_lut[4096];
 __global__ void init_exp_lut_kernel() {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -789,7 +870,7 @@ static void save_ckpt(const char* path, const PairIndex& pi, const int32_t* w){
   wf(f, w, weights_elems()*sizeof(int32_t));
   std::fclose(f);
 }
-static bool load_ckpt(const char* path, PairIndex* pi, std::vector<int32_t>* w){
+static bool load_ckpt(const char* path, PairIndex* pi, size_t* w_offset){
   FILE* f=std::fopen(path,"rb");
   if(!f) return false;
   uint32_t magic=ru32(f), ver=ru32(f);
@@ -808,8 +889,7 @@ static bool load_ckpt(const char* path, PairIndex* pi, std::vector<int32_t>* w){
   rf(f, pi->hkeys.data(), (size_t)table_size*sizeof(uint32_t));
   rf(f, pi->hvals.data(), (size_t)table_size*sizeof(uint16_t));
   pi->hmask = (uint32_t)table_size - 1u;
-  w->resize(weights_elems());
-  rf(f, w->data(), weights_elems()*sizeof(int32_t));
+  *w_offset = (size_t)std::ftell(f);
   std::fclose(f);
   return true;
 }
@@ -1365,19 +1445,27 @@ static void init_weights_cpu(std::vector<int32_t>& w, uint64_t seed){
   }
   for(int i=0;i<D;i++) W.gout[i]=1;
 }
-static void gpu_alloc(GPU* g,int dev,int B,int T){
+static void gpu_alloc(GPU* g,int dev,int B,int T, bool is_training){
   g->dev=dev; g->B=B; g->T=T; g->N=B*T;
   CUDA_CHECK(cudaSetDevice(dev));
   size_t Wn=weights_elems();
-  CUDA_CHECK(cudaMalloc(&g->dW, Wn*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&g->dG, Wn*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&g->mW, Wn*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&g->vW, Wn*sizeof(int32_t)));
-  CUDA_CHECK(cudaMemset(g->dG,0,Wn*sizeof(int32_t)));
-  CUDA_CHECK(cudaMemset(g->mW,0,Wn*sizeof(int32_t)));
-  CUDA_CHECK(cudaMemset(g->vW,0,Wn*sizeof(int32_t)));
-  pack_W(g->dW,&g->W); pack_W(g->dG,&g->G);
-  pack_W(g->mW,&g->MW); pack_W(g->vW,&g->VW);
+  
+  if (is_training) {
+    CUDA_CHECK(cudaMalloc(&g->dW, Wn*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&g->dG, Wn*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&g->mW, Wn*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&g->vW, Wn*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(g->dG,0,Wn*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(g->mW,0,Wn*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(g->vW,0,Wn*sizeof(int32_t)));
+  } else {
+    g->dW = nullptr;
+    g->dG = nullptr; g->mW = nullptr; g->vW = nullptr;
+  }
+  if (is_training) {
+    pack_W(g->dW,&g->W);
+    pack_W(g->dG,&g->G); pack_W(g->mW,&g->MW); pack_W(g->vW,&g->VW);
+  }
   CUDA_CHECK(cudaMalloc(&g->tok,(size_t)g->N*sizeof(uint16_t)));
   CUDA_CHECK(cudaMalloc(&g->tgt,(size_t)g->N*sizeof(uint16_t)));
   g->htok_h=nullptr; g->htgt_h=nullptr;
@@ -1459,10 +1547,11 @@ static void gpu_alloc(GPU* g,int dev,int B,int T){
     malw(&g->Hw.W2_rm[l],(size_t)F*(size_t)Dhf); malw(&g->Hw.W2_tr[l],(size_t)Dhf*(size_t)F);
   }
 }
-static void gpu_free(GPU* g){
+static void gpu_free(GPU* g, bool shared_dW){
   CUDA_CHECK(cudaSetDevice(g->dev));
   auto cf=[&](void* p){ if(p) cudaFree(p); };
-  cf(g->dW); cf(g->dG); cf(g->mW); cf(g->vW);
+  if (!shared_dW) cf(g->dW); 
+  cf(g->dG); cf(g->mW); cf(g->vW);
   cf(g->tok); cf(g->tgt);
   if(g->htok_h) CUDA_CHECK(cudaFreeHost(g->htok_h));
   if(g->htgt_h) CUDA_CHECK(cudaFreeHost(g->htgt_h));
@@ -1501,6 +1590,32 @@ static void gpu_free(GPU* g){
   g->graph_built=0;
   std::memset(g,0,sizeof(*g));
 }
+static void refresh_half_weights_chunk(GPU* g, const int32_t* srcW, size_t chunk_start, size_t chunk_len) {
+  CUDA_CHECK(cudaSetDevice(g->dev));
+  dim3 blk(16,16);
+
+  auto process_tensor = [&](int8_t* dst_rm, int8_t* dst_tr, size_t tensor_offset, size_t rows, size_t cols) {
+      size_t tensor_len = rows * cols;
+      size_t tensor_end = tensor_offset + tensor_len;
+      size_t chunk_end = chunk_start + chunk_len;
+      
+      // Check for overlap
+      if (chunk_end <= tensor_offset || chunk_start >= tensor_end) return;
+
+      // Find intersection
+      size_t overlap_start = std::max(chunk_start, tensor_offset);
+      size_t overlap_end = std::min(chunk_end, tensor_end);
+      
+      // If we don't have the full tensor in this chunk, we must just wait until we do, 
+      // or map offsets. Since our chunk is massive (32M INT32 = 128MB), most individual
+      // layers fit entirely inside one chunk. 
+      // To simplify, we enforce that our chunks are large enough to contain whole tensors at a time.
+  };
+
+  // We actually need the full mapping, so instead of chunking the kernel, we will map 
+  // the entire network offset-by-offset.
+}
+
 static void refresh_half_weights(GPU* g){
   CUDA_CHECK(cudaSetDevice(g->dev));
   dim3 blk(16,16);
@@ -1647,6 +1762,7 @@ static void broadcast_weights_from0(std::vector<GPU>& gpus){
 }
 static void train_step_device(GPU* g){
   int B=g->B, T=g->T, N=g->N;
+  int32_t invN = 1;
   size_t Wn=weights_elems();
   zero_i32<<<(int)((Wn+255)/256),256>>>(g->dG,(int)Wn); KERNEL_CHECK();
   dim3 blk2(16,16);
@@ -1904,68 +2020,73 @@ __global__ void argmax_stage2_int(const int32_t* maxv1, const int* maxi1, int* o
   if(tid==0) outi[0]=si[0];
 }
 struct ChatCtx {
-  WView W;
-  HW Hw;
-  int32_t* dW;
-  int32_t *x1,*x2,*y1,*y2,*n1,*tmp1,*tmp2,*u,*a,*logits;
-  int32_t *inv1;
-  int32_t *q,*k,*v,*o,*fout,*gout;
-  int32_t *xfull,*xnorm;
-  int32_t *invF;
-  int32_t *amaxv1;
-  int *amaxi1;
-  int *amaxi;
-  int32_t *sin_tbl, *cos_tbl;
-  int32_t *Kc[L];
-  int32_t *Vc[L];
+  GPU* engine_gpus;
+  int G;
+  int32_t *x1[8],*x2[8],*y1[8],*y2[8],*n1[8],*tmp1[8],*tmp2[8],*u[8],*a[8],*logits[8];
+  int32_t *inv1[8];
+  int32_t *q[8],*k[8],*v[8],*o[8],*fout[8],*gout[8];
+  int32_t *xfull[8],*xnorm[8];
+  int32_t *invF[8];
+  int32_t *amaxv1[8];
+  int *amaxi1[8];
+  int *amaxi[8];
+  int32_t *Kc[8][L];
+  int32_t *Vc[8][L];
 };
-static void chat_alloc(ChatCtx* c, const GPU& g0){
-  CUDA_CHECK(cudaSetDevice(0));
-  c->dW = g0.dW;
-  c->W = g0.W;
-  c->Hw = g0.Hw;
-  c->sin_tbl=g0.sin_tbl;
-  c->cos_tbl=g0.cos_tbl;
-  CUDA_CHECK(cudaMalloc(&c->x1, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->x2, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->y1, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->y2, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->n1, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->tmp1, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->tmp2, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->inv1, sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->q, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->k, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->v, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->o, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->fout, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->gout, Dhf*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->u, F*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->a, F*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->logits, V*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->xfull, D*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->xnorm, D*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->invF, sizeof(int32_t)));
-  int blocks=(V+255)/256;
-  CUDA_CHECK(cudaMalloc(&c->amaxv1, blocks*sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&c->amaxi1, blocks*sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&c->amaxi, sizeof(int)));
-  for(int l=0;l<L;l++){
-    CUDA_CHECK(cudaMalloc(&c->Kc[l], (size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
-    CUDA_CHECK(cudaMalloc(&c->Vc[l], (size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
-    CUDA_CHECK(cudaMemset(c->Kc[l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
-    CUDA_CHECK(cudaMemset(c->Vc[l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+static void chat_alloc(ChatCtx* c, std::vector<GPU>& gpus){
+  c->G = gpus.size();
+  c->engine_gpus = gpus.data();
+  for(int i=0; i<c->G; i++){
+    CUDA_CHECK(cudaSetDevice(gpus[i].dev));
+    CUDA_CHECK(cudaMalloc(&c->x1[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->x2[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->y1[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->y2[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->n1[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->tmp1[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->tmp2[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->inv1[i], sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->q[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->k[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->v[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->o[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->fout[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->gout[i], Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->u[i], F*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->a[i], F*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->logits[i], V*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->xfull[i], D*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->xnorm[i], D*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->invF[i], sizeof(int32_t)));
+    int blocks=(V+255)/256;
+    CUDA_CHECK(cudaMalloc(&c->amaxv1[i], blocks*sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&c->amaxi1[i], blocks*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&c->amaxi[i], sizeof(int)));
+    for(int l=0;l<L;l++){
+      int owner_g = (l * c->G) / L;
+      if(owner_g == i){
+        CUDA_CHECK(cudaMalloc(&c->Kc[i][l], (size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&c->Vc[i][l], (size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(c->Kc[i][l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(c->Vc[i][l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+      } else {
+        c->Kc[i][l] = nullptr;
+        c->Vc[i][l] = nullptr;
+      }
+    }
   }
 }
 static void chat_free(ChatCtx* c){
-  CUDA_CHECK(cudaSetDevice(0));
   auto cf=[&](void* p){ if(p) cudaFree(p); };
-  cf(c->x1); cf(c->x2); cf(c->y1); cf(c->y2); cf(c->n1); cf(c->tmp1); cf(c->tmp2); cf(c->inv1);
-  cf(c->q); cf(c->k); cf(c->v); cf(c->o); cf(c->fout); cf(c->gout);
-  cf(c->u); cf(c->a); cf(c->logits);
-  cf(c->xfull); cf(c->xnorm); cf(c->invF);
-  cf(c->amaxv1); cf(c->amaxi1); cf(c->amaxi);
-  for(int l=0;l<L;l++){ cf(c->Kc[l]); cf(c->Vc[l]); }
+  for(int i=0; i<c->G; i++){
+    CUDA_CHECK(cudaSetDevice(c->engine_gpus[i].dev));
+    cf(c->x1[i]); cf(c->x2[i]); cf(c->y1[i]); cf(c->y2[i]); cf(c->n1[i]); cf(c->tmp1[i]); cf(c->tmp2[i]); cf(c->inv1[i]);
+    cf(c->q[i]); cf(c->k[i]); cf(c->v[i]); cf(c->o[i]); cf(c->fout[i]); cf(c->gout[i]);
+    cf(c->u[i]); cf(c->a[i]); cf(c->logits[i]);
+    cf(c->xfull[i]); cf(c->xnorm[i]); cf(c->invF[i]);
+    cf(c->amaxv1[i]); cf(c->amaxi1[i]); cf(c->amaxi[i]);
+    for(int l=0;l<L;l++){ cf(c->Kc[i][l]); cf(c->Vc[i][l]); }
+  }
   std::memset(c,0,sizeof(*c));
 }
 __global__ void embed_one_int(int32_t* y1, int32_t* y2, const int32_t* wte, const int32_t* wpe, int id, int t){
@@ -2006,45 +2127,72 @@ __global__ void dp4a_gemv_vocab(int32_t* logits, const int32_t* x, const int8_t*
   logits[v]=acc;
 }
 static int chat_step(ChatCtx* c, int t, int tok_id){
-  embed_one_int<<<(D+255)/256,256>>>(c->y1, c->y2, c->W.wte, c->W.wpe, tok_id, t); KERNEL_CHECK();
+  int G = c->G;
+  
+  CUDA_CHECK(cudaSetDevice(c->engine_gpus[0].dev));
+  embed_one_int<<<(D+255)/256,256>>>(c->y1[0], c->y2[0], c->engine_gpus[0].W.wte, c->engine_gpus[0].W.wpe, tok_id, t); KERNEL_CHECK();
+  
+  int prev_g = 0;
   for(int l=0;l<L;l++){
-    rms1_int<Dhf><<<1,256>>>(c->n1, c->inv1, c->y2, c->W.gf[l]); KERNEL_CHECK();
-    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->q, c->n1, c->Hw.Wq_tr[l], Dhf, Dhf); KERNEL_CHECK();
-    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->k, c->n1, c->Hw.Wk_tr[l], Dhf, Dhf); KERNEL_CHECK();
-    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->v, c->n1, c->Hw.Wv_tr[l], Dhf, Dhf); KERNEL_CHECK();
+    int cur_g = (l * G) / L;
+    if (cur_g != prev_g) {
+      CUDA_CHECK(cudaStreamSynchronize(0));
+      CUDA_CHECK(cudaMemcpyPeer(c->y1[cur_g], c->engine_gpus[cur_g].dev, c->y1[prev_g], c->engine_gpus[prev_g].dev, Dhf*sizeof(int32_t)));
+      CUDA_CHECK(cudaMemcpyPeer(c->y2[cur_g], c->engine_gpus[cur_g].dev, c->y2[prev_g], c->engine_gpus[prev_g].dev, Dhf*sizeof(int32_t)));
+      CUDA_CHECK(cudaSetDevice(c->engine_gpus[cur_g].dev));
+      prev_g = cur_g;
+    }
+    
+    GPU& g = c->engine_gpus[cur_g];
+    int i = cur_g;
+
+    rms1_int<Dhf><<<1,256>>>(c->n1[i], c->inv1[i], c->y2[i], g.W.gf[l]); KERNEL_CHECK();
+    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->q[i], c->n1[i], g.Hw.Wq_tr[l], Dhf, Dhf); KERNEL_CHECK();
+    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->k[i], c->n1[i], g.Hw.Wk_tr[l], Dhf, Dhf); KERNEL_CHECK();
+    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->v[i], c->n1[i], g.Hw.Wv_tr[l], Dhf, Dhf); KERNEL_CHECK();
     dim3 rgrd((Dh/2+15)/16, H);
-    rope_apply_one_int<<<rgrd,16>>>(c->q, c->sin_tbl, c->cos_tbl, t); KERNEL_CHECK();
-    rope_apply_one_int<<<rgrd,16>>>(c->k, c->sin_tbl, c->cos_tbl, t); KERNEL_CHECK();
-    kv_store_int<<<(Dhf+255)/256,256>>>(c->Kc[l], c->Vc[l], c->k, c->v, t); KERNEL_CHECK();
-    attn_decode_one_int<<<H,32>>>(c->o, c->q, c->Kc[l], c->Vc[l], t); KERNEL_CHECK();
-    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->fout, c->o, c->Hw.Wo_tr[l], Dhf, Dhf); KERNEL_CHECK();
-    add2_int<<<(Dhf+255)/256,256>>>(c->y1, c->fout, Dhf); KERNEL_CHECK();
-    rms1_int<Dhf><<<1,256>>>(c->n1, c->inv1, c->y1, c->W.gg[l]); KERNEL_CHECK();
-    dp4a_gemv_tr_i8<<<(F+255)/256,256>>>(c->u, c->n1, c->Hw.W1_tr[l], F, Dhf); KERNEL_CHECK();
-    gelu_vec_int<<<(F+255)/256,256>>>(c->a, c->u, F); KERNEL_CHECK();
-    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->gout, c->a, c->Hw.W2_tr[l], Dhf, F); KERNEL_CHECK();
-    add2_int<<<(Dhf+255)/256,256>>>(c->y2, c->gout, Dhf); KERNEL_CHECK();
+    rope_apply_one_int<<<rgrd,16>>>(c->q[i], g.sin_tbl, g.cos_tbl, t); KERNEL_CHECK();
+    rope_apply_one_int<<<rgrd,16>>>(c->k[i], g.sin_tbl, g.cos_tbl, t); KERNEL_CHECK();
+    kv_store_int<<<(Dhf+255)/256,256>>>(c->Kc[i][l], c->Vc[i][l], c->k[i], c->v[i], t); KERNEL_CHECK();
+    attn_decode_one_int<<<H,32>>>(c->o[i], c->q[i], c->Kc[i][l], c->Vc[i][l], t); KERNEL_CHECK();
+    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->fout[i], c->o[i], g.Hw.Wo_tr[l], Dhf, Dhf); KERNEL_CHECK();
+    add2_int<<<(Dhf+255)/256,256>>>(c->y1[i], c->fout[i], Dhf); KERNEL_CHECK();
+    rms1_int<Dhf><<<1,256>>>(c->n1[i], c->inv1[i], c->y1[i], g.W.gg[l]); KERNEL_CHECK();
+    dp4a_gemv_tr_i8<<<(F+255)/256,256>>>(c->u[i], c->n1[i], g.Hw.W1_tr[l], F, Dhf); KERNEL_CHECK();
+    gelu_vec_int<<<(F+255)/256,256>>>(c->a[i], c->u[i], F); KERNEL_CHECK();
+    dp4a_gemv_tr_i8<<<(Dhf+127)/128,128>>>(c->gout[i], c->a[i], g.Hw.W2_tr[l], Dhf, F); KERNEL_CHECK();
+    add2_int<<<(Dhf+255)/256,256>>>(c->y2[i], c->gout[i], Dhf); KERNEL_CHECK();
   }
-  concat1_int<<<(D+255)/256,256>>>(c->xfull, c->y1, c->y2); KERNEL_CHECK();
-  rms1_int<D><<<1,256>>>(c->xnorm, c->invF, c->xfull, c->W.gout); KERNEL_CHECK();
-  dp4a_gemv_vocab<<<(V+255)/256,256>>>(c->logits, c->xnorm, c->Hw.Wout_tr); KERNEL_CHECK();
+
+  int last_g = prev_g;
+  if(last_g != 0) {
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    CUDA_CHECK(cudaMemcpyPeer(c->y1[0], c->engine_gpus[0].dev, c->y1[last_g], c->engine_gpus[last_g].dev, Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemcpyPeer(c->y2[0], c->engine_gpus[0].dev, c->y2[last_g], c->engine_gpus[last_g].dev, Dhf*sizeof(int32_t)));
+    CUDA_CHECK(cudaSetDevice(c->engine_gpus[0].dev));
+  }
+
+  GPU& g0 = c->engine_gpus[0];
+  concat1_int<<<(D+255)/256,256>>>(c->xfull[0], c->y1[0], c->y2[0]); KERNEL_CHECK();
+  rms1_int<D><<<1,256>>>(c->xnorm[0], c->invF[0], c->xfull[0], g0.W.gout); KERNEL_CHECK();
+  dp4a_gemv_vocab<<<(V+255)/256,256>>>(c->logits[0], c->xnorm[0], g0.Hw.Wout_tr); KERNEL_CHECK();
   int blocks=(V+255)/256;
-  argmax_stage1_int<<<blocks,256>>>(c->logits, c->amaxv1, c->amaxi1, V); KERNEL_CHECK();
-  argmax_stage2_int<<<1,256>>>(c->amaxv1, c->amaxi1, c->amaxi, blocks); KERNEL_CHECK();
+  argmax_stage1_int<<<blocks,256>>>(c->logits[0], c->amaxv1[0], c->amaxi1[0], V); KERNEL_CHECK();
+  argmax_stage2_int<<<1,256>>>(c->amaxv1[0], c->amaxi1[0], c->amaxi[0], blocks); KERNEL_CHECK();
   int next=0;
-  CUDA_CHECK(cudaMemcpy(&next, c->amaxi, sizeof(int), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(&next, c->amaxi[0], sizeof(int), cudaMemcpyDeviceToHost));
   if(next<0) next=0;
   if(next>=V) next=V-1;
   return next;
 }
-static void chat_repl(const PairIndex& pi, const std::vector<int32_t>& hostW, const char* ckpt_path, const char* prompt, bool do_measure){
-  CUDA_CHECK(cudaSetDevice(0));
-  GPU g0{};
-  gpu_alloc(&g0, 0, 1, 16);
-  CUDA_CHECK(cudaMemcpy(g0.dW, hostW.data(), hostW.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
-  refresh_half_weights(&g0);
+static void chat_repl(const PairIndex& pi, std::vector<GPU>& gpus, const char* ckpt_path, const char* prompt, bool do_measure){
   ChatCtx ctx{};
-  chat_alloc(&ctx, g0);
+  chat_alloc(&ctx, gpus);
+  
+  if(!gpus.empty()) {
+     // Peer access is now done centrally in main().
+  }
+
   std::vector<uint16_t> pre;
   if(prompt && prompt[0]) pre=encode_prompt(pi, std::string(prompt));
   int t=0;
@@ -2054,88 +2202,109 @@ static void chat_repl(const PairIndex& pi, const std::vector<int32_t>& hostW, co
     t++;
     if(t>=Tmax) break;
   }
-  std::fprintf(stderr,"[chat] commands: /reset /quit (greedy decode, incremental KV, generates up to 200 tokens)\n");
-  std::string line;
-  std::vector<uint8_t> output_buffer;
-  while(true){
-    std::fprintf(stderr,"> ");
-    std::fflush(stderr);
-    if(!std::getline(std::cin,line)) break;
-    if(line=="/quit") break;
-    if(line=="/reset"){
-      t=0;
-      for(int l=0;l<L;l++){
-        CUDA_CHECK(cudaMemset(ctx.Kc[l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(ctx.Vc[l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+  std::fprintf(stderr,"[chat] commands: /reset /quit (greedy decode, PIPELINE KV across GPUs, generates up to 200 tokens)\n");
+    std::string line;
+    bool has_external_prompt = false;
+    const char* prompt_file = "/tmp/deepseek_prompt.txt";
+    
+    while(true){
+      if(!has_external_prompt){
+        std::fprintf(stderr,"> ");
+        std::fflush(stderr);
       }
-      next=-1;
-      output_buffer.clear();
-      continue;
-    }
-    auto ids=encode_prompt(pi, line+"\n");
-    for(size_t i=0;i<ids.size();i++){
-      next = chat_step(&ctx, t, (int)ids[i]);
-      t++;
-      if(t>=Tmax) break;
-    }
-    if(t>=Tmax){ std::cout << "\n[ctx full]\n"; continue; }
-    int gen_max=200;
-    std::chrono::time_point<std::chrono::high_resolution_clock> tstart_chat;
-    if(do_measure) tstart_chat = std::chrono::high_resolution_clock::now();
-    for(int i=0;i<gen_max && t<Tmax;i++){
-      uint16_t out_id=(uint16_t)next;
-      std::vector<uint8_t> out;
-      decode_id(pi, out_id, out);
-      bool stop=false;
-      for(uint8_t b: out){
-        if(b=='\n') stop=true;
-        output_buffer.push_back(b);
-      }
-      bool complete = true;
-      if (!output_buffer.empty()) {
-        int trailing_bytes = 0;
-        for (int j = (int)output_buffer.size() - 1; j >= 0; j--) {
-          uint8_t b = output_buffer[j];
-          if ((b & 0xC0) == 0x80) {
-            trailing_bytes++;
-          } else {
-            if ((b & 0xE0) == 0xC0) complete = (trailing_bytes == 1);
-            else if ((b & 0xF0) == 0xE0) complete = (trailing_bytes == 2);
-            else if ((b & 0xF8) == 0xF0) complete = (trailing_bytes == 3);
-            else complete = true;
-            break;
+      
+      line = "";
+      // Poll external prompt file (from relay)
+      struct stat st;
+      if(stat(prompt_file, &st) == 0 && st.st_size > 0){
+        FILE* pf = std::fopen(prompt_file, "r");
+        if(pf){
+          char buf[1024];
+          if(std::fgets(buf, sizeof(buf), pf)) line = buf;
+          std::fclose(pf);
+          std::remove(prompt_file); // Consume it
+          if(!line.empty()) {
+            std::fprintf(stderr, "[external prompt] %s\n", line.c_str());
+            has_external_prompt = true;
           }
-          if (trailing_bytes > 3) { complete = true; break; }
         }
+      } else {
+        // Idle Heartbeat for UI "Alive" signal
+        TelemetryPacket p{};
+        p.step = (uint32_t)t;
+        std::strncpy(p.model_id, "DeepSeek-Elite (Pipeline)", 63);
+        std::strncpy(p.prompt, "SYSTEM_IDLE", 63);
+        send_telemetry(p);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
-      if (complete && !output_buffer.empty()) {
-        std::cout.write((const char*)output_buffer.data(), (std::streamsize)output_buffer.size());
+      
+      // Fallback to stdin if no external prompt
+      if(line.empty()){
+        // Non-blocking stdin check is tricky in standard C++, 
+        // but for now we'll just wait if we didn't get an external one.
+        // If the user wants REALTIME visualization, we should send breadcrumbs.
+        if(!std::getline(std::cin, line)) break;
+      }
+      
+      if(line=="/quit") break;
+      if(line=="/reset"){
+        t=0;
+        for(int i=0; i<ctx.G; i++){
+          CUDA_CHECK(cudaSetDevice(ctx.engine_gpus[i].dev));
+          for(int l=0;l<L;l++){
+            int g_target = (l * ctx.G) / L;
+            if (g_target == i) {
+              CUDA_CHECK(cudaMemset(ctx.Kc[i][l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+              CUDA_CHECK(cudaMemset(ctx.Vc[i][l],0,(size_t)Tmax*(size_t)Dhf*sizeof(int32_t)));
+            }
+          }
+        }
+        next=-1;
+        has_external_prompt = false;
+        continue;
+      }
+      
+      auto ids=encode_prompt(pi, line+"\n");
+      for(size_t i=0;i<ids.size();i++){
+        next = chat_step(&ctx, t, (int)ids[i]);
+        t++;
+        if(t>=Tmax) break;
+      }
+      if(t>=Tmax){ std::cout << "\n[ctx full]\n"; has_external_prompt=false; continue; }
+      
+      int gen_max=200;
+      std::chrono::time_point<std::chrono::high_resolution_clock> tstart_chat;
+      if(do_measure) tstart_chat = std::chrono::high_resolution_clock::now();
+      
+      for(int i=0;i<gen_max && t<Tmax;i++){
+        uint16_t out_id=(uint16_t)next;
+        
+        // TELEMETRY: Send packet for every generated token (the "thinking" visualization)
+        TelemetryPacket p{};
+        p.step = (uint32_t)t;
+        p.proj_x = 0; p.proj_y = 0; p.proj_z = (float)(out_id % 100); // Visual breadcrumb
+        std::strncpy(p.model_id, "DeepSeek-Elite (Pipeline)", 63);
+        // We overload prompt field with TokenID: text for the UI to decode and filter
+        std::snprintf(p.prompt, 63, "TokenID: %d", (int)out_id);
+        send_telemetry(p);
+
+        std::vector<uint8_t> out;
+        decode_id(pi, out_id, out);
+        bool stop=false;
+        for(uint8_t b: out){
+          if(b=='\n') stop=true;
+          std::cout << (char)b;
+        }
         std::cout.flush();
-        output_buffer.clear();
+
+        next = chat_step(&ctx, t, (int)out_id);
+        t++;
+        if(stop) break;
       }
-      next = chat_step(&ctx, t, (int)out_id);
-      t++;
-      if(stop){
-        if(do_measure){
-          auto tend = std::chrono::high_resolution_clock::now();
-          double elapsed = std::chrono::duration<double>(tend - tstart_chat).count();
-          std::fprintf(stderr, "\n[tok/s: %.1f]\n", (double)i / elapsed);
-        }
-        break;
-      }
+      std::cout << std::endl;
+      has_external_prompt = false;
     }
-    if(t>=Tmax){
-        if(do_measure){
-          auto tend = std::chrono::high_resolution_clock::now();
-          double elapsed = std::chrono::duration<double>(tend - tstart_chat).count();
-          std::cout << "\n[ctx full, tok/s: " << (double)gen_max / elapsed << "]\n";
-        } else {
-          std::cout << "\n[ctx full]\n";
-        }
-    }
-  }
   chat_free(&ctx);
-  gpu_free(&g0);
 }
 int main(int argc,char** argv){
   const char* data_path="tinyshakespeare.txt";
@@ -2179,10 +2348,10 @@ int main(int argc,char** argv){
   if(seq<16 || seq>Tmax) die("--seq out of range");
   auto bytes=read_file_bytes(data_path);
   PairIndex pi;
-  std::vector<int32_t> winit;
+  size_t ckpt_w_offset = 0;
   bool has_ckpt = false;
   if(!do_train || do_chat || do_continue){
-    has_ckpt = load_ckpt(ckpt_path, &pi, &winit);
+    has_ckpt = load_ckpt(ckpt_path, &pi, &ckpt_w_offset);
   }
   if(do_train && has_ckpt && !do_continue){
     die("ckpt exists: pass --continue or delete ckpt");
@@ -2190,17 +2359,10 @@ int main(int argc,char** argv){
   if(!has_ckpt){
     if(!load_index_v7(index_path, &pi)) pi = make_pair_index(bytes);
   }
-  std::vector<int32_t> hostW(weights_elems());
   if(has_ckpt) {
-    hostW=winit;
     if(!do_train) do_chat = true;
   }
-  else init_weights_cpu(hostW, seed);
   if(!do_train && !do_chat) do_train=true;
-  if(do_chat){
-    chat_repl(pi, hostW, ckpt_path, chat_prompt, do_measure);
-    return 0;
-  }
   auto ids = encode_ids(pi, bytes.data(), bytes.size());
   if(ids.size() < (size_t)seq+2) die("encoded too small");
   int devCount=0; CUDA_CHECK(cudaGetDeviceCount(&devCount));
@@ -2218,11 +2380,157 @@ int main(int argc,char** argv){
   while(sumB>batch){ for(int i=0;i<G && sumB>batch;i++){ if(Bi[(size_t)i]>1){ Bi[(size_t)i]--; sumB--; } } }
   while(sumB<batch){ for(int i=0;i<G && sumB<batch;i++){ Bi[(size_t)i]++; sumB++; } }
   std::vector<GPU> gpus((size_t)G);
-  for(int i=0;i<G;i++) gpu_alloc(&gpus[(size_t)i], i, Bi[(size_t)i], seq);
   for(int i=0;i<G;i++){
-    CUDA_CHECK(cudaSetDevice(i));
-    CUDA_CHECK(cudaMemcpy(gpus[(size_t)i].dW, hostW.data(), hostW.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
-    refresh_half_weights(&gpus[(size_t)i]);
+    gpu_alloc(&gpus[(size_t)i], i, Bi[(size_t)i], seq, do_train);
+  }
+  
+  if (G > 1) {
+    for(int i=0;i<G;i++){
+      for(int j=0;j<G;j++){
+        if(i==j) continue;
+        int can=0; cudaDeviceCanAccessPeer(&can, gpus[i].dev, gpus[j].dev);
+        if(can) {
+          cudaSetDevice(gpus[i].dev);
+          cudaDeviceEnablePeerAccess(gpus[j].dev, 0);
+        }
+      }
+    }
+  }
+  
+  if (has_ckpt) {
+    FILE* f=std::fopen(ckpt_path,"rb");
+    if(!f) die("reopen ckpt failed");
+    std::fseek(f, (long)ckpt_w_offset, SEEK_SET);
+
+    if (do_train) {
+      // Training mode: load all 24GB into contiguous device memory
+      std::vector<int32_t> chunk(32 * 1024 * 1024);
+      size_t total = weights_elems(), done = 0;
+      while(done < total){
+        size_t n = std::min(chunk.size(), total - done);
+        rf(f, chunk.data(), n*sizeof(int32_t));
+        for(int i=0;i<G;i++){
+          CUDA_CHECK(cudaSetDevice(i));
+          CUDA_CHECK(cudaMemcpy(gpus[(size_t)i].dW + done, chunk.data(), n*sizeof(int32_t), cudaMemcpyHostToDevice));
+        }
+        done += n;
+      }
+      for(int i=0;i<G;i++){ refresh_half_weights(&gpus[(size_t)i]); }
+    } else {
+      // Chat mode: No monolithic 24GB allocation on ANY GPU! Keep an exact structure traversal directly from host
+      // Since mapping requires matching the precise offsets of `pack_W`, we load layer by layer.
+      
+      auto read_and_cast = [&](int8_t* dst_rm, int8_t* dst_tr, size_t rows, size_t cols, GPU* sync_gpus, int num_g) {
+          size_t num_elems = rows * cols;
+          std::vector<int32_t> host_layer(num_elems);
+          rf(f, host_layer.data(), num_elems*sizeof(int32_t));
+          
+          for(int i=0; i<num_g; i++) {
+             GPU& g = sync_gpus[i];
+             CUDA_CHECK(cudaSetDevice(g.dev));
+             int32_t* d_tmp;
+             CUDA_CHECK(cudaMalloc(&d_tmp, num_elems*sizeof(int32_t)));
+             CUDA_CHECK(cudaMemcpy(d_tmp, host_layer.data(), num_elems*sizeof(int32_t), cudaMemcpyHostToDevice));
+             
+             dim3 blk(16,16);
+             dim3 grd((cols+15)/16, (rows+15)/16);
+             w_i32_to_i8_rm_tr<<<grd,blk>>>(dst_rm, dst_tr, d_tmp, rows, cols); 
+             KERNEL_CHECK();
+             
+             CUDA_CHECK(cudaStreamSynchronize(0));
+             CUDA_CHECK(cudaFree(d_tmp));
+          }
+      };
+
+      for(int i=0; i<G; i++) { CUDA_CHECK(cudaSetDevice(i)); gpus[i].W.wte=nullptr; gpus[i].W.Wout=nullptr; }
+
+      // We precisely replicate pack_W layout sequential reads
+      read_and_cast(gpus[0].Hw.wte_rm, gpus[0].Hw.wte_tr, Vpad, D, &gpus[0], 1); // wte only on GPU 0
+      std::fseek(f, (long)(Tmax*D*sizeof(int32_t)), SEEK_CUR); // wpe
+
+      for(int l=0; l<L; l++){
+        read_and_cast(gpus[0].Hw.Wq_rm[l], gpus[0].Hw.Wq_tr[l], Dhf, Dhf, &gpus[0], 1);
+        read_and_cast(gpus[0].Hw.Wk_rm[l], gpus[0].Hw.Wk_tr[l], Dhf, Dhf, &gpus[0], 1);
+        read_and_cast(gpus[0].Hw.Wv_rm[l], gpus[0].Hw.Wv_tr[l], Dhf, Dhf, &gpus[0], 1);
+        read_and_cast(gpus[0].Hw.Wo_rm[l], gpus[0].Hw.Wo_tr[l], Dhf, Dhf, &gpus[0], 1);
+        read_and_cast(gpus[0].Hw.W1_rm[l], gpus[0].Hw.W1_tr[l], F, Dhf, &gpus[0], 1);
+        read_and_cast(gpus[0].Hw.W2_rm[l], gpus[0].Hw.W2_tr[l], Dhf, F, &gpus[0], 1);
+        std::fseek(f, (long)(Dhf*sizeof(int32_t)), SEEK_CUR); // gf
+        std::fseek(f, (long)(Dhf*sizeof(int32_t)), SEEK_CUR); // gg
+        
+        // Push the int8 matrices initialized on GPU 0 to peer GPUs if they need them
+        for(int pg=1; pg<G; pg++) {
+           CUDA_CHECK(cudaSetDevice(pg));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wq_rm[l], gpus[pg].dev, gpus[0].Hw.Wq_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wk_rm[l], gpus[pg].dev, gpus[0].Hw.Wk_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wv_rm[l], gpus[pg].dev, gpus[0].Hw.Wv_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wo_rm[l], gpus[pg].dev, gpus[0].Hw.Wo_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W1_rm[l], gpus[pg].dev, gpus[0].Hw.W1_rm[l], gpus[0].dev, F*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W2_rm[l], gpus[pg].dev, gpus[0].Hw.W2_rm[l], gpus[0].dev, Dhf*F*sizeof(int8_t)));
+           
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wq_tr[l], gpus[pg].dev, gpus[0].Hw.Wq_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wk_tr[l], gpus[pg].dev, gpus[0].Hw.Wk_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wv_tr[l], gpus[pg].dev, gpus[0].Hw.Wv_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wo_tr[l], gpus[pg].dev, gpus[0].Hw.Wo_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W1_tr[l], gpus[pg].dev, gpus[0].Hw.W1_tr[l], gpus[0].dev, F*Dhf*sizeof(int8_t)));
+           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W2_tr[l], gpus[pg].dev, gpus[0].Hw.W2_tr[l], gpus[0].dev, Dhf*F*sizeof(int8_t)));
+        }
+      }
+      
+      std::fseek(f, (long)(D*sizeof(int32_t)), SEEK_CUR); // gout
+      read_and_cast(gpus[0].Hw.Wout_rm, gpus[0].Hw.Wout_tr, D, Vpad, &gpus[0], 1); // Wout only on GPU 0
+      
+      // Need to populate the FP32 normalizer arrays too
+      std::fseek(f, (long)ckpt_w_offset, SEEK_SET);
+      std::vector<int32_t> float_layer;
+      
+      // read wte
+      float_layer.resize(Vpad*D); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
+      CUDA_CHECK(cudaSetDevice(0));
+      CUDA_CHECK(cudaMalloc(&gpus[0].W.wte, Vpad*D*sizeof(int32_t)));
+      CUDA_CHECK(cudaMemcpy(gpus[0].W.wte, float_layer.data(), float_layer.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+      
+      // read wpe
+      float_layer.resize(Tmax*D); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
+      CUDA_CHECK(cudaMalloc(&gpus[0].W.wpe, Tmax*D*sizeof(int32_t)));
+      CUDA_CHECK(cudaMemcpy(gpus[0].W.wpe, float_layer.data(), float_layer.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+      
+      for(int l=0; l<L; l++){
+        std::fseek(f, (long)(Dhf*Dhf*4 + F*Dhf*2)*sizeof(int32_t), SEEK_CUR);
+        
+        float_layer.resize(Dhf); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
+        for(int pg=0; pg<G; pg++) {
+           CUDA_CHECK(cudaSetDevice(pg)); CUDA_CHECK(cudaMalloc(&gpus[pg].W.gf[l], Dhf*sizeof(int32_t)));
+           CUDA_CHECK(cudaMemcpy(gpus[pg].W.gf[l], float_layer.data(), Dhf*sizeof(int32_t), cudaMemcpyHostToDevice));
+        }
+        
+        float_layer.resize(Dhf); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
+        for(int pg=0; pg<G; pg++) {
+           CUDA_CHECK(cudaSetDevice(pg)); CUDA_CHECK(cudaMalloc(&gpus[pg].W.gg[l], Dhf*sizeof(int32_t)));
+           CUDA_CHECK(cudaMemcpy(gpus[pg].W.gg[l], float_layer.data(), Dhf*sizeof(int32_t), cudaMemcpyHostToDevice));
+        }
+      }
+      
+      float_layer.resize(D); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
+      CUDA_CHECK(cudaSetDevice(0)); CUDA_CHECK(cudaMalloc(&gpus[0].W.gout, D*sizeof(int32_t)));
+      CUDA_CHECK(cudaMemcpy(gpus[0].W.gout, float_layer.data(), float_layer.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+    }
+    std::fclose(f);
+  } else {
+    std::vector<int32_t> hostW;
+    hostW.resize(weights_elems());
+    init_weights_cpu(hostW, seed);
+    for(int i=0;i<G;i++){
+      if (i==0 || do_train) {
+        CUDA_CHECK(cudaSetDevice(i));
+        CUDA_CHECK(cudaMemcpy(gpus[(size_t)i].dW, hostW.data(), hostW.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+      }
+    }
+    for(int i=0;i<G;i++){ refresh_half_weights(&gpus[(size_t)i]); }
+  }
+  if(do_chat){
+    chat_repl(pi, gpus, ckpt_path, chat_prompt, do_measure);
+    return 0;
   }
   if(use_graph){
     for(int i=0;i<G;i++){
@@ -2274,17 +2582,19 @@ int main(int argc,char** argv){
     }
     if(save_every>0 && (step%save_every)==0){
       CUDA_CHECK(cudaSetDevice(0));
-      CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
-      save_ckpt(ckpt_path, pi, hostW.data());
+      std::vector<int32_t> trainW(weights_elems());
+      CUDA_CHECK(cudaMemcpy(trainW.data(), gpus[0].dW, trainW.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+      save_ckpt(ckpt_path, pi, trainW.data());
       std::printf("[*] saved: %s\n", ckpt_path);
       std::fflush(stdout);
     }
   }
   CUDA_CHECK(cudaSetDevice(0));
-  CUDA_CHECK(cudaMemcpy(hostW.data(), gpus[0].dW, hostW.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
-  save_ckpt(ckpt_path, pi, hostW.data());
+  std::vector<int32_t> finalW(weights_elems());
+  CUDA_CHECK(cudaMemcpy(finalW.data(), gpus[0].dW, finalW.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+  save_ckpt(ckpt_path, pi, finalW.data());
   std::printf("[*] saved final: %s\n", ckpt_path);
-  for(int i=0;i<G;i++) gpu_free(&gpus[(size_t)i]);
+  for(int i=0;i<G;i++) gpu_free(&gpus[(size_t)i], (i>0 && !do_train));
   return 0;
 }
 CU
@@ -2341,12 +2651,14 @@ if "MEGA_KERNEL_PATCH_v1" not in s:
         s = s[:m.start()] + head + body + tail + s[m.end():]
     p.write_text(s, encoding="utf-8")
 PY
+echo "COMPILING C++ ENGINE (NVCC)..." > "/tmp/deepseek_status.txt"
 echo "[*] Building: $BIN (sm_75)"
 nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread -lineinfo --expt-relaxed-constexpr \
   -DPAIR_K="$PAIR_K" -DPAIR_K1="$PAIR_K1" -DVCHUNK="$VCHUNK" -DDMODEL="$DMODEL" -DNHEAD="$NHEAD" -DNLAY="$NLAY" -DFFN="$FFN" -DTMAX="$TMAX" \
   "$TMP_CU_DIR/$CU" -o "$TMP_CU_DIR/temp_bin"
 mv "$TMP_CU_DIR/temp_bin" "$BIN"
 rm -rf "$TMP_CU_DIR"
+echo "ENGINE ONLINE" > "/tmp/deepseek_status.txt"
 echo
 echo "================================================================="
 echo " Run Settings (Hash: $CKPT_HASH)"
