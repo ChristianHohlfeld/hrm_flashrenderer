@@ -430,11 +430,6 @@ IMPORTANT:
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 using namespace nvcuda;
 
@@ -452,29 +447,7 @@ struct TelemetryCtx {
     int sock;
     struct sockaddr_in addr;
     float* d_proj_matrix;
-    float* d_prev_grad;
-    float* d_curr_grad;
-    uint32_t step;
-    bool enabled;
-};
-
-
-struct TelemetryPacket {
-    uint32_t step;
-    float loss;
-    float cos_sim;
-    float euclid_dist;
-    float proj_x;
-    float proj_y;
-    float proj_z;
-};
-
-struct TelemetryCtx {
-    int sock;
-    struct sockaddr_in addr;
-    float* d_proj_matrix;
-    float* d_prev_grad;
-    float* d_curr_grad;
+    float* d_proj_result;
     uint32_t step;
     bool enabled;
 };
@@ -1733,6 +1706,7 @@ struct GPU {
   // device-side scalar loss mean (written by loss_reduce_2)
   float *loss_mean = nullptr;
 
+  TelemetryCtx telem;
 };
 
 static void init_weights_cpu(std::vector<float>& w, uint64_t seed){
@@ -1743,6 +1717,86 @@ static void init_weights_cpu(std::vector<float>& w, uint64_t seed){
     for(int i=0;i<Dhf;i++){ W.gf[l][i]=1.f; W.gg[l][i]=1.f; }
   }
   for(int i=0;i<D;i++) W.gout[i]=1.f;
+}
+
+
+__global__ void random_project_3d_kernel(const float* grad, float* proj, const float* matrix, int D) {
+    int dim = blockIdx.x; // 0, 1, or 2
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        sum += grad[i] * matrix[dim * D + i];
+    }
+    atomicAdd(&proj[dim], sum);
+}
+
+static void init_telemetry(TelemetryCtx* ctx, int step_init) {
+    const char* enable = std::getenv("TELEM_ENABLE");
+    if (!enable || std::string(enable) != "1") {
+        ctx->enabled = false;
+        return;
+    }
+    const char* port_s = std::getenv("TELEM_PORT");
+    int port = port_s ? std::atoi(port_s) : 9999;
+    const char* target = std::getenv("TELEM_TARGET");
+    if (!target) target = "127.0.0.1";
+
+    ctx->sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ctx->sock < 0) { ctx->enabled = false; return; }
+    
+    ctx->addr.sin_family = AF_INET;
+    ctx->addr.sin_port = htons(port);
+    ctx->addr.sin_addr.s_addr = inet_addr(target);
+    
+    ctx->step = step_init;
+    ctx->enabled = true;
+
+    size_t Wn = weights_floats();
+    CUDA_CHECK(cudaMalloc(&ctx->d_proj_matrix, 3 * Wn * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_proj_result, 3 * sizeof(float)));
+
+    // Initialize projection matrix with random normal-ish values
+    std::vector<float> h_matrix(3 * Wn);
+    RNG r{42};
+    for (auto& v : h_matrix) v = frand11(&r);
+    CUDA_CHECK(cudaMemcpy(ctx->d_proj_matrix, h_matrix.data(), h_matrix.size() * sizeof(float), cudaMemcpyHostToDevice));
+    
+    std::printf("[*] Telemetry enabled on port %d\n", port);
+}
+
+static void send_telemetry(TelemetryCtx* ctx, float loss, int step, float* d_grad) {
+    if (!ctx->enabled) return;
+    
+    size_t Wn = weights_floats();
+    float h_proj[3] = {0,0,0};
+
+    CUDA_CHECK(cudaMemset(ctx->d_proj_result, 0, 3 * sizeof(float)));
+    random_project_3d_kernel<<<3, 256>>>(d_grad, ctx->d_proj_result, ctx->d_proj_matrix, (int)Wn);
+    CUDA_CHECK(cudaMemcpy(h_proj, ctx->d_proj_result, 3 * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Calculate Cosine Similarity and Euclid Distance
+    static float last_x = 0, last_y = 0, last_z = 0;
+    float dx = h_proj[0] - last_x;
+    float dy = h_proj[1] - last_y;
+    float dz = h_proj[2] - last_z;
+    float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+    
+    float dot = h_proj[0]*last_x + h_proj[1]*last_y + h_proj[2]*last_z;
+    float mag1 = std::sqrt(h_proj[0]*h_proj[0] + h_proj[1]*h_proj[1] + h_proj[2]*h_proj[2]);
+    float mag2 = std::sqrt(last_x*last_x + last_y*last_y + last_z*last_z);
+    float cos_sim = (mag1 > 1e-9 && mag2 > 1e-9) ? (dot / (mag1 * mag2)) : 1.0f;
+
+    last_x = h_proj[0]; last_y = h_proj[1]; last_z = h_proj[2];
+
+    TelemetryPacket p;
+    p.step = (uint32_t)step;
+    p.loss = loss;
+    p.cos_sim = cos_sim;
+    p.euclid_dist = dist;
+    p.proj_x = h_proj[0];
+    p.proj_y = h_proj[1];
+    p.proj_z = h_proj[2];
+
+    sendto(ctx->sock, &p, sizeof(p), 0, (struct sockaddr*)&ctx->addr, sizeof(ctx->addr));
 }
 
 static void gpu_alloc(GPU* g,int dev,int B,int T){
@@ -2837,6 +2891,8 @@ int main(int argc,char** argv){
     refresh_half_weights(&gpus[(size_t)i]);
   }
 
+  init_telemetry(&gpus[0].telem, 0);
+
 
 // Build CUDA Graphs once up-front (so the training loop has no "warmup step").
 if(use_graph){
@@ -2871,6 +2927,8 @@ if(use_graph){
       th.emplace_back([&,i](){ losses[(size_t)i]=train_step(&gpus[(size_t)i], ids, step, base + (int64_t)i*9973LL, seed, use_graph); });
     }
     for(auto& t: th) t.join();
+
+    send_telemetry(&gpus[0].telem, losses[0], step, gpus[0].dG);
 
     if(G>1){
       if(!p2p_allreduce(gpus)) host_allreduce(gpus);
