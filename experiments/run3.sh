@@ -2238,12 +2238,19 @@ static void chat_repl(const PairIndex& pi, std::vector<GPU>& gpus, const char* c
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
       
-      // Fallback to stdin if no external prompt
+      // Fallback to stdin if no external prompt (and stdin hasn't hit EOF)
       if(line.empty()){
-        // Non-blocking stdin check is tricky in standard C++, 
-        // but for now we'll just wait if we didn't get an external one.
-        // If the user wants REALTIME visualization, we should send breadcrumbs.
-        if(!std::getline(std::cin, line)) break;
+        static bool stdin_eof = false;
+        if(!stdin_eof){
+          if(!std::getline(std::cin, line)){
+            stdin_eof = true;
+            // stdin closed (nohup/background mode) — keep polling external prompts
+            continue;
+          }
+        } else {
+          // stdin is closed, just keep polling external prompt file
+          continue;
+        }
       }
       
       if(line=="/quit") break;
