@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>LLM Telemetry 3D</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            color: #00ff00;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+        }
+
+        #overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            pointer-events: none;
+        }
+
+        .stat {
+            margin-bottom: 5px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 5px;
+            border-left: 3px solid #00ff00;
+        }
+
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 100;
+            pointer-events: auto;
+        }
+
+        button {
+            background: #000;
+            color: #00ff00;
+            border: 1px solid #00ff00;
+            padding: 10px 20px;
+            cursor: pointer;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #00ff00;
+            color: #000;
+        }
+
+        #prompt-window {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 300px;
+            height: 400px;
+            background: rgba(0, 5, 0, 0.9);
+            border: 1px solid #00ff00;
+            padding: 10px;
+            overflow-y: auto;
+            z-index: 100;
+            font-size: 11px;
+        }
+
+        .prompt-entry {
+            border-bottom: 1px solid #003300;
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+        }
+
+        .prompt-text {
+            color: #88ff88;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="overlay">
+        <div class="stat">STEP: <span id="val-step">0</span></div>
+        <div class="stat">LOSS: <span id="val-loss">0.000</span></div>
+        <div class="stat">COS_SIM: <span id="val-cos">0.000</span></div>
+        <div class="stat">SPEED: <span id="val-speed">0.000</span></div>
+    </div>
+    <div id="prompt-window">
+        <div>-- PROMPT HISTORY --</div>
+        <div id="prompt-list"></div>
+    </div>
+    <div id="controls">
+        <button id="btn-stop">Stop Training</button>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const group = new THREE.Group();
+        scene.add(group);
+
+        const material = new THREE.LineBasicMaterial({ vertexColors: true });
+        const geometry = new THREE.BufferGeometry();
+        const line = new THREE.Line(geometry, material);
+        group.add(line);
+
+        const positions = [];
+        const colors = [];
+        camera.position.z = 5;
+
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            document.getElementById('val-step').innerText = data.step;
+            document.getElementById('val-loss').innerText = data.loss.toFixed(4);
+            document.getElementById('val-cos').innerText = data.cos_sim.toFixed(4);
+            document.getElementById('val-speed').innerText = data.euclid_dist.toFixed(4);
+
+            positions.push(data.proj_x, data.proj_y, data.proj_z);
+
+            const color = new THREE.Color();
+            color.setHSL(Math.max(0, 0.3 - data.loss / 20), 1.0, 0.5);
+            colors.push(color.r, color.g, color.b);
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+            updateCamera(data.proj_x, data.proj_y, data.proj_z);
+        };
+
+        function updateCamera(x, y, z) {
+            const lookAt = new THREE.Vector3(x, y, z);
+            camera.lookAt(lookAt);
+        }
+
+        document.getElementById('btn-stop').onclick = () => {
+            fetch('/stop', { method: 'POST' });
+        };
+
+        function animate() {
+            requestAnimationFrame(animate);
+            group.rotation.y += 0.002;
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+
+</html>
