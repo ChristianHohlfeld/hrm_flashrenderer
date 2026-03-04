@@ -2207,14 +2207,13 @@ static void chat_repl(const PairIndex& pi, std::vector<GPU>& gpus, const char* c
     bool has_external_prompt = false;
     const char* prompt_file = "/tmp/deepseek_prompt.txt";
     
+    // Detect if stdin is available (interactive mode) or closed (nohup/background mode)
+    bool interactive_mode = !std::cin.eof() && std::cin.good();
+    
     while(true){
-      if(!has_external_prompt){
-        std::fprintf(stderr,"> ");
-        std::fflush(stderr);
-      }
-      
       line = "";
-      // Poll external prompt file (from relay)
+      
+      // Check external prompt file first (works in both modes)
       struct stat st;
       if(stat(prompt_file, &st) == 0 && st.st_size > 0){
         FILE* pf = std::fopen(prompt_file, "r");
@@ -2224,31 +2223,31 @@ static void chat_repl(const PairIndex& pi, std::vector<GPU>& gpus, const char* c
           std::fclose(pf);
           std::remove(prompt_file); // Consume it
           if(!line.empty()) {
+            // Strip trailing newline
+            while(!line.empty() && (line.back()=='\n' || line.back()=='\r')) line.pop_back();
             std::fprintf(stderr, "[external prompt] %s\n", line.c_str());
-            has_external_prompt = true;
           }
         }
-      } else {
-        // Idle Heartbeat for UI "Alive" signal
-        TelemetryPacket p{};
-        p.step = (uint32_t)t;
-        std::strncpy(p.model_id, "DeepSeek-Elite (Pipeline)", 63);
-        std::strncpy(p.prompt, "SYSTEM_IDLE", 63);
-        send_telemetry(p);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
       
-      // Fallback to stdin if no external prompt (and stdin hasn't hit EOF)
+      // If no external prompt, either read stdin or poll
       if(line.empty()){
-        static bool stdin_eof = false;
-        if(!stdin_eof){
+        if(interactive_mode){
+          std::fprintf(stderr,"> ");
+          std::fflush(stderr);
           if(!std::getline(std::cin, line)){
-            stdin_eof = true;
-            // stdin closed (nohup/background mode) — keep polling external prompts
+            interactive_mode = false; // stdin closed, switch to polling
+            std::fprintf(stderr, "[stdin closed, switching to external prompt polling]\n");
             continue;
           }
         } else {
-          // stdin is closed, just keep polling external prompt file
+          // Background mode: send heartbeat and sleep
+          TelemetryPacket p{};
+          p.step = (uint32_t)t;
+          std::strncpy(p.model_id, "DeepSeek-Elite (Pipeline)", 63);
+          std::strncpy(p.prompt, "SYSTEM_IDLE", 63);
+          send_telemetry(p);
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
           continue;
         }
       }
