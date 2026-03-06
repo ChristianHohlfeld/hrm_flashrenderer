@@ -7,8 +7,6 @@ This repository has two separate goals:
 1. **Practical bounded-context inference** with HRM retrieval, where retrieval/indexing stays off-GPU and the LLM only sees a tightly bounded prompt.
 2. **Experimental CUDA engine work** under `experiments/`, where custom kernels, deterministic indexing, benchmark wrappers, and checkpointed training/chat flows are compared directly.
 
-This README is written as a release README: clear, direct, and operational.
-
 ---
 
 ## What the repo contains
