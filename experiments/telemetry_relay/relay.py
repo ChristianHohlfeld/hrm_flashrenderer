@@ -38,6 +38,8 @@ async def udp_receiver(app):
             data, addr = sock.recvfrom(1024)
             data_len = len(data)
             packet = None
+            if data_len in [116, 180, 348]:
+                print(f"[*] Received telemetry packet, len={data_len}", flush=True)
             
             if data_len == 116:
                 # Legacy / run_llm_telemetry.sh style (1 GPU)
@@ -79,37 +81,45 @@ async def udp_receiver(app):
                 # Enrich with GPU stats from NVML (Real Load Spread)
                 g_utils = []
                 g_mems = []
-                for i in range(min(3, GPU_COUNT)):
+                g_names = []
+                g_mems_total = []
+                for i in range(min(4, GPU_COUNT)): # Support up to 4 GPUs to match UI
                     try:
                         handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                         util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        name = pynvml.nvmlDeviceGetName(handle)
+                        if isinstance(name, bytes):
+                            name = name.decode('utf-8', errors='ignore')
                         g_utils.append(float(util.gpu))
                         g_mems.append(float(mem.used) / 1024 / 1024) # MB
+                        g_mems_total.append(float(mem.total) / 1024 / 1024)
+                        g_names.append(name)
                     except:
-                        g_utils.append(0.0)
-                        g_mems.append(0.0)
-                
-                # Pad to 3
-                while len(g_utils) < 3: g_utils.append(0.0)
-                while len(g_mems) < 3: g_mems.append(0.0)
+                        pass
                 
                 packet["gpu_util"] = g_utils
                 packet["gpu_mem"] = g_mems
+                packet["gpu_names"] = g_names
+                packet["gpu_mem_total"] = g_mems_total
                 
                 # Token Decoding and SPAM filtering
                 prompt_text = packet.get("prompt", "")
-                token_id = packet.get("step", 0) # Often overloaded or 0
-                is_system = prompt_text in ["SYSTEM_IDLE", "AWAITING_PROMPT", "llm_engine"] or prompt_text.startswith("TokenID:")
+                is_system = prompt_text in ["SYSTEM_IDLE", "AWAITING_PROMPT", "llm_engine"]
                 
                 token_text = ""
-                if not is_system and TOKENIZER and token_id > 0:
+                if prompt_text.startswith("TokenID:"):
                     try:
-                        token_text = TOKENIZER.decode([token_id])
+                        token_id = int(prompt_text.split(":")[1].strip())
+                        if TOKENIZER:
+                            token_text = TOKENIZER.decode([token_id])
+                        else:
+                            token_text = f"[{token_id}]"
+                        packet["token_text"] = token_text
+                        is_system = False
                     except:
-                        token_text = f"[{token_id}]"
-                
-                packet["token_text"] = token_text
+                        pass
+
                 packet["is_system"] = is_system
                 
                 msg = json.dumps(packet)
@@ -166,19 +176,22 @@ async def heartbeat(app):
                 
             g_utils = []
             g_mems = []
-            for i in range(min(3, GPU_COUNT)):
+            g_names = []
+            g_mems_total = []
+            for i in range(min(4, GPU_COUNT)):
                 try:
                     handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                     util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                     mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    name = pynvml.nvmlDeviceGetName(handle)
+                    if isinstance(name, bytes):
+                        name = name.decode('utf-8', errors='ignore')
                     g_utils.append(float(util.gpu))
                     g_mems.append(float(mem.used) / 1024 / 1024)
+                    g_mems_total.append(float(mem.total) / 1024 / 1024)
+                    g_names.append(name)
                 except:
-                    g_utils.append(0.0)
-                    g_mems.append(0.0)
-            
-            while len(g_utils) < 3: g_utils.append(0.0)
-            while len(g_mems) < 3: g_mems.append(0.0)
+                    pass
             
             status_msg = "ONLINE (WS_ACT)"
             if os.path.exists("/tmp/deepseek_status.txt"):
@@ -192,6 +205,7 @@ async def heartbeat(app):
                 "step": 0, "loss": 0, "cos_sim": 0, "euclid_dist": 0,
                 "proj_x": 0, "proj_y": 0, "proj_z": 0,
                 "gpu_util": g_utils, "gpu_mem": g_mems,
+                "gpu_names": g_names, "gpu_mem_total": g_mems_total,
                 "cpu_util": psutil.cpu_percent(),
                 "ram_util": psutil.virtual_memory().percent,
                 "model_id": "System Monitor",

@@ -5,7 +5,9 @@ need(){ command -v "$1" >/dev/null 2>&1 || { echo "FATAL: $1 not found"; exit 1;
 need nvcc || { echo "FATAL: nvcc not found (install CUDA toolkit)"; exit 1; }
 need g++ || { echo "FATAL: g++ not found (sudo apt install build-essential)"; exit 1; }
 need curl || { echo "FATAL: curl not found"; exit 1; }
-need python3 || { echo "FATAL: python3 not found"; exit 1; }
+PY="/home/chris/myenv2/bin/python"
+if [ ! -f "$PY" ]; then PY="python3"; fi
+need "$PY" || { echo "FATAL: $PY not found"; exit 1; }
 
 absify_inputs() {
   local s="$1" out="" part
@@ -343,142 +345,153 @@ FFN="${FFN:-1024}"
 TMAX="${TMAX:-8192}"
 BIN="${BIN:-llm_engine}"
 
+# =============================================================================
+# Handle --force-new (ensure script knows which checkpoint to delete)
+# =============================================================================
+# In --hf mode, ckpt name is derived from hf parameters. For now, let's use a 
+# simple manual check or let the hf_converter handle it.
+# Actually, the most robust way is to delete ANY matching ckpt pattern if force-new is passed.
+if [[ $FORCE_NEW -eq 1 ]]; then
+    echo "[*] --force-new passed. Clearing existing checkpoints for this BIN..."
+    rm -f "${WORKDIR}/ckpt_${BIN}"_*.bin
+fi
+
 # If HF model requested, run the Python embedded script to process safetensors
 if [[ "$HF_MODEL" != "" ]]; then
   echo "[*] Bridging HuggingFace Model: $HF_MODEL to Elite INT32 pipeline..."
   cat > "$WORKDIR/hf_converter.py" <<'EOF'
-import os, sys, struct, hashlib, glob
-try:
-    import torch
-    from huggingface_hub import snapshot_download
-    from safetensors import safe_open
-    
-    def find_tensor(filename, tensor_name):
+import os, sys, struct, hashlib, glob, json
+import torch
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+
+def find_tensor(filename, tensor_name):
+    try:
         with safe_open(filename, framework="pt") as f:
             if tensor_name in f.keys():
                 return f.get_tensor(tensor_name)
-        return None
+    except: pass
+    return None
 
-except ImportError:
-    print("FATAL: Please install dependencies: pip install torch huggingface_hub safetensors")
-    sys.exit(1)
-
-except ImportError:
-    print("FATAL: Please install dependencies: pip install numpy huggingface_hub safetensors")
-    sys.exit(1)
-
-with open("/tmp/deepseek_status.txt", "w") as f:
-    f.write(f"DOWNLOADING {sys.argv[1]}...")
-    
 repo_id = sys.argv[1]
 workdir = sys.argv[2]
 pair_k1 = int(sys.argv[3])
 pair_k2 = int(sys.argv[4])
 index_bin_path = sys.argv[5]
+
 print(f"[*] Downloading metadata for {repo_id}...")
 model_path = snapshot_download(repo_id, allow_patterns=["*.safetensors", "config.json"])
 
-with open("/tmp/deepseek_status.txt", "w") as f:
-    f.write("LOADING TENSORS...")
-import json
 with open(os.path.join(model_path, "config.json")) as f:
     config = json.load(f)
-D = config.get("hidden_size", 256)
-H = config.get("num_attention_heads", 8)
-L = config.get("num_hidden_layers", 6)
-F = config.get("intermediate_size", 1024)
-Tmax = config.get("max_position_embeddings", 512)
-# Write out the env overrides for the Bash script to source
+
+# RevNet Engine assumes D_engine = 2 * hidden_size to fit llama layers in Dhf slots
+D_orig = config.get("hidden_size", 4096)
+D = D_orig * 2
+H_q = config.get("num_attention_heads", 32)
+H_kv = config.get("num_key_value_heads", 8)
+L = config.get("num_hidden_layers", 32)
+F = config.get("intermediate_size", 11008)
+Tmax_embed = config.get("max_position_embeddings", 2048)
+v_orig = config.get("vocab_size", 32000)
+
+v_pad = ((v_orig + pair_k1 + pair_k2 + 15) // 16) * 16
+Dhf = D_orig
+
 env_path = os.path.join(workdir, "hf_env.sh")
 with open(env_path, "w") as f:
     f.write(f"export DMODEL={D}\n")
-    f.write(f"export NHEAD={H}\n")
+    f.write(f"export NHEAD={H_q}\n")
     f.write(f"export NLAY={L}\n")
     f.write(f"export FFN={F}\n")
-    f.write(f"export TMAX={Tmax}\n")
-# Calculate custom hash to see if we already built this .bin
+    f.write(f"export TMAX={Tmax_embed}\n")
+
 bin_name = "llm_engine"
-v_pad = ((256 + pair_k1 + pair_k2 + 15) // 16) * 16
-hash_str = f"{bin_name}_K{pair_k1+pair_k2}_D{D}_H{H}_L{L}_F{F}_T{Tmax}"
+hash_str = f"{bin_name}_K{pair_k1+pair_k2}_D{D}_H{H_q}_L{L}_F{F}_T{Tmax_embed}"
 ckpt_hash = hashlib.md5(hash_str.encode()).hexdigest()[:8]
 ckpt_path = os.path.join(workdir, f"ckpt_{bin_name}_{ckpt_hash}.bin")
+
 with open(env_path, "a") as f:
     f.write(f"export CKPT_HASH={ckpt_hash}\n")
     f.write(f"export DEFAULT_CKPT_FILE={ckpt_path}\n")
+
 if os.path.exists(ckpt_path):
-    print(f"[*] Checkpoint {ckpt_path} already exists. Skipping tensor mapping.")
+    print(f"[*] Checkpoint {ckpt_path} exists. Skipping.")
     sys.exit(0)
-print(f"[*] Mapping HuggingFace Safetensors to Elite C++ Layout...")
+
 safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
-# Reversible architecture requires Dhf = D/2.
-Dhf = D // 2
-def get_t(name, expected_shape=None):
-    t_pt = None
-    for file in safetensors_files:
-        t_pt = find_tensor(file, name)
-        if t_pt is not None:
-            break
-            
-    if t_pt is None:
-        print(f"Warning: {name} not found. Filling with zeros.")
-        if expected_shape: return torch.zeros(expected_shape, dtype=torch.float32)
-        return torch.zeros(1, dtype=torch.float32)
-        
-    t = t_pt.float()
-    del t_pt
+def get_t(name, shape=None, transpose=False, repeat_heads=1):
+    t = None
+    for f in safetensors_files:
+        t = find_tensor(f, name)
+        if t is not None: break
+    if t is None:
+        print(f"Warning: {name} not found.")
+        return torch.zeros(shape if shape else (1,), dtype=torch.float32)
     
-    if expected_shape and list(t.shape) != list(expected_shape):
-        print(f"Warning: {name} shape mismatch. Expected {expected_shape}, got {t.shape}")
-        out = torch.zeros(expected_shape, dtype=torch.float32)
-        slices = tuple(slice(0, min(d_out, d_in)) for d_out, d_in in zip(expected_shape, t.shape))
-        out[slices] = t[slices]
-        del t
-        return out
-        
+    t = t.float()
+    if repeat_heads > 1:
+        # GQA: Repeat KV heads (cur: H_kv, target: H_q)
+        # Weight shape is (H_kv*head_dim, D_orig)
+        tdim = t.shape[0]
+        t = t.view(H_kv, tdim // H_kv, -1)
+        t = t.repeat_interleave(repeat_heads, dim=0)
+        t = t.view(-1, t.shape[-1])
+    
+    if transpose: t = t.t()
+    
+    if shape:
+        out = torch.zeros(shape, dtype=torch.float32)
+        s0, s1 = min(shape[0], t.shape[0]), min(shape[1], t.shape[1]) if len(shape)>1 else 0
+        if len(shape)==1: out[:s0] = t[:s0]
+        else: out[:s0, :s1] = t[:s0, :s1]
+        t = out
     return t
-    
+
 def write_tensor(f, t):
-    t_int = (t * 1000.0).to(torch.int32).flatten().numpy()
+    t_int = (t * 10000.0).to(torch.int32).flatten().numpy()
     f.write(t_int.tobytes())
-    del t_int
-    del t
+
+print(f"[*] Mapping {repo_id} to {ckpt_path} (D={D}, Dhf={Dhf}, F={F})...")
 with open(index_bin_path, "rb") as idx_f:
     index_data = idx_f.read()
-
 pow2 = struct.unpack("<I", index_data[16:20])[0]
 
 with open(ckpt_path, "wb") as f:
     f.write(struct.pack("<II", 0x43484452, 11))
     f.write(struct.pack("<II", pair_k1, pair_k2))
-    f.write(struct.pack("<IIIII", D, H, L, F, Tmax))
-   
+    f.write(struct.pack("<IIIII", D, H_q, L, F, Tmax_embed))
     id2pair_len = pair_k1 * 2
     id2pair2_len = pair_k2 * 4
     f.write(index_data[24 : 24+id2pair_len])
     f.write(index_data[24+id2pair_len : 24+id2pair_len+id2pair2_len])
     f.write(struct.pack("<I", pow2))
     f.write(index_data[24+id2pair_len+id2pair2_len:])
-   
-    print("[*] Quantizing and writing tensors (INT32)...")
+    
+    # wte: Map Llama hidden_size to engine first-half(Dhf)
+    print("[*] Writing embeddings...")
     write_tensor(f, get_t("model.embed_tokens.weight", (v_pad, D)))
-    write_tensor(f, torch.zeros((Tmax, D), dtype=torch.float32)) # wpe
-   
+    write_tensor(f, torch.zeros((Tmax_embed, D), dtype=torch.float32)) # wpe
+    
     for l in range(L):
+        print(f"[*] Layer {l}/{L}...")
         write_tensor(f, get_t(f"model.layers.{l}.input_layernorm.weight", (Dhf,)))
-        write_tensor(f, get_t(f"model.layers.{l}.self_attn.q_proj.weight", (Dhf, Dhf)))
-        write_tensor(f, get_t(f"model.layers.{l}.self_attn.k_proj.weight", (Dhf, Dhf)))
-        write_tensor(f, get_t(f"model.layers.{l}.self_attn.v_proj.weight", (Dhf, Dhf)))
-        write_tensor(f, get_t(f"model.layers.{l}.self_attn.o_proj.weight", (Dhf, Dhf)))
-       
+        write_tensor(f, get_t(f"model.layers.{l}.self_attn.q_proj.weight", (Dhf, Dhf), transpose=True))
+        write_tensor(f, get_t(f"model.layers.{l}.self_attn.k_proj.weight", (Dhf, Dhf), transpose=True, repeat_heads=H_q//H_kv))
+        write_tensor(f, get_t(f"model.layers.{l}.self_attn.v_proj.weight", (Dhf, Dhf), transpose=True, repeat_heads=H_q//H_kv))
+        write_tensor(f, get_t(f"model.layers.{l}.self_attn.o_proj.weight", (Dhf, Dhf), transpose=True))
+        
         write_tensor(f, get_t(f"model.layers.{l}.post_attention_layernorm.weight", (Dhf,)))
-        write_tensor(f, get_t(f"model.layers.{l}.mlp.gate_proj.weight", (Dhf, F)))
-        write_tensor(f, get_t(f"model.layers.{l}.mlp.down_proj.weight", (F, Dhf)))
-    write_tensor(f, get_t("model.norm.weight", (D,)))
-    write_tensor(f, get_t("lm_head.weight", (D, v_pad)))
-print(f"[*] Successfully built Elite INT32 checkpoint: {ckpt_path}")
+        # MLP: Gate and Down. (Llama has Gate, Up, Down. We use static bridge for minimal change)
+        write_tensor(f, get_t(f"model.layers.{l}.mlp.gate_proj.weight", (F, Dhf), transpose=True))
+        write_tensor(f, get_t(f"model.layers.{l}.mlp.down_proj.weight", (Dhf, F), transpose=True))
+        
+    write_tensor(f, get_t("model.norm.weight", (D_orig,))) # Pad to D later via get_t shape if needed
+    write_tensor(f, get_t("lm_head.weight", (v_pad, D_orig), transpose=True)) # Pad to D later
+print(f"[*] Done.")
 EOF
-  python3 "$WORKDIR/hf_converter.py" "$HF_MODEL" "$WORKDIR" "$PAIR_K1" "$K2" "$INDEX_BIN"
+  "$PY" "$WORKDIR/hf_converter.py" "$HF_MODEL" "$WORKDIR" "$PAIR_K1" "$K2" "$INDEX_BIN"
   source "$WORKDIR/hf_env.sh"
   # Cap TMAX for runtime to fit KV cache in available VRAM.
   # The HF model reports max_position_embeddings=131072, but that would
@@ -499,13 +512,7 @@ if [[ $USER_PASSED_CKPT -eq 0 ]]; then
 else
   CKPT_FILE=""
 fi
-if [[ $FORCE_NEW -eq 1 ]]; then
-  echo "[*] --force-new passed. Ensuring a fresh start."
-  if [[ $USER_PASSED_CKPT -eq 0 && -f "$CKPT_FILE" ]]; then
-    rm -f "$CKPT_FILE"
-    echo "[*] Deleted existing checkpoint: $CKPT_FILE"
-  fi
-fi
+# ... (logic moved up)
 # =============================================================================
 # Core C++ Engine Compilation
 # =============================================================================
@@ -911,7 +918,7 @@ __global__ void w_i32_to_i8_rm_tr(int8_t* rm, int8_t* tr, const int32_t* w, int 
   int k = blockIdx.y*blockDim.y + threadIdx.y;
   int m = blockIdx.x*blockDim.x + threadIdx.x;
   if(k<K && m<M){
-    int32_t v = w[(size_t)k*(size_t)M + (size_t)m] >> 8;
+    int32_t v = w[(size_t)k*(size_t)M + (size_t)m] >> 3;
     if(v>127) v=127; if(v<-128) v=-128;
     int8_t hv = (int8_t)v;
     rm[(size_t)k*(size_t)M + (size_t)m] = hv;
@@ -922,7 +929,7 @@ __global__ void build_Atr_i8(int8_t* Atr, const int32_t* A, int N, int K){
   int n=blockIdx.x*blockDim.x + threadIdx.x;
   int k=blockIdx.y*blockDim.y + threadIdx.y;
   if(n<N && k<K){
-    int32_t v = A[(size_t)n*(size_t)K + (size_t)k] >> 8;
+    int32_t v = A[(size_t)n*(size_t)K + (size_t)k] >> 3;
     if(v>127) v=127; if(v<-128) v=-128;
     Atr[(size_t)k*(size_t)N + (size_t)n] = (int8_t)v;
   }
@@ -931,7 +938,7 @@ __global__ void build_dYtr_i8(int8_t* dYtr, const int32_t* dY, int N, int M){
   int n=blockIdx.x*blockDim.x + threadIdx.x;
   int m=blockIdx.y*blockDim.y + threadIdx.y;
   if(n<N && m<M){
-    int32_t v = dY[(size_t)n*(size_t)M + (size_t)m] >> 8;
+    int32_t v = dY[(size_t)n*(size_t)M + (size_t)m] >> 3;
     if(v>127) v=127; if(v<-128) v=-128;
     dYtr[(size_t)m*(size_t)N + (size_t)n] = (int8_t)v;
   }
@@ -1445,7 +1452,7 @@ static void init_weights_cpu(std::vector<int32_t>& w, uint64_t seed){
   }
   for(int i=0;i<D;i++) W.gout[i]=1;
 }
-static void gpu_alloc(GPU* g,int dev,int B,int T, bool is_training){
+static void gpu_alloc(GPU* g,int dev,int B,int T, bool is_training, int num_gpus){
   g->dev=dev; g->B=B; g->T=T; g->N=B*T;
   CUDA_CHECK(cudaSetDevice(dev));
   size_t Wn=weights_elems();
@@ -1539,6 +1546,16 @@ static void gpu_alloc(GPU* g,int dev,int B,int T, bool is_training){
   malw(&g->Hw.Wout_rm,(size_t)D*(size_t)Vpad);
   malw(&g->Hw.Wout_tr,(size_t)Vpad*(size_t)D);
   for(int l=0;l<L;l++){
+    int owner_g = (l * num_gpus) / L;
+    if (!is_training && dev != owner_g) {
+      g->Hw.Wq_rm[l] = nullptr; g->Hw.Wq_tr[l] = nullptr;
+      g->Hw.Wk_rm[l] = nullptr; g->Hw.Wk_tr[l] = nullptr;
+      g->Hw.Wv_rm[l] = nullptr; g->Hw.Wv_tr[l] = nullptr;
+      g->Hw.Wo_rm[l] = nullptr; g->Hw.Wo_tr[l] = nullptr;
+      g->Hw.W1_rm[l] = nullptr; g->Hw.W1_tr[l] = nullptr;
+      g->Hw.W2_rm[l] = nullptr; g->Hw.W2_tr[l] = nullptr;
+      continue;
+    }
     malw(&g->Hw.Wq_rm[l],(size_t)Dhf*(size_t)Dhf); malw(&g->Hw.Wq_tr[l],(size_t)Dhf*(size_t)Dhf);
     malw(&g->Hw.Wk_rm[l],(size_t)Dhf*(size_t)Dhf); malw(&g->Hw.Wk_tr[l],(size_t)Dhf*(size_t)Dhf);
     malw(&g->Hw.Wv_rm[l],(size_t)Dhf*(size_t)Dhf); malw(&g->Hw.Wv_tr[l],(size_t)Dhf*(size_t)Dhf);
@@ -1619,11 +1636,19 @@ static void refresh_half_weights_chunk(GPU* g, const int32_t* srcW, size_t chunk
 static void refresh_half_weights(GPU* g){
   CUDA_CHECK(cudaSetDevice(g->dev));
   dim3 blk(16,16);
-  dim3 grdWte((D+15)/16,(Vpad+15)/16);
-  w_i32_to_i8_rm_tr<<<grdWte,blk>>>(g->Hw.wte_rm, g->Hw.wte_tr, g->W.wte, Vpad, D); KERNEL_CHECK();
-  dim3 grdWout((Vpad+15)/16,(D+15)/16);
-  w_i32_to_i8_rm_tr<<<grdWout,blk>>>(g->Hw.Wout_rm, g->Hw.Wout_tr, g->W.Wout, D, Vpad); KERNEL_CHECK();
+  
+  if (g->W.wte && g->Hw.wte_rm) {
+    dim3 grdWte((D+15)/16,(Vpad+15)/16);
+    w_i32_to_i8_rm_tr<<<grdWte,blk>>>(g->Hw.wte_rm, g->Hw.wte_tr, g->W.wte, Vpad, D); KERNEL_CHECK();
+  }
+  
+  if (g->W.Wout && g->Hw.Wout_rm) {
+    dim3 grdWout((Vpad+15)/16,(D+15)/16);
+    w_i32_to_i8_rm_tr<<<grdWout,blk>>>(g->Hw.Wout_rm, g->Hw.Wout_tr, g->W.Wout, D, Vpad); KERNEL_CHECK();
+  }
+
   for(int l=0;l<L;l++){
+    if (!g->Hw.Wq_rm[l] || !g->W.Wq[l]) continue; // Skip layers not owned/loaded on this GPU
     dim3 grdHH((Dhf+15)/16,(Dhf+15)/16);
     w_i32_to_i8_rm_tr<<<grdHH,blk>>>(g->Hw.Wq_rm[l], g->Hw.Wq_tr[l], g->W.Wq[l], Dhf, Dhf); KERNEL_CHECK();
     w_i32_to_i8_rm_tr<<<grdHH,blk>>>(g->Hw.Wk_rm[l], g->Hw.Wk_tr[l], g->W.Wk[l], Dhf, Dhf); KERNEL_CHECK();
@@ -1927,14 +1952,12 @@ static int32_t train_step(GPU* g, const std::vector<uint16_t>& ids, int step, in
 __global__ void dp4a_gemv_tr_i8(int32_t* y, const int32_t* x, const int8_t* Wtr, int M, int K){
   int m = blockIdx.x * blockDim.x + threadIdx.x;
   if(m>=M) return;
-  int32_t acc=0;
+  int64_t acc=0;
   const int8_t* wrow = Wtr + (size_t)m*(size_t)K;
-  for(int k=0;k<K;k+=4){
-    int32_t a_val = *((const int32_t*)(&x[k]));
-    int32_t b_val = *((const int32_t*)(&wrow[k]));
-    acc = __dp4a(a_val, b_val, acc);
+  for(int k=0;k<K;k++){
+    acc += (int64_t)x[k] * (int64_t)wrow[k];
   }
-  y[m]=acc;
+  y[m]=(int32_t)acc;
 }
 template<int DIM>
 __global__ void rms1_int(int32_t* y, int32_t* inv_out, const int32_t* x, const int32_t* g){
@@ -1944,9 +1967,14 @@ __global__ void rms1_int(int32_t* y, int32_t* inv_out, const int32_t* x, const i
   buf[threadIdx.x]=s; __syncthreads();
   for(int k=blockDim.x/2;k>0;k>>=1){ if(threadIdx.x<k) buf[threadIdx.x]+=buf[threadIdx.x+k]; __syncthreads(); }
   int32_t inv = 1024;
-  if(threadIdx.x==0) inv_out[0]=inv;
+  if(threadIdx.x==0) {
+    double mean = (double)buf[0] / (double)DIM;
+    inv = (int32_t)(1024.0 / sqrt(mean + 1e-5));
+    inv_out[0]=inv;
+  }
   __syncthreads();
-  for(int i=threadIdx.x;i<DIM;i+=blockDim.x) y[i]=(x[i]*inv*g[i])/1024;
+  inv = inv_out[0];
+  for(int i=threadIdx.x;i<DIM;i+=blockDim.x) y[i]=((int64_t)x[i]*inv*g[i])/1024;
 }
 __global__ void rope_apply_one_int(int32_t* X, const int32_t* sin_tbl, const int32_t* cos_tbl, int t){
   int h = blockIdx.y;
@@ -2118,13 +2146,11 @@ __global__ void dp4a_gemv_vocab(int32_t* logits, const int32_t* x, const int8_t*
   int v = blockIdx.x*blockDim.x + threadIdx.x;
   if(v>=V) return;
   const int8_t* wrow = Wtr + (size_t)v*(size_t)D;
-  int32_t acc=0;
-  for(int k=0;k<D;k+=4){
-    int32_t a_val = *((const int32_t*)(&x[k]));
-    int32_t b_val = *((const int32_t*)(&wrow[k]));
-    acc = __dp4a(a_val, b_val, acc);
+  int64_t acc=0;
+  for(int k=0;k<D;k++){
+    acc += (int64_t)x[k] * (int64_t)wrow[k];
   }
-  logits[v]=acc;
+  logits[v]=(int32_t)acc;
 }
 static int chat_step(ChatCtx* c, int t, int tok_id){
   int G = c->G;
@@ -2387,7 +2413,7 @@ int main(int argc,char** argv){
   while(sumB<batch){ for(int i=0;i<G && sumB<batch;i++){ Bi[(size_t)i]++; sumB++; } }
   std::vector<GPU> gpus((size_t)G);
   for(int i=0;i<G;i++){
-    gpu_alloc(&gpus[(size_t)i], i, Bi[(size_t)i], seq, do_train);
+    gpu_alloc(&gpus[(size_t)i], i, Bi[(size_t)i], seq, do_train, G);
   }
   
   if (G > 1) {
@@ -2423,111 +2449,105 @@ int main(int argc,char** argv){
       }
       for(int i=0;i<G;i++){ refresh_half_weights(&gpus[(size_t)i]); }
     } else {
-      // Chat mode: No monolithic 24GB allocation on ANY GPU! Keep an exact structure traversal directly from host
-      // Since mapping requires matching the precise offsets of `pack_W`, we load layer by layer.
+      // Chat mode: Load weights layer-by-layer to the owning GPU.
+      // This is VRAM efficient as no single GPU needs to hold the full 24GB INT32 weights.
       
-      auto read_and_cast = [&](int8_t* dst_rm, int8_t* dst_tr, size_t rows, size_t cols, GPU* sync_gpus, int num_g) {
-          size_t num_elems = rows * cols;
-          std::vector<int32_t> host_layer(num_elems);
-          rf(f, host_layer.data(), num_elems*sizeof(int32_t));
-          
-          for(int i=0; i<num_g; i++) {
-             GPU& g = sync_gpus[i];
-             CUDA_CHECK(cudaSetDevice(g.dev));
-             int32_t* d_tmp;
-             CUDA_CHECK(cudaMalloc(&d_tmp, num_elems*sizeof(int32_t)));
-             CUDA_CHECK(cudaMemcpy(d_tmp, host_layer.data(), num_elems*sizeof(int32_t), cudaMemcpyHostToDevice));
-             
-             dim3 blk(16,16);
-             dim3 grd((cols+15)/16, (rows+15)/16);
-             w_i32_to_i8_rm_tr<<<grd,blk>>>(dst_rm, dst_tr, d_tmp, rows, cols); 
-             KERNEL_CHECK();
-             
-             CUDA_CHECK(cudaStreamSynchronize(0));
-             CUDA_CHECK(cudaFree(d_tmp));
-          }
+      // Stage 1: Load shared weights (wte, wpe, gout, Wout) to GPU 0
+      CUDA_CHECK(cudaSetDevice(0));
+      WView Wtop; pack_W(nullptr, &Wtop); // Just to get relative offsets
+      
+      auto load_tensor_to_gpu = [&](int device, int32_t* dst, size_t elems, size_t offset_in_weights) {
+        CUDA_CHECK(cudaSetDevice(device));
+        std::vector<int32_t> host_tmp(elems);
+        std::fseek(f, (long)(ckpt_w_offset + offset_in_weights * sizeof(int32_t)), SEEK_SET);
+        rf(f, host_tmp.data(), elems * sizeof(int32_t));
+        CUDA_CHECK(cudaMemcpy(dst, host_tmp.data(), elems * sizeof(int32_t), cudaMemcpyHostToDevice));
       };
 
-      for(int i=0; i<G; i++) { CUDA_CHECK(cudaSetDevice(i)); gpus[i].W.wte=nullptr; gpus[i].W.Wout=nullptr; }
+      size_t off_wte = 0;
+      size_t off_wpe = (size_t)Vpad * D;
+      size_t off_layers = off_wpe + (size_t)Tmax * D;
+      
+      // Alloc and load head/tail on GPU 0
+      CUDA_CHECK(cudaMalloc(&gpus[0].W.wte, (size_t)Vpad * D * sizeof(int32_t)));
+      load_tensor_to_gpu(0, gpus[0].W.wte, (size_t)Vpad * D, off_wte);
+      
+      CUDA_CHECK(cudaMalloc(&gpus[0].W.wpe, (size_t)Tmax * D * sizeof(int32_t)));
+      load_tensor_to_gpu(0, gpus[0].W.wpe, (size_t)Tmax * D, off_wpe);
+      
+      size_t layer_size = (size_t)Dhf + (size_t)Dhf*Dhf*4 + (size_t)Dhf + (size_t)Dhf*F + (size_t)F*Dhf;
+      size_t off_gout = off_layers + (size_t)L * layer_size;
+      
+      CUDA_CHECK(cudaMalloc(&gpus[0].W.gout, (size_t)D * sizeof(int32_t)));
+      load_tensor_to_gpu(0, gpus[0].W.gout, (size_t)D, off_gout);
+      
+      CUDA_CHECK(cudaMalloc(&gpus[0].W.Wout, (size_t)D * Vpad * sizeof(int32_t)));
+      load_tensor_to_gpu(0, gpus[0].W.Wout, (size_t)D * Vpad, off_gout + D);
 
-      // We precisely replicate pack_W layout sequential reads
-      read_and_cast(gpus[0].Hw.wte_rm, gpus[0].Hw.wte_tr, Vpad, D, &gpus[0], 1); // wte only on GPU 0
-      std::fseek(f, (long)(Tmax*D*sizeof(int32_t)), SEEK_CUR); // wpe
+      // Quantize GPU 0 shared tensors
+      refresh_half_weights(&gpus[0]);
+      
+      // Free shard INT32 weights on GPU 0
+      CUDA_CHECK(cudaFree(gpus[0].W.wte)); gpus[0].W.wte = nullptr;
+      CUDA_CHECK(cudaFree(gpus[0].W.wpe)); gpus[0].W.wpe = nullptr;
+      CUDA_CHECK(cudaFree(gpus[0].W.gout)); gpus[0].W.gout = nullptr;
+      CUDA_CHECK(cudaFree(gpus[0].W.Wout)); gpus[0].W.Wout = nullptr;
 
+      // Stage 2: Load each layer only to its owner GPU
       for(int l=0; l<L; l++){
-        read_and_cast(gpus[0].Hw.Wq_rm[l], gpus[0].Hw.Wq_tr[l], Dhf, Dhf, &gpus[0], 1);
-        read_and_cast(gpus[0].Hw.Wk_rm[l], gpus[0].Hw.Wk_tr[l], Dhf, Dhf, &gpus[0], 1);
-        read_and_cast(gpus[0].Hw.Wv_rm[l], gpus[0].Hw.Wv_tr[l], Dhf, Dhf, &gpus[0], 1);
-        read_and_cast(gpus[0].Hw.Wo_rm[l], gpus[0].Hw.Wo_tr[l], Dhf, Dhf, &gpus[0], 1);
-        read_and_cast(gpus[0].Hw.W1_rm[l], gpus[0].Hw.W1_tr[l], F, Dhf, &gpus[0], 1);
-        read_and_cast(gpus[0].Hw.W2_rm[l], gpus[0].Hw.W2_tr[l], Dhf, F, &gpus[0], 1);
-        std::fseek(f, (long)(Dhf*sizeof(int32_t)), SEEK_CUR); // gf
-        std::fseek(f, (long)(Dhf*sizeof(int32_t)), SEEK_CUR); // gg
+        int owner_g = (l * G) / L;
+        CUDA_CHECK(cudaSetDevice(owner_g));
         
-        // Push the int8 matrices initialized on GPU 0 to peer GPUs if they need them
-        for(int pg=1; pg<G; pg++) {
-           CUDA_CHECK(cudaSetDevice(pg));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wq_rm[l], gpus[pg].dev, gpus[0].Hw.Wq_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wk_rm[l], gpus[pg].dev, gpus[0].Hw.Wk_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wv_rm[l], gpus[pg].dev, gpus[0].Hw.Wv_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wo_rm[l], gpus[pg].dev, gpus[0].Hw.Wo_rm[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W1_rm[l], gpus[pg].dev, gpus[0].Hw.W1_rm[l], gpus[0].dev, F*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W2_rm[l], gpus[pg].dev, gpus[0].Hw.W2_rm[l], gpus[0].dev, Dhf*F*sizeof(int8_t)));
-           
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wq_tr[l], gpus[pg].dev, gpus[0].Hw.Wq_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wk_tr[l], gpus[pg].dev, gpus[0].Hw.Wk_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wv_tr[l], gpus[pg].dev, gpus[0].Hw.Wv_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.Wo_tr[l], gpus[pg].dev, gpus[0].Hw.Wo_tr[l], gpus[0].dev, Dhf*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W1_tr[l], gpus[pg].dev, gpus[0].Hw.W1_tr[l], gpus[0].dev, F*Dhf*sizeof(int8_t)));
-           CUDA_CHECK(cudaMemcpyPeer(gpus[pg].Hw.W2_tr[l], gpus[pg].dev, gpus[0].Hw.W2_tr[l], gpus[0].dev, Dhf*F*sizeof(int8_t)));
-        }
+        size_t l_off = off_layers + (size_t)l * layer_size;
+        
+        // Map WView pointers for this layer
+        auto& W = gpus[owner_g].W;
+        CUDA_CHECK(cudaMalloc(&W.gf[l], Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.gf[l], Dhf, l_off); l_off += Dhf;
+        
+        CUDA_CHECK(cudaMalloc(&W.Wq[l], (size_t)Dhf*Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.Wq[l], (size_t)Dhf*Dhf, l_off); l_off += (size_t)Dhf*Dhf;
+        
+        CUDA_CHECK(cudaMalloc(&W.Wk[l], (size_t)Dhf*Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.Wk[l], (size_t)Dhf*Dhf, l_off); l_off += (size_t)Dhf*Dhf;
+        
+        CUDA_CHECK(cudaMalloc(&W.Wv[l], (size_t)Dhf*Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.Wv[l], (size_t)Dhf*Dhf, l_off); l_off += (size_t)Dhf*Dhf;
+        
+        CUDA_CHECK(cudaMalloc(&W.Wo[l], (size_t)Dhf*Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.Wo[l], (size_t)Dhf*Dhf, l_off); l_off += (size_t)Dhf*Dhf;
+        
+        CUDA_CHECK(cudaMalloc(&W.gg[l], Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.gg[l], Dhf, l_off); l_off += Dhf;
+        
+        CUDA_CHECK(cudaMalloc(&W.W1[l], (size_t)Dhf*F * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.W1[l], (size_t)Dhf*F, l_off); l_off += (size_t)Dhf*F;
+        
+        CUDA_CHECK(cudaMalloc(&W.W2[l], (size_t)F*Dhf * sizeof(int32_t)));
+        load_tensor_to_gpu(owner_g, W.W2[l], (size_t)F*Dhf, l_off);
+        
+        // Quantize this specific layer on its owner GPU
+        refresh_half_weights(&gpus[owner_g]);
+        
+        // VRAM Optimization: Free INT32 buffers immediately after quantization
+        CUDA_CHECK(cudaFree(W.gf[l])); W.gf[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.Wq[l])); W.Wq[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.Wk[l])); W.Wk[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.Wv[l])); W.Wv[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.Wo[l])); W.Wo[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.gg[l])); W.gg[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.W1[l])); W.W1[l] = nullptr;
+        CUDA_CHECK(cudaFree(W.W2[l])); W.W2[l] = nullptr;
       }
-      
-      std::fseek(f, (long)(D*sizeof(int32_t)), SEEK_CUR); // gout
-      read_and_cast(gpus[0].Hw.Wout_rm, gpus[0].Hw.Wout_tr, D, Vpad, &gpus[0], 1); // Wout only on GPU 0
-      
-      // Need to populate the FP32 normalizer arrays too
-      std::fseek(f, (long)ckpt_w_offset, SEEK_SET);
-      std::vector<int32_t> float_layer;
-      
-      // read wte
-      float_layer.resize(Vpad*D); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
-      CUDA_CHECK(cudaSetDevice(0));
-      CUDA_CHECK(cudaMalloc(&gpus[0].W.wte, Vpad*D*sizeof(int32_t)));
-      CUDA_CHECK(cudaMemcpy(gpus[0].W.wte, float_layer.data(), float_layer.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
-      
-      // read wpe
-      float_layer.resize(Tmax*D); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
-      CUDA_CHECK(cudaMalloc(&gpus[0].W.wpe, Tmax*D*sizeof(int32_t)));
-      CUDA_CHECK(cudaMemcpy(gpus[0].W.wpe, float_layer.data(), float_layer.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
-      
-      for(int l=0; l<L; l++){
-        std::fseek(f, (long)(Dhf*Dhf*4 + F*Dhf*2)*sizeof(int32_t), SEEK_CUR);
-        
-        float_layer.resize(Dhf); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
-        for(int pg=0; pg<G; pg++) {
-           CUDA_CHECK(cudaSetDevice(pg)); CUDA_CHECK(cudaMalloc(&gpus[pg].W.gf[l], Dhf*sizeof(int32_t)));
-           CUDA_CHECK(cudaMemcpy(gpus[pg].W.gf[l], float_layer.data(), Dhf*sizeof(int32_t), cudaMemcpyHostToDevice));
-        }
-        
-        float_layer.resize(Dhf); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
-        for(int pg=0; pg<G; pg++) {
-           CUDA_CHECK(cudaSetDevice(pg)); CUDA_CHECK(cudaMalloc(&gpus[pg].W.gg[l], Dhf*sizeof(int32_t)));
-           CUDA_CHECK(cudaMemcpy(gpus[pg].W.gg[l], float_layer.data(), Dhf*sizeof(int32_t), cudaMemcpyHostToDevice));
-        }
-      }
-      
-      float_layer.resize(D); rf(f, float_layer.data(), float_layer.size()*sizeof(int32_t));
-      CUDA_CHECK(cudaSetDevice(0)); CUDA_CHECK(cudaMalloc(&gpus[0].W.gout, D*sizeof(int32_t)));
-      CUDA_CHECK(cudaMemcpy(gpus[0].W.gout, float_layer.data(), float_layer.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
     }
     std::fclose(f);
   } else {
+    if(!do_train) die("Cannot start chat mode without an existing checkpoint.");
     std::vector<int32_t> hostW;
     hostW.resize(weights_elems());
     init_weights_cpu(hostW, seed);
     for(int i=0;i<G;i++){
-      if (i==0 || do_train) {
+      if (gpus[(size_t)i].dW) {
         CUDA_CHECK(cudaSetDevice(i));
         CUDA_CHECK(cudaMemcpy(gpus[(size_t)i].dW, hostW.data(), hostW.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
       }
@@ -2607,7 +2627,7 @@ CU
 if [[ ! -f "$TMP_CU_DIR/$CU" ]]; then
   echo "FATAL: missing $CU in $TMP_CU_DIR"; exit 1
 fi
-python3 - "$TMP_CU_DIR/$CU" <<'PY'
+"$PY" - "$TMP_CU_DIR/$CU" <<'PY'
 import re, pathlib, sys
 import os
 cu_path = sys.argv[1]
@@ -2663,7 +2683,7 @@ nvcc -O3 -std=c++17 -arch=sm_75 --default-stream per-thread -lineinfo --expt-rel
   -DPAIR_K="$PAIR_K" -DPAIR_K1="$PAIR_K1" -DVCHUNK="$VCHUNK" -DDMODEL="$DMODEL" -DNHEAD="$NHEAD" -DNLAY="$NLAY" -DFFN="$FFN" -DTMAX="$TMAX" \
   "$TMP_CU_DIR/$CU" -o "$TMP_CU_DIR/temp_bin"
 mv "$TMP_CU_DIR/temp_bin" "$BIN"
-rm -rf "$TMP_CU_DIR"
+#rm -rf "$TMP_CU_DIR"
 echo "ENGINE ONLINE" > "/tmp/deepseek_status.txt"
 echo
 echo "================================================================="

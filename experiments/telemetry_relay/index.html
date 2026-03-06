@@ -263,9 +263,14 @@
 
         .msg-block {
             display: block;
-            /* Inline-Fluss für Text ermöglichen */
-            margin-bottom: 2px;
-            line-height: 1.4;
+            margin-bottom: 8px;
+            /* Added spacing for better readability */
+            line-height: 1.5;
+            padding: 8px;
+            border-radius: 4px;
+            background: rgba(0, 50, 0, 0.2);
+            word-wrap: break-word;
+            /* Handle long URLs/tokens in mobile */
         }
 
         .msg-meta {
@@ -613,6 +618,19 @@
         const printCLI = (txCmd, rxRes = null, type = 'normal') => {
             if (rxRes && (rxRes.includes("SYSTEM_IDLE") || rxRes.includes("AWAITING_PROMPT"))) return;
 
+            // Feature: Append to last message if RX stream is active
+            if (!txCmd && rxRes && type !== 'sys') {
+                const lastBlock = cliHist.lastElementChild;
+                if (lastBlock) {
+                    const rxSpan = lastBlock.querySelector('.msg-rx');
+                    if (rxSpan) {
+                        rxSpan.innerText += rxRes;
+                        cliHist.scrollTo({ top: cliHist.scrollHeight, behavior: 'smooth' });
+                        return;
+                    }
+                }
+            }
+
             const block = document.createElement('div');
             block.className = 'msg-block';
 
@@ -639,7 +657,7 @@
 
             // Smarter Auto-Scroll
             requestAnimationFrame(() => {
-                cliHist.scrollTop = cliHist.scrollHeight;
+                cliHist.scrollTo({ top: cliHist.scrollHeight, behavior: 'smooth' });
             });
         };
 
@@ -751,6 +769,14 @@
             if (modelId) elModel.innerText = modelId;
 
             gpus.forEach((gpu, idx) => {
+                const gpuBlock = gpu.fill.closest('.gpu-block');
+                if (gpuNamesArr && idx >= gpuNamesArr.length) {
+                    if (gpuBlock) gpuBlock.style.display = 'none';
+                    return;
+                } else {
+                    if (gpuBlock) gpuBlock.style.display = 'block';
+                }
+
                 let load = 0;
                 if (gpuUtilsArr && gpuUtilsArr.length > idx) {
                     load = Math.max(0, Math.min(100, Math.round(gpuUtilsArr[idx])));
