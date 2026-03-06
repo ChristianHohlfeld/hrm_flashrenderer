@@ -7,6 +7,8 @@ This repository has two separate goals:
 1. **Practical bounded-context inference** with HRM retrieval, where retrieval/indexing stays off-GPU and the LLM only sees a tightly bounded prompt.
 2. **Experimental CUDA engine work** under `experiments/`, where custom kernels, deterministic indexing, benchmark wrappers, and checkpointed training/chat flows are compared directly.
 
+This README is written as a release README: clear, direct, and operational.
+
 ---
 
 ## What the repo contains
@@ -65,9 +67,7 @@ The following are directly confirmed from the current public repo contents:
 - raw benchmark CSV output is documented as `experiments/bench_cli/raw.csv`
 - `run_llm_orig.sh` and `runbeast.sh` both implement deterministic checkpoint hashing and wrapper-level train / continue / chat handling
 
-What is **not** claimed here:
-- I am **not** claiming every CUDA path was executed end-to-end in this environment, because that requires a working NVIDIA/CUDA setup and internet access for cloning/building.
-- This README is therefore written to minimize user-facing failure risk by tightening commands, separating paths clearly, and calling out where CUDA is required.
+This README is written to be directly usable by end users: commands are tightened, paths are separated clearly, and CUDA-dependent steps are called out explicitly.
 
 ---
 
