@@ -1,7 +1,7 @@
-export DMODEL=8192
-export NHEAD=32
-export NLAY=32
-export FFN=14336
-export TMAX=131072
-export CKPT_HASH=ae6a982d
-export DEFAULT_CKPT_FILE=/home/chris/hrm_flashrenderer/experiments/ckpt_llm_engine_ae6a982d.bin
+export DMODEL=4096
+export NHEAD=16
+export NLAY=27
+export FFN=10944
+export TMAX=163840
+export CKPT_HASH=99363e7b
+export DEFAULT_CKPT_FILE=/home/chris/hrm_flashrenderer/experiments/ckpt_llm_engine_99363e7b.bin
