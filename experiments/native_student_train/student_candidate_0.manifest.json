@@ -1,0 +1,24 @@
+{
+  "repo": "teacher_dump",
+  "strategy": "candidate_0",
+  "metrics": {
+    "epoch": 6,
+    "train_loss": 9.65178794821212,
+    "val": {
+      "nll": 9.693308823137244,
+      "overlap": 0.0,
+      "score": -96.93308823137244
+    }
+  },
+  "train_rows": 13,
+  "val_rows": 3,
+  "dims": {
+    "D": 256,
+    "H": 8,
+    "L": 6,
+    "F": 1024,
+    "TMAX": 512,
+    "Vpad": 16640
+  },
+  "ckpt": "/home/chris/hrm_flashrenderer/experiments/native_student_train/student_candidate_0.bin"
+}

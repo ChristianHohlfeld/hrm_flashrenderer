@@ -1,0 +1,16 @@
+{"prompt":"hi","teacher_text":"Hello. How can I help you today?"}
+{"prompt":"how are you","teacher_text":"I'm doing well and ready to help."}
+{"prompt":"explain yourself in one sentence","teacher_text":"I am a reasoning assistant that answers questions clearly and directly."}
+{"prompt":"what is vram","teacher_text":"VRAM is memory on the graphics card used for model weights, activations, and caches."}
+{"prompt":"why did the model run out of memory","teacher_text":"It ran out of memory because the runtime footprint exceeded available GPU memory."}
+{"prompt":"how can I lower memory use","teacher_text":"You can lower memory use by shrinking context, reducing model size, quantizing weights, or offloading state."}
+{"prompt":"what is distillation","teacher_text":"Distillation trains a smaller student model to imitate a larger teacher model."}
+{"prompt":"what is calibration","teacher_text":"Calibration adjusts scales, biases, and decoding behavior so outputs become more stable and useful."}
+{"prompt":"what is a checkpoint","teacher_text":"A checkpoint is a saved snapshot of model parameters that can be loaded later for inference or further training."}
+{"prompt":"what is a tensor","teacher_text":"A tensor is a multidimensional array used to store model parameters and activations."}
+{"prompt":"what is cuda","teacher_text":"CUDA is NVIDIA's platform for running parallel compute workloads on GPUs."}
+{"prompt":"what is a token","teacher_text":"A token is a unit of text a language model processes during inference and training."}
+{"prompt":"why use a small student model","teacher_text":"A small student model reduces VRAM use and can still capture useful behavior from a larger teacher."}
+{"prompt":"why use a big teacher model","teacher_text":"A big teacher model provides stronger guidance and richer behavior for training a smaller student."}
+{"prompt":"what is kv cache","teacher_text":"The KV cache stores attention keys and values from previous steps to speed up autoregressive generation."}
+{"prompt":"what is low vram inference","teacher_text":"Low VRAM inference is running a model while minimizing GPU memory usage through quantization, compression, and offload."}
