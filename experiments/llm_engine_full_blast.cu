@@ -1,37 +1,3 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# =============================================================================
-# llm_engine_full_blast.sh
-#
-# Self-contained, CUDA-generating, promptable runtime script.
-#
-# Writes one .cu, builds it with nvcc, runs it.
-#
-# Features in the generated runtime:
-#   - native checkpoint loader for the bounded small-core format
-#   - explicit VRAM preflight / budgeting
-#   - single-GPU-first deterministic boot
-#   - paged KV with host spill + resident GPU window
-#   - bounded decode loop / repeat guard / blank guard
-#   - interactive prompt loop
-#
-# Intended checkpoint format:
-#   the bounded/native format used by your small-core runs
-#   (magic/version/pair_k1/K2/D/H/L/F/TMAX + fixed trailing weights)
-#
-# Usage:
-#   ./llm_engine_full_blast.sh
-#   CKPT=./native_student_train/student_candidate_1.bin ./llm_engine_full_blast.sh
-#   INDEX=./index_v7_k18192_k28192.bin ./llm_engine_full_blast.sh
-#   GPU=1 CTX_LIMIT=256 MAX_NEW=64 ./llm_engine_full_blast.sh
-# =============================================================================
-
-BIN="${BIN:-llm_engine_full_blast}"
-CU="${CU:-llm_engine_full_blast.cu}"
-WORKDIR="${WORKDIR:-$PWD}"
-
-cat > "$WORKDIR/$CU" <<'CU'
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -618,10 +584,3 @@ int main() {
 
   return 0;
 }
-CU
-
-echo "[*] Building $BIN from $CU"
-nvcc -O3 -std=c++17 -arch=sm_75 -lineinfo "$WORKDIR/$CU" -o "$WORKDIR/$BIN"
-
-echo "[*] Launching $BIN"
-exec "$WORKDIR/$BIN"

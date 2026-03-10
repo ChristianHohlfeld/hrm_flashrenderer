@@ -1,0 +1,24 @@
+{
+  "metrics": {
+    "epoch": 2,
+    "train_loss": 6.226813232308422,
+    "val": {
+      "nll": 4.161713010911507,
+      "overlap": 0.02693204162934819,
+      "quality": 15.0,
+      "score": 6.614714886406716
+    }
+  },
+  "train_rows": 270,
+  "val_rows": 30,
+  "dims": {
+    "D": 256,
+    "H": 8,
+    "L": 6,
+    "F": 1024,
+    "TMAX": 512,
+    "Vpad": 16640
+  },
+  "ckpt": "/home/chris/hrm_flashrenderer/experiments/native_student_hard/student_candidate_1.bin",
+  "hidden": 128
+}
