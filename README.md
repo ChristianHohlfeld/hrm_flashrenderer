@@ -1,173 +1,110 @@
 # HRM FlashRenderer
 
-Native HRM retrieval plus native DeepSeek INT8 inference for heterogeneous multi-GPU hosts.
+Native HRM retrieval + native DeepSeek INT8 inference for heterogeneous multi-GPU hosts.
 
-## Production Goal
+## First-User Path (One Command, Full Stack, Final Prompt)
 
-This repository is finalized around one production flow:
+If your server has:
+- Python 3.10-3.12
+- NVIDIA driver + CUDA (`nvidia-smi`, `nvcc`)
+- 4 GPUs (22/11/11/10 GB) with one NVLink pair on the two 11 GB cards
+- an HRM index at `./model_index` (`router_index.bin` + `index.sqlite`)
 
-1. Native DeepSeek INT8 backend (`deepseek_int8`) as the default path.
-2. Heterogeneous 4-GPU topology with router-based dispatch (no global `world=4` bottleneck).
-3. Strict dynamic GPU topology inference with explicit NVLink pair detection.
-
-Target host profile:
-- RTX 2080 Ti 22 GB (solo)
-- RTX 2080 Ti 11 GB + RTX 2080 Ti 11 GB (NVLink pair)
-- RTX 3080 Ti 10 GB (solo)
-
-## Hardware-Aligned Model Profile (Max VRAM Without OOM)
-
-Default startup mode is `auto` with profile `max_vram_hetero`:
-
-- `solo_22gb`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
-- `nvlink_pair`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
-- `solo_3080`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
-
-Default per-service runtime settings:
-
-- `solo_22gb`: `max_seq_len=4096`, `prefill_chunk_size=768`
-- `nvlink_pair`: `max_seq_len=4096`, `prefill_chunk_size=768`
-- `solo_3080`: `max_seq_len=3072`, `prefill_chunk_size=384`
-
-## Dynamic GPU Topology (Always Inferred)
-
-`scripts/start_native_topology.sh` now enforces dynamic detection:
-
-- Detects GPU VRAM via `nvidia-smi --query-gpu=index,memory.total`.
-- Detects NVLink connectivity via `nvidia-smi topo -m`.
-- Selects NVLink service pair from actual NVLink links.
-- Selects `solo_22gb` as largest remaining VRAM GPU.
-- Selects `solo_3080` as smallest remaining VRAM GPU.
-
-Strict behavior (`STRICT_GPU_TOPOLOGY=1`, default):
-
-- Startup fails if topology cannot be inferred.
-- Startup fails if manual `GPU_*` overrides mismatch inferred topology.
-- No static fallback ordering is used by default.
-
-## Dependencies
-
-Lean production runtime:
+run exactly this from repo root:
 
 ```bash
-python3 -m pip install -r requirements.prod.txt
-python3 -m pip install -r requirements.server.txt
-python3 -m pip install -e .
+bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis."
 ```
 
-Optional torch backend only:
+This single command does:
+1. bootstrap (build + dependencies)
+2. production preflight
+3. start native DeepSeek stack
+4. verify health on all services
+5. send final prompt through router (`/v1/generate`)
+6. fail hard if no real retrieval+inference happened
+
+If it ends with `E2E PASS`, your pipeline is live.
+
+## If Bootstrap Already Done
+
+Skip reinstall/rebuild:
 
 ```bash
-python3 -m pip install -r requirements.torch.txt
+RUN_BOOTSTRAP=0 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis."
 ```
 
-Native model path uses dense HF safetensors layouts and does not support MoE/GGUF/GPTQ/AWQ for this backend.
+## Keep Running / Stop
 
-## End-to-End Production Flow (Server)
+By default, stack stays up after E2E PASS.
 
-### 1) Preflight
-
-```bash
-bash scripts/prod_preflight.sh ./model_index 4
-```
-
-Preflight now includes:
-- script syntax validation
-- Python import checks
-- CLI entrypoint checks
-- topology detection self-test (`scripts/test_topology_detection.sh`)
-
-### 2) Optional explicit model exports
-
-```bash
-bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-```
-
-### 3) Start full native stack
-
-```bash
-export BACKEND=deepseek_int8
-export PREPARE_MODELS=1
-bash scripts/start_native_stack.sh ./model_index auto
-```
-
-### 4) Verify health
-
-```bash
-curl -s http://127.0.0.1:8081/v1/health
-curl -s http://127.0.0.1:8082/v1/health
-curl -s http://127.0.0.1:8083/v1/health
-curl -s http://127.0.0.1:8090/v1/health
-```
-
-### 5) Router smoke test
-
-```bash
-bash scripts/smoke_router.sh http://127.0.0.1:8090
-```
-
-### 6) Query inference
-
-```bash
-curl -s http://127.0.0.1:8090/v1/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Summarize top retrieval evidence in 5 bullets.","route_hint":"balanced"}'
-```
-
-### 7) Stop stack
+Stop:
 
 ```bash
 bash scripts/stop_native_stack.sh
 ```
 
-## Validation Status (Before vs After)
+Auto-stop right after E2E test:
 
-### Before finalization (issues)
+```bash
+AUTO_STOP=1 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz: Stack OK?"
+```
 
-- Static GPU mapping assumptions (`1,2` / `0` / `3`) in topology startup.
-- Main docs used small default model examples.
-- Native engine had fixed layer split (`10/9/rest`) that could overload one GPU in pair mode.
-- `scripts/test.sh` was brittle for mixed environments (hard fail when `cmake` or `python` binary naming differed).
-- CRLF shell script issues could break Bash execution (`pipefail\r`).
+## Manual Flow (If You Prefer Explicit Steps)
 
-### After finalization (implemented)
+```bash
+PROFILE=deepseek_int8 bash scripts/bootstrap.sh
+bash scripts/prod_preflight.sh ./model_index 4
+bash scripts/start_native_stack.sh ./model_index auto
+bash scripts/smoke_router.sh http://127.0.0.1:8090
+```
 
-- Auto profile defaults to `14B/14B/7B` for this host shape.
-- Strict dynamic topology inference with NVLink pair detection is enforced.
-- Engine layer placement changed to balanced per visible GPU count.
-- Startup scripts support `auto` model profile and per-service tuning defaults.
-- Added topology detection regression test:
-  - `scripts/test_topology_detection.sh`
-- Hardened `scripts/test.sh` to run what is available and skip unsupported local checks cleanly.
+Final prompt call:
 
-### Executed checks in this workspace
+```bash
+curl -s http://127.0.0.1:8090/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis.","route_hint":"balanced","max_new_tokens":256}'
+```
 
-- `bash -n scripts/*.sh` on production scripts: PASS
-- `python -m compileall hrm_flash/serve.py hrm_flash/deepseek_native.py hrm_flash/cli.py hrm_flash/router.py`: PASS
-- `python -m hrm_flash.cli --help`, `serve --help`, `router --help`, `generate --help`: PASS
-- `bash scripts/test_topology_detection.sh`: PASS
-- `bash scripts/test.sh`: PASS (with environment-driven skips for unavailable tools)
-- `bash scripts/prod_preflight.sh ./.run/verify_model 1`: FAIL in this desktop environment (`nvidia-smi` missing)
+## Model + Hardware Alignment (Default)
 
-That final preflight failure is expected on this non-GPU dev environment and must be re-run on your production server.
+`auto` startup profile (`max_vram_hetero`) uses:
+- `solo_22gb`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
+- `nvlink_pair`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
+- `solo_3080`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
 
-## Required Server Acceptance (Must Pass Before Prod Switch)
+Per-service defaults:
+- `solo_22gb`: `max_seq_len=4096`, `prefill_chunk_size=768`
+- `nvlink_pair`: `max_seq_len=4096`, `prefill_chunk_size=768`
+- `solo_3080`: `max_seq_len=3072`, `prefill_chunk_size=384`
 
-1. `bash scripts/prod_preflight.sh ./model_index 4`
-2. `bash scripts/start_native_stack.sh ./model_index auto`
-3. `bash scripts/smoke_router.sh http://127.0.0.1:8090`
-4. 10-20 real prompts through router with `route_hint` values `fast`, `balanced`, `quality`
-5. Confirm no OOM / no service restarts in `.run/services/*.log`
-6. `bash scripts/stop_native_stack.sh` and clean restart once
+## Dynamic GPU Mapping (No Static Order Assumptions)
+
+`scripts/start_native_topology.sh` always infers:
+- NVLink pair from `nvidia-smi topo -m`
+- VRAM tiers from `nvidia-smi --query-gpu=index,memory.total`
+
+Strict mode is on by default:
+- `STRICT_GPU_TOPOLOGY=1`
+- startup fails if detected topology is missing/mismatched
+
+## Backend Scope
+
+Main production backend:
+- `deepseek_int8` (default)
+
+Optional:
+- `torch_tp` (separate dependency profile)
+
+Native DeepSeek path supports dense HF safetensors layouts and does not support MoE/GGUF/GPTQ/AWQ in this backend.
 
 ## Key Scripts
 
-- `scripts/start_native_stack.sh`
-- `scripts/start_native_topology.sh`
-- `scripts/build_deepseek_native.sh`
-- `scripts/deepseek_native_engine.sh`
+- `scripts/prod_live_e2e.sh`
 - `scripts/prod_preflight.sh`
+- `scripts/start_native_stack.sh`
+- `scripts/stop_native_stack.sh`
 - `scripts/smoke_router.sh`
 - `scripts/test.sh`
 - `scripts/test_topology_detection.sh`

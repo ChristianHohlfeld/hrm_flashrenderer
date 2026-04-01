@@ -120,6 +120,7 @@ bash -n scripts/stop_native_stack.sh
 bash -n scripts/smoke_router.sh
 bash -n scripts/deepseek_native_engine.sh
 bash -n scripts/test_topology_detection.sh
+bash -n scripts/prod_live_e2e.sh
 
 echo "[preflight] running topology detection self-test..."
 bash scripts/test_topology_detection.sh
