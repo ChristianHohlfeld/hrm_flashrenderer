@@ -29,7 +29,6 @@ def _cuda_ext():
                     "--use_fast_math",
                     "-lineinfo",
                     "-std=c++17",
-                    "-arch=sm_75",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",

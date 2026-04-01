@@ -15,7 +15,13 @@ from typing import Any, Dict, List, Optional
 
 from hrm_flash.hrm_client import run_hrm_query
 from hrm_flash.prompt_builder import build_sources, build_renderer_prompt, fit_prompt_to_token_budget
-from hrm_flash.utils import find_hrm_binary, validate_tp_world
+from hrm_flash.utils import (
+    ensure_local_llm_model,
+    find_hrm_binary,
+    validate_native_model_config,
+    validate_native_weight_layout,
+    validate_tp_world,
+)
 from hrm_flash.flash_daemon_client import FlashDaemonAddr, parse_daemon_addr, generate as daemon_generate
 
 
@@ -39,6 +45,7 @@ class _State:
         self.hrm_bin: Path | None = None
         self.hrm_model: Path | None = None
         self.llm_model: Path | None = None
+        self.tokenizer_source: str | None = None
         self.world: int | None = None
         self.max_seq_len: int = 8192
         self.prefill_chunk_size: int = 1024
@@ -52,6 +59,9 @@ class _State:
         self.daemon_proc: subprocess.Popen | None = None
         self.sem: asyncio.Semaphore | None = None
         self.device: str = 'cuda'
+        self.backend: str = "torch_tp"
+        self.deepseek_engine = None
+        self.native_request_timeout_s: float = 180.0
 
 
 STATE = _State()
@@ -143,7 +153,10 @@ def _build_prompt(prompt: str) -> tuple[str, list[dict[str, Any]]]:
 
     if not STATE.disable_token_budget:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(str(STATE.llm_model), local_files_only=bool(STATE.local_files_only))
+        tok_src = STATE.tokenizer_source or (str(STATE.llm_model) if STATE.llm_model is not None else None)
+        if not tok_src:
+            return "", []
+        tok = AutoTokenizer.from_pretrained(str(tok_src), local_files_only=bool(STATE.local_files_only))
         max_prompt_tokens = int(STATE.max_seq_len) - int(STATE.max_new_tokens) - int(STATE.reserve_prompt_tokens)
         q_fit, s_fit = fit_prompt_to_token_budget(q_for_prompt, sources_for_prompt, tok, max_prompt_tokens)
         if not s_fit:
@@ -159,8 +172,8 @@ def main():
 
     ap = argparse.ArgumentParser(prog="hrm-flash-serve", description="HRM FlashRenderer HTTP service (HRM retrieval + persistent FlashAttention TP daemon).")
     ap.add_argument("--hrm_model", required=True)
-    ap.add_argument("--llm_model", required=True)
-    ap.add_argument("--world", type=int, choices=[2, 3, 4], required=True)
+    ap.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID")
+    ap.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
     ap.add_argument("--host", type=str, default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
 
@@ -178,11 +191,21 @@ def main():
     ap.add_argument("--max_concurrent", type=int, default=1)
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
                     help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
+    ap.add_argument("--backend", type=str, choices=["torch_tp", "deepseek_int8"], default="torch_tp")
+    ap.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
+    ap.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
+    ap.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
+    ap.add_argument("--native_startup_timeout_s", type=float, default=120.0)
+    ap.add_argument("--native_request_timeout_s", type=float, default=180.0)
 
     args = ap.parse_args()
 
     STATE.hrm_model = Path(args.hrm_model).resolve()
-    STATE.llm_model = Path(args.llm_model).resolve()
+    if not (STATE.hrm_model / "router_index.bin").is_file() or not (STATE.hrm_model / "index.sqlite").is_file():
+        raise SystemExit(
+            f"ERR: HRM model directory must contain router_index.bin and index.sqlite: {STATE.hrm_model}"
+        )
+    STATE.backend = str(args.backend)
     STATE.world = int(args.world)
     STATE.max_seq_len = int(args.max_seq_len)
     STATE.prefill_chunk_size = int(args.prefill_chunk_size)
@@ -194,17 +217,66 @@ def main():
     STATE.disable_token_budget = bool(args.disable_token_budget)
     STATE.sem = asyncio.Semaphore(max(1, int(args.max_concurrent)))
     STATE.device = str(args.device)
+    STATE.native_request_timeout_s = float(args.native_request_timeout_s)
 
     # Locate HRM binary (only needed if hrm_api not built)
     STATE.hrm_bin = find_hrm_binary(repo_root=STATE.repo_root, explicit=args.hrm_bin)
 
-    # Validate TP world up-front
-    from transformers import AutoConfig
-    cfg = AutoConfig.from_pretrained(str(STATE.llm_model), local_files_only=bool(STATE.local_files_only))
-    validate_tp_world(cfg, int(STATE.world))
+    if STATE.backend == "deepseek_int8":
+        from hrm_flash.deepseek_native import (
+            DeepSeekNativeEngine,
+            ensure_deepseek_q8_model,
+            resolve_deepseek_engine_bin,
+        )
 
-    # Ensure daemon running
-    STATE.daemon_addr = _start_daemon_if_needed()
+        try:
+            model_bin, tok_src = ensure_deepseek_q8_model(
+                args.llm_model,
+                model_bin=args.model_bin,
+                local_files_only=bool(args.local_files_only),
+                project_root=STATE.repo_root,
+            )
+        except RuntimeError as e:
+            raise SystemExit(f"ERR: Failed to resolve/export deepseek model: {e}") from e
+        tokenizer_source = str(args.tokenizer_model or tok_src)
+        try:
+            engine_bin = resolve_deepseek_engine_bin(STATE.repo_root, explicit=args.native_engine_bin)
+        except RuntimeError as e:
+            raise SystemExit(f"ERR: {e}") from e
+
+        STATE.tokenizer_source = tokenizer_source
+        STATE.deepseek_engine = DeepSeekNativeEngine(
+            repo_root=STATE.repo_root,
+            model_bin=model_bin,
+            tokenizer_source=tokenizer_source,
+            engine_bin=engine_bin,
+            runtime_name=f"serve-{int(args.port)}",
+            local_files_only=bool(args.local_files_only),
+            max_new_tokens=int(args.max_new_tokens),
+            startup_timeout_s=float(args.native_startup_timeout_s),
+            request_timeout_s=float(args.native_request_timeout_s),
+        )
+        STATE.deepseek_engine.start()
+    else:
+        try:
+            STATE.llm_model = ensure_local_llm_model(
+                args.llm_model,
+                local_files_only=bool(args.local_files_only),
+                project_root=STATE.repo_root,
+            )
+        except RuntimeError as e:
+            raise SystemExit(f"ERR: Failed to resolve/download model '{args.llm_model}': {e}") from e
+        STATE.tokenizer_source = str(STATE.llm_model)
+
+        # Validate native model compatibility and TP world up-front
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(str(STATE.llm_model), local_files_only=bool(STATE.local_files_only))
+        validate_native_model_config(cfg)
+        validate_native_weight_layout(STATE.llm_model)
+        validate_tp_world(cfg, int(STATE.world))
+
+        # Ensure daemon running
+        STATE.daemon_addr = _start_daemon_if_needed()
 
     app = FastAPI(title="hrm-flash", version="5.1.0")
 
@@ -214,7 +286,27 @@ def main():
 
     @app.get("/v1/health")
     async def health():
-        return {"ok": True, "daemon": os.environ.get("HRM_FLASH_DAEMON"), "world": STATE.world}
+        deepseek_running = False
+        daemon_running = False
+        if STATE.deepseek_engine is not None:
+            try:
+                deepseek_running = bool(STATE.deepseek_engine.is_running())
+            except Exception:
+                deepseek_running = False
+        if STATE.backend == "torch_tp":
+            if STATE.daemon_proc is not None:
+                daemon_running = STATE.daemon_proc.poll() is None
+            else:
+                daemon_running = STATE.daemon_addr is not None
+        ok = deepseek_running if STATE.backend == "deepseek_int8" else daemon_running
+        return {
+            "ok": bool(ok),
+            "backend": STATE.backend,
+            "daemon": os.environ.get("HRM_FLASH_DAEMON") if STATE.backend == "torch_tp" else None,
+            "daemon_running": daemon_running if STATE.backend == "torch_tp" else None,
+            "deepseek_running": deepseek_running,
+            "world": STATE.world,
+        }
 
     @app.post("/v1/generate")
     async def generate(req: GenerateReq):
@@ -225,13 +317,30 @@ def main():
             if not prompt_text:
                 return JSONResponse({"ok": True, "text": "I don't know.", "sources": []})
             max_new = int(req.max_new_tokens) if req.max_new_tokens is not None else STATE.max_new_tokens
-            try:
-                text = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: daemon_generate(STATE.daemon_addr, prompt_text, max_new, STATE.prefill_chunk_size),
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+            if STATE.backend == "deepseek_int8":
+                if STATE.deepseek_engine is None:
+                    raise HTTPException(status_code=500, detail="DeepSeek engine not initialized")
+                try:
+                    text = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: STATE.deepseek_engine.generate(
+                            prompt_text,
+                            max_new_tokens=max_new,
+                            timeout_s=STATE.native_request_timeout_s,
+                        ),
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
+            else:
+                if STATE.daemon_addr is None:
+                    raise HTTPException(status_code=500, detail="Torch TP daemon is not initialized")
+                try:
+                    text = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: daemon_generate(STATE.daemon_addr, prompt_text, max_new, STATE.prefill_chunk_size),
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
             return JSONResponse({"ok": True, "text": text, "sources": sources})
 
     @app.on_event("shutdown")
@@ -241,6 +350,11 @@ def main():
         if p is not None:
             try:
                 p.terminate()
+            except Exception:
+                pass
+        if STATE.deepseek_engine is not None:
+            try:
+                STATE.deepseek_engine.stop()
             except Exception:
                 pass
 

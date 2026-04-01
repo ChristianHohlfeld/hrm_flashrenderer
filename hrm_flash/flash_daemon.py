@@ -8,6 +8,7 @@ import sys
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Listener
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -17,7 +18,12 @@ from transformers import AutoConfig, AutoTokenizer
 from tp.dist_utils import init_dist
 from engine.llama_tp import TPLlamaForCausalLM, generate_tp
 from engine.weight_loader import WeightLoader
-from hrm_flash.utils import validate_tp_world
+from hrm_flash.utils import (
+    ensure_local_llm_model,
+    validate_native_model_config,
+    validate_native_weight_layout,
+    validate_tp_world,
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,8 @@ def _worker(rank: int, cfg: DaemonConfig, master_addr: str, master_port: int):
 
     # Load tokenizer/config/model once per rank
     config = AutoConfig.from_pretrained(cfg.model_dir, local_files_only=cfg.local_files_only)
+    validate_native_model_config(config)
+    validate_native_weight_layout(Path(cfg.model_dir))
     validate_tp_world(config, int(cfg.world))
 
     model = TPLlamaForCausalLM(config, max_seq_len=int(cfg.max_seq_len), device=cfg.device).to(device).eval()
@@ -188,7 +196,7 @@ def _worker(rank: int, cfg: DaemonConfig, master_addr: str, master_port: int):
 
 def main():
     ap = argparse.ArgumentParser(prog="hrm-flashd", description="Persistent FlashAttention TP daemon (loads model once).")
-    ap.add_argument("--model", required=True, help="Local HF safetensors model dir")
+    ap.add_argument("--model", required=True, help="Local HF safetensors model dir or HF repo ID")
     ap.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
     ap.add_argument("--max_seq_len", type=int, default=8192)
     ap.add_argument("--prefill_chunk_size", type=int, default=1024)
@@ -200,10 +208,20 @@ def main():
                     help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
     args = ap.parse_args()
 
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        model_dir = ensure_local_llm_model(
+            args.model,
+            local_files_only=bool(args.local_files_only),
+            project_root=repo_root,
+        )
+    except RuntimeError as e:
+        raise SystemExit(f"ERR: Failed to resolve/download model '{args.model}': {e}") from e
+
     port = int(args.port) if int(args.port) != 0 else _pick_free_port()
 
     cfg = DaemonConfig(
-        model_dir=str(args.model),
+        model_dir=str(model_dir),
         world=int(args.world),
         max_seq_len=int(args.max_seq_len),
         prefill_chunk_size=int(args.prefill_chunk_size),

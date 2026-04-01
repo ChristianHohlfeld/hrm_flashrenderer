@@ -1,0 +1,2 @@
+-r requirements.prod.txt
+torch==2.2.0

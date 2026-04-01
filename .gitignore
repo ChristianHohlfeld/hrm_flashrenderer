@@ -20,6 +20,9 @@ real_payloads.jsonl
 # Database & Logs
 *.sqlite
 *.log
+.run/
+deepseek_engine
+llm_engine
 
 # Python
 __pycache__/

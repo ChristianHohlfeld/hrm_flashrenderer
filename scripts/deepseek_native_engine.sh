@@ -1,8 +1,8 @@
 #!/bin/bash
-# © 2026 Christian Heinrich Hohlfeld (Konstanz, Germany), christianhohlfeld.com, ORCID 0009-0003-6634-9045.
-# DeepSeek INT8 Persistent Decode Engine — Single File, No Compromise, Prod Class
+# Â© 2026 Christian Heinrich Hohlfeld (Konstanz, Germany), christianhohlfeld.com, ORCID 0009-0003-6634-9045.
+# DeepSeek INT8 Persistent Decode Engine â€” Single File, No Compromise, Prod Class
 # Hardware Target: RTX 2080 Ti (sm_75), 11 GB VRAM
-# Model: DeepSeek-R1-Distill-Qwen-1.5B (D=1536 H=12 KVH=2 Dh=128 F=8960 L=28 V=151936)
+# Model Scope: DeepSeek dense distill variants (Qwen/Llama-style safetensors layout)
 #
 # Architecture:
 #   - INT8 weights with per-row fp32 scale (W8A16 quantization)
@@ -10,25 +10,27 @@
 #   - FP16 KV cache (compact, no precision loss)
 #   - Online softmax with fused 1/sqrt(Dh) scaling
 #   - RoPE (Q15 precomputed sin/cos tables in device memory)
-#   - DP4A dot products for weight GEMVs (bandwidth-bound → int8 wins)
+#   - DP4A dot products for weight GEMVs (bandwidth-bound â†’ int8 wins)
 #   - Zero-copy mmap weight loading
 #   - Pure numpy export (NO TORCH)
 
 set -euo pipefail
 
 WORKDIR="${WORKDIR:-$PWD}"
-PYTHON="${PYTHON:-/home/chris/myenv2/bin/python}"
-PIP="${PIP:-/home/chris/myenv2/bin/pip}"
-MODEL_REPO="${MODEL_REPO:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}"
+PYTHON="${PYTHON:-python3}"
+MODEL_REPO="${MODEL_REPO:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 MODEL_BIN="${MODEL_BIN:-model_q8.bin}"
-ENGINE_BIN="${ENGINE_BIN:-deepseek_engine}"
-SM="${SM:-75}"
+ENGINE_BIN="${ENGINE_BIN:-$WORKDIR/.run/bin/deepseek_engine}"
+SM="${SM:-75}"  # Backward-compatible single-arch override.
+CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-75,86}"  # Comma-separated list, e.g. "75,86"
+FORCE_REBUILD="${FORCE_REBUILD:-0}"
+SKIP_RUN="${SKIP_RUN:-0}"
 
 cd "$WORKDIR"
 
-# ═══════════════════════════════════════════════════════════════
-# PHASE 1: Inline Python Exporter (BF16→INT8, all layers, NO TORCH)
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# PHASE 1: Inline Python Exporter (BF16â†’INT8, all layers, NO TORCH)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 cat << 'PYEOF' > /tmp/_dsi8_export.py
 import os, sys, struct, json
 import numpy as np
@@ -62,7 +64,7 @@ def load_safetensors(path):
     return out
 
 def q8_row(t):
-    """Per-row INT8 quantization with fp32 scale: t ≈ q * scale"""
+    """Per-row INT8 quantization with fp32 scale: t â‰ˆ q * scale"""
     absmax = np.abs(t).max(axis=-1)
     absmax = np.maximum(absmax, 1e-8)
     scale = absmax / 127.0
@@ -170,18 +172,19 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-# ═══════════════════════════════════════════════════════════════
-# PHASE 2: Inline CUDA Engine — FP32 hidden + INT8 weight GEMVs
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# PHASE 2: Inline CUDA Engine â€” FP32 hidden + INT8 weight GEMVs
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 cat << 'CUEOF' > /tmp/_dsi8_engine.cu
-// © 2026 Christian Heinrich Hohlfeld (Konstanz, Germany), christianhohlfeld.com
-// DeepSeek INT8 Persistent Decode Engine — Hybrid FP32/INT8
+// Â© 2026 Christian Heinrich Hohlfeld (Konstanz, Germany), christianhohlfeld.com
+// DeepSeek INT8 Persistent Decode Engine â€” Hybrid FP32/INT8
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -210,7 +213,7 @@ cat << 'CUEOF' > /tmp/_dsi8_engine.cu
 #define NVML_CHECK(x) do { nvmlReturn_t r=(x); if(r!=NVML_SUCCESS){ \
   fprintf(stderr,"NVML Error: %s\n",nvmlErrorString(r)); exit(1);}} while(0)
 
-// ─── Config ───
+// â”€â”€â”€ Config â”€â”€â”€
 struct ModelConfig {
   int D, H, KVH, Dh, F, V, L, Tmax;
   double rope_theta;
@@ -239,7 +242,7 @@ struct TelemetryCtx {
     bool enabled;
 };
 
-// ─── Tensor types ───
+// â”€â”€â”€ Tensor types â”€â”€â”€
 #define TENSOR_TYPE_Q8  0
 #define TENSOR_TYPE_F32 1
 
@@ -254,7 +257,7 @@ struct TensorF32 {
   const float* data;
 };
 
-// ─── Mmap Loader ───
+// â”€â”€â”€ Mmap Loader â”€â”€â”€
 struct Loader {
   uint8_t* base; size_t sz; int fd;
   ModelConfig cfg;
@@ -330,11 +333,11 @@ private:
   }
 };
 
-// ═══════════════════════════════════════════════════════════════
-// CUDA KERNELS — FP32 activations, INT8 weight GEMVs
-// ═══════════════════════════════════════════════════════════════
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// CUDA KERNELS â€” FP32 activations, INT8 weight GEMVs
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-// ─── RoPE tables (per-GPU) ───
+// â”€â”€â”€ RoPE tables (per-GPU) â”€â”€â”€
 static float* d_rope_sin[3] = {nullptr, nullptr, nullptr};
 static float* d_rope_cos[3] = {nullptr, nullptr, nullptr};
 
@@ -360,7 +363,7 @@ static void init_rope_tables(int Dh, int Tmax, double theta, int n_gpus) {
   }
 }
 
-// ─── RMSNorm then INT8 Quantize (Fused) ───
+// â”€â”€â”€ RMSNorm then INT8 Quantize (Fused) â”€â”€â”€
 // out_q: [D] int8, out_scale: [1] float
 __global__ void rmsnorm_quant(int8_t* out_q, float* out_scale, float* out_f32, 
                              const float* x, const float* gamma, float eps, int D) {
@@ -415,7 +418,7 @@ __global__ void rmsnorm_quant(int8_t* out_q, float* out_scale, float* out_f32,
   }
 }
 
-// ─── Optimized GEMV using pre-quantized x ───
+// â”€â”€â”€ Optimized GEMV using pre-quantized x â”€â”€â”€
 __global__ void gemv_w8_prequant(float* out, const int8_t* x_q, float x_scale,
                                 const int8_t* W, const float* w_scale, int rows, int cols) {
   int row = blockIdx.x;
@@ -448,7 +451,7 @@ __global__ void gemv_w8_prequant(float* out, const int8_t* x_q, float x_scale,
   }
 }
 
-// ─── Standard INT8 Weight GEMV (quantizes on-the-fly) ───
+// â”€â”€â”€ Standard INT8 Weight GEMV (quantizes on-the-fly) â”€â”€â”€
 __global__ void gemv_w8(float* out, const float* x, const int8_t* W,
                         const float* w_scale, int rows, int cols) {
   int row = blockIdx.x;
@@ -501,13 +504,13 @@ __global__ void gemv_w8(float* out, const float* x, const int8_t* W,
   }
 }
 
-// ─── Add bias (fp32) ───
+// â”€â”€â”€ Add bias (fp32) â”€â”€â”€
 __global__ void add_bias_f(float* x, const float* bias, int n) {
   int i = blockIdx.x*blockDim.x+threadIdx.x;
   if(i<n) x[i] += bias[i];
 }
 
-// ─── RoPE (fp32 in-place) ───
+// â”€â”€â”€ RoPE (fp32 in-place) â”€â”€â”€
 __global__ void rope_apply(float* q, const float* rope_cos, const float* rope_sin,
                            int t, int Dh) {
   int head = blockIdx.x;
@@ -522,7 +525,7 @@ __global__ void rope_apply(float* q, const float* rope_cos, const float* rope_si
   qh[2*d+1] = q0*s + q1*c;
 }
 
-// ─── KV Store (fp32 → fp16) ───
+// â”€â”€â”€ KV Store (fp32 â†’ fp16) â”€â”€â”€
 __global__ void kv_store(half* Kc, half* Vc, const float* k, const float* v,
                          int t, int KVDh) {
   int i = blockIdx.x*blockDim.x+threadIdx.x;
@@ -531,7 +534,7 @@ __global__ void kv_store(half* Kc, half* Vc, const float* k, const float* v,
   Vc[(size_t)t*KVDh + i] = __float2half(v[i]);
 }
 
-// ─── Online Softmax Attention (Corrected Decode) ───
+// â”€â”€â”€ Online Softmax Attention (Corrected Decode) â”€â”€â”€
 __global__ void attn_decode(float* out, const float* q,
                              const half* Kc, const half* Vc,
                              int t, int Dh, int KVH, float inv_sqrt_dh) {
@@ -576,7 +579,7 @@ __global__ void attn_decode(float* out, const float* q,
   out[head * Dh + tid] = acc / fmaxf(s, 1e-10f);
 }
 
-// ─── SiLU gate × up (fp32) ───
+// â”€â”€â”€ SiLU gate Ã— up (fp32) â”€â”€â”€
 __global__ void silu_gate_mul(float* out, const float* gate, const float* up, int n) {
   int i = blockIdx.x*blockDim.x+threadIdx.x;
   if(i>=n) return;
@@ -585,7 +588,7 @@ __global__ void silu_gate_mul(float* out, const float* gate, const float* up, in
   out[i] = g * sigmoid * up[i];
 }
 
-// ─── Argmax ───
+// â”€â”€â”€ Argmax â”€â”€â”€
 __global__ void argmax_kernel(const float* logits, int* result, int V) {
   __shared__ float sv[256];
   __shared__ int si[256];
@@ -602,7 +605,7 @@ __global__ void argmax_kernel(const float* logits, int* result, int V) {
   if(tid==0) result[0]=si[0];
 }
 
-// ─── Log-Softmax + Cross-Entropy Loss (for PPL tracking) ───
+// â”€â”€â”€ Log-Softmax + Cross-Entropy Loss (for PPL tracking) â”€â”€â”€
 __global__ void cross_entropy_loss(const float* logits, int target, float* loss, int V) {
   // Compute log(softmax(logits))[target]
   // Step 1: find max
@@ -635,13 +638,13 @@ __global__ void cross_entropy_loss(const float* logits, int target, float* loss,
   }
 }
 
-// ─── Add residual ───
+// â”€â”€â”€ Add residual â”€â”€â”€
 __global__ void add_inplace(float* a, const float* b, int n) {
   int i=blockIdx.x*blockDim.x+threadIdx.x;
   if(i<n) a[i]+=b[i];
 }
 
-// ─── Embed lookup (fp32 dequantize) ───
+// â”€â”€â”€ Embed lookup (fp32 dequantize) â”€â”€â”€
 __global__ void embed_lookup(float* out, const int8_t* table, const float* scale,
                              int tok, int D) {
   int i = blockIdx.x*blockDim.x+threadIdx.x;
@@ -733,9 +736,9 @@ static void send_telemetry(TelemetryCtx* ctx, float loss, int step, float* d_vec
     sendto(ctx->sock, &p, sizeof(p), 0, (struct sockaddr*)&ctx->addr, sizeof(ctx->addr));
 }
 
-// ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // MULTI-GPU & INTERACTIVE INFRASTRUCTURE
-// ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 struct GPUBuffer {
     float *d_hidden;
@@ -750,7 +753,9 @@ struct GPUBuffer {
 };
 
 static void check_prompt_file(char* buffer, size_t size) {
-    FILE* f = fopen("/tmp/deepseek_prompt.txt", "r");
+    const char* prompt_path = std::getenv("DSI8_PROMPT_FILE");
+    if (!prompt_path || !prompt_path[0]) prompt_path = "/tmp/deepseek_prompt.txt";
+    FILE* f = fopen(prompt_path, "r");
     if (f) {
         if (fgets(buffer, size, f)) {
             // strip newline
@@ -758,10 +763,86 @@ static void check_prompt_file(char* buffer, size_t size) {
             if (nl) *nl = 0;
         }
         fclose(f);
-        remove("/tmp/deepseek_prompt.txt");
+        remove(prompt_path);
     } else {
         buffer[0] = 0;
     }
+}
+
+static const char* dsi8_tokens_path() {
+    const char* p = std::getenv("DSI8_TOKENS_FILE");
+    return (p && p[0]) ? p : "/tmp/deepseek_tokens.txt";
+}
+
+static const char* dsi8_prompt_tokens_path() {
+    const char* p = std::getenv("DSI8_PROMPT_TOKENS_FILE");
+    return (p && p[0]) ? p : "/tmp/deepseek_prompt_tokens.txt";
+}
+
+static const char* dsi8_done_path() {
+    const char* p = std::getenv("DSI8_DONE_FILE");
+    return (p && p[0]) ? p : "/tmp/deepseek_done.flag";
+}
+
+static int dsi8_tgen_default() {
+    const char* s = std::getenv("DSI8_TGEN");
+    if (!s || !s[0]) return 64;
+    int v = std::atoi(s);
+    if (v < 1) v = 1;
+    if (v > 2048) v = 2048;
+    return v;
+}
+
+static void clear_result_files() {
+    remove(dsi8_tokens_path());
+    remove(dsi8_done_path());
+}
+
+static void load_prompt_tokens(std::vector<int>& out) {
+    out.clear();
+    const char* path = dsi8_prompt_tokens_path();
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char line[64];
+    while (fgets(line, sizeof(line), f)) {
+        int tok = std::atoi(line);
+        if (tok >= 0) out.push_back(tok);
+    }
+    fclose(f);
+    remove(path);
+}
+
+static void append_token_id(int tok) {
+    FILE* f = fopen(dsi8_tokens_path(), "a");
+    if (!f) return;
+    fprintf(f, "%d\n", tok);
+    fclose(f);
+}
+
+static void mark_done() {
+    FILE* f = fopen(dsi8_done_path(), "w");
+    if (!f) return;
+    fprintf(f, "done\n");
+    fclose(f);
+}
+
+static inline int layer_owner(int layer_idx, int n_layers, int n_gpus) {
+    if (n_gpus <= 1) return 0;
+    if (n_gpus > 3) n_gpus = 3;
+    if (n_layers <= 0) return 0;
+    if (layer_idx < 0) layer_idx = 0;
+    if (layer_idx >= n_layers) layer_idx = n_layers - 1;
+
+    int base = n_layers / n_gpus;
+    int rem = n_layers % n_gpus;
+    int start = 0;
+    for (int g = 0; g < n_gpus; g++) {
+        int cnt = base + ((g < rem) ? 1 : 0);
+        int end = start + cnt;
+        if (layer_idx < end) return g;
+        start = end;
+    }
+    return n_gpus - 1;
 }
 int main(int argc, char** argv) {
   if(argc<2){ fprintf(stderr,"Usage: %s <model_q8.bin> [prompt_text]\n",argv[0]); return 1; }
@@ -774,7 +855,7 @@ int main(int argc, char** argv) {
   auto& C = ldr.cfg;
   
   TelemetryCtx telem;
-  init_telemetry(&telem, C.D, argc > 2 ? argv[2] : "DeepSeek-1.5B-Q8");
+  init_telemetry(&telem, C.D, argc > 2 ? argv[2] : "DeepSeek-Distill-Q8");
   printf("[*] Model: D=%d H=%d KVH=%d Dh=%d F=%d V=%d L=%d Tmax=%d\n",
          C.D, C.H, C.KVH, C.Dh, C.F, C.V, C.L, C.Tmax);
   fflush(stdout);
@@ -784,8 +865,19 @@ int main(int argc, char** argv) {
 
   int n_gpus = 0;
   cudaGetDeviceCount(&n_gpus);
+  if (n_gpus < 1) {
+    fprintf(stderr, "ERR: no CUDA devices visible. Check CUDA_VISIBLE_DEVICES and NVIDIA driver.\n");
+    return 1;
+  }
   if (n_gpus > 3) n_gpus = 3;
   printf("[*] Using %d GPUs for Layer Splitting\n", n_gpus);
+  fflush(stdout);
+
+  std::vector<int> layer_counts((size_t)n_gpus, 0);
+  for (int l = 0; l < C.L; l++) layer_counts[(size_t)layer_owner(l, C.L, n_gpus)]++;
+  for (int g = 0; g < n_gpus; g++) {
+    printf("[*] Layer partition GPU %d: %d layers\n", g, layer_counts[(size_t)g]);
+  }
   fflush(stdout);
 
   init_rope_tables(C.Dh, C.Tmax, C.rope_theta, n_gpus);
@@ -855,8 +947,7 @@ int main(int argc, char** argv) {
 
   size_t kv_layer = (size_t)C.Tmax * KVDh * sizeof(half);
   for(int l=0; l<C.L; l++) {
-    int target_gpu = (l < 10) ? 0 : (l < 19 ? 1 : 2);
-    if (target_gpu >= n_gpus) target_gpu = n_gpus - 1;
+    int target_gpu = layer_owner(l, C.L, n_gpus);
     cudaSetDevice(target_gpu);
 
     char pfix[128]; snprintf(pfix, 128, "model.layers.%d.", l);
@@ -903,20 +994,29 @@ int main(int argc, char** argv) {
     }
     printf("> Received Prompt: %s\n", prompt_buf); fflush(stdout);
 
-    int cur_tok = C.bos_id; 
-    int Tgen = 64;
+    std::vector<int> prompt_tokens;
+    load_prompt_tokens(prompt_tokens);
+    if (prompt_tokens.empty()) prompt_tokens.push_back(C.bos_id);
+
+    int prompt_len = (int)prompt_tokens.size();
+    int Tgen = dsi8_tgen_default();
+    int total_steps = prompt_len + Tgen;
+    if (total_steps > C.Tmax) total_steps = C.Tmax;
+    int generated = 0;
+    int next_tok = prompt_tokens[0];
+
+    clear_result_files();
     float total_loss = 0.0f;
     int loss_count = 0;
     
-    for(int t=0; t<Tgen; t++) {
+    for(int t=0; t<total_steps; t++) {
+      int cur_tok = (t < prompt_len) ? prompt_tokens[(size_t)t] : next_tok;
       cudaSetDevice(0);
       embed_lookup<<<(C.D+255)/256, 256>>>(gb[0].d_hidden, d_embed_w, d_embed_s, cur_tok, C.D);
 
       for(int l=0; l<C.L; l++) {
-        int target_gpu = (l < 10) ? 0 : (l < 19 ? 1 : 2);
-        if (target_gpu >= n_gpus) target_gpu = n_gpus - 1;
-        int prev_gpu = (l > 0) ? ((l-1 < 10) ? 0 : (l-1 < 19 ? 1 : 2)) : 0;
-        if (prev_gpu >= n_gpus) prev_gpu = n_gpus - 1;
+        int target_gpu = layer_owner(l, C.L, n_gpus);
+        int prev_gpu = (l > 0) ? layer_owner(l - 1, C.L, n_gpus) : 0;
 
         if (target_gpu != prev_gpu) {
             CUDA_CHECK(cudaMemcpy(gb[target_gpu].d_hidden, gb[prev_gpu].d_hidden, C.D * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -984,48 +1084,84 @@ int main(int argc, char** argv) {
       gemv_w8_prequant<<<C.V, 128>>>(d_logits, gb[0].d_x_q, head_xs, d_lmhead_w, d_lmhead_s, C.V, C.D);
       
       argmax_kernel<<<1, 256>>>(d_logits, d_next_tok, C.V);
-      CUDA_CHECK(cudaMemcpy(&cur_tok, d_next_tok, sizeof(int), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(&next_tok, d_next_tok, sizeof(int), cudaMemcpyDeviceToHost));
 
       float step_loss = 0.0f;
       if (t > 0) {
-          cross_entropy_loss<<<1, 256>>>(d_logits, cur_tok, d_loss, C.V);
+          cross_entropy_loss<<<1, 256>>>(d_logits, next_tok, d_loss, C.V);
           CUDA_CHECK(cudaMemcpy(&step_loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost));
           total_loss += step_loss; loss_count++;
       }
-      char idbuf[64]; snprintf(idbuf, 64, "TokenID: %d", cur_tok);
+      if (t >= prompt_len - 1) {
+          append_token_id(next_tok);
+          generated++;
+      }
+      char idbuf[64]; snprintf(idbuf, 64, "TokenID: %d", next_tok);
       send_telemetry(&telem, step_loss, t, gb[0].d_hidden, C.D, idbuf);
-      if(t == 0 || t % 10 == 0) printf("t=%d tok=%d\n", t, cur_tok);
+      if(t == 0 || t % 10 == 0) printf("t=%d tok=%d\n", t, next_tok);
+      if (generated >= Tgen) break;
     }
+    mark_done();
     printf("> Generation complete.\n\n> "); fflush(stdout);
   }
   return 0;
 }
 CUEOF
 
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # PHASE 3: Skip (assume env ready)
 
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # PHASE 4: Export Model (v3 format: Q8 weights + F32 norms/bias)
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 if [ ! -f "$MODEL_BIN" ]; then
-  echo "[*] Exporting $MODEL_REPO → $MODEL_BIN ..."
+  echo "[*] Exporting $MODEL_REPO â†’ $MODEL_BIN ..."
   "$PYTHON" /tmp/_dsi8_export.py "$MODEL_REPO" "$MODEL_BIN"
 fi
 
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # PHASE 5: Compile
-# ═══════════════════════════════════════════════════════════════
-echo "[*] Compiling engine (sm_$SM, -O3, --use_fast_math)..."
-nvcc -O3 --use_fast_math -Xptxas -O3,-v -arch=sm_$SM \
-     /tmp/_dsi8_engine.cu -o "$ENGINE_BIN" -lnvidia-ml
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+echo "[*] Compiling engine (-O3, --use_fast_math)..."
+if [ "$FORCE_REBUILD" = "1" ] || [ ! -x "$ENGINE_BIN" ]; then
+  arch_list="$CUDA_ARCH_LIST"
+  if [ -z "${arch_list// /}" ]; then
+    arch_list="$SM"
+  fi
+  IFS=',' read -r -a _archs <<< "$arch_list"
+  NVCC_ARCH_FLAGS=()
+  LAST_ARCH=""
+  for raw_arch in "${_archs[@]}"; do
+    arch="${raw_arch// /}"
+    if [ -z "$arch" ]; then
+      continue
+    fi
+    NVCC_ARCH_FLAGS+=("-gencode=arch=compute_${arch},code=sm_${arch}")
+    LAST_ARCH="$arch"
+  done
+  if [ -z "$LAST_ARCH" ]; then
+    LAST_ARCH="$SM"
+    NVCC_ARCH_FLAGS+=("-gencode=arch=compute_${LAST_ARCH},code=sm_${LAST_ARCH}")
+  fi
+  NVCC_ARCH_FLAGS+=("-gencode=arch=compute_${LAST_ARCH},code=compute_${LAST_ARCH}")
+  echo "[*] CUDA_ARCH_LIST=$arch_list"
+  mkdir -p "$(dirname "$ENGINE_BIN")"
+  nvcc -O3 --use_fast_math -Xptxas -O3,-v "${NVCC_ARCH_FLAGS[@]}" \
+       /tmp/_dsi8_engine.cu -o "$ENGINE_BIN" -lnvidia-ml
+else
+  echo "[*] Reusing existing engine binary: $ENGINE_BIN"
+fi
 
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # PHASE 6: Run
-# ═══════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 echo "================================================================="
 echo "  DeepSeek INT8 Persistent Decode Engine (Hybrid FP32/INT8)"
 echo "  Model: $MODEL_REPO"
 echo "  Binary: $MODEL_BIN"
 echo "================================================================="
-./"$ENGINE_BIN" "$MODEL_BIN" "$MODEL_REPO"
+if [ "$SKIP_RUN" = "1" ]; then
+  echo "[*] SKIP_RUN=1 -> build/export finished."
+  exit 0
+fi
+"$ENGINE_BIN" "$MODEL_BIN" "$MODEL_REPO"

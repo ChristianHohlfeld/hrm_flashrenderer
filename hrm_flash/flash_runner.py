@@ -36,8 +36,9 @@ def run_flash_generate(
     ]
     if local_files_only:
         cmd.append("--local_files_only")
-    if world is not None:
-        cmd += ["--world", str(int(world))]
+    # Local subprocess mode should always be explicit about world size.
+    # If not provided by caller, default to single-GPU TP world=1.
+    cmd += ["--world", str(int(world) if world is not None else 1)]
     cmd += ["--device", device]
 
     env = os.environ.copy()

@@ -1,12 +1,5 @@
-# Core
-torch==2.2.0
+# Lean core (no-torch native path)
+numpy>=1.26
+huggingface_hub>=0.20
 transformers==4.38.1
 safetensors>=0.4.1
-
-# Server
-fastapi
-uvicorn
-pydantic
-
-# Renderer (Zero VRAM)
-llama-cpp-python

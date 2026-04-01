@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source /home/chris/myenv2/bin/activate
 cd "$ROOT_DIR"
 
 PRESET="decision"
@@ -115,12 +114,26 @@ case "$PRESET" in
   *) echo "Invalid preset: $PRESET"; exit 2 ;;
 esac
 
-RUNNERS=(
-  "orig|./run_llm_orig.sh|"
-  "llm|./run_llm.sh|"
-  "llm_pho|./run_llm.sh|--pho"
-)
-[[ "$INCLUDE_BEAST" == "1" ]] && RUNNERS+=("beast|./runbeast.sh|")
+RUNNERS=()
+if [[ -f "./run_llm_orig.sh" ]]; then
+  RUNNERS+=("orig|./run_llm_orig.sh|")
+else
+  echo "FATAL: ./run_llm_orig.sh not found" >&2
+  exit 1
+fi
+if [[ -f "./run_llm.sh" ]]; then
+  RUNNERS+=("llm|./run_llm.sh|")
+  RUNNERS+=("llm_pho|./run_llm.sh|--pho")
+else
+  echo "WARN: ./run_llm.sh not found, skipping llm/llm_pho runners" >&2
+fi
+if [[ "$INCLUDE_BEAST" == "1" ]]; then
+  if [[ -f "./runbeast.sh" ]]; then
+    RUNNERS+=("beast|./runbeast.sh|")
+  else
+    echo "WARN: --include-beast requested but ./runbeast.sh not found, skipping beast runner" >&2
+  fi
+fi
 
 run_once(){
   local runner="$1" script="$2" flag="$3" scenario="$4" corpus="$5" seq="$6" batch="$7" lr="$8" rep="$9"
@@ -128,7 +141,7 @@ run_once(){
   local ckpt="$OUT_DIR/logs/ckpt_${runner}__${scenario}__lr${lr}__r${rep}.bin"
 
   INDEX_INPUTS="$corpus" DATA_FILE="$corpus" /usr/bin/time -f 'ELAPSED_SEC=%e' \
-    "$script" --train --force-new --steps "$STEPS" --log_every "$LOG_EVERY" --save_every "$SAVE_EVERY" \
+    bash "$script" --train --force-new --steps "$STEPS" --log_every "$LOG_EVERY" --save_every "$SAVE_EVERY" \
     --gpus "$GPUS" --seq "$seq" --batch "$batch" --measure --lr "$lr" --ckpt "$ckpt" $flag > "$log" 2>&1
 
   local tok sec lr_disp
