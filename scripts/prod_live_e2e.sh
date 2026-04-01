@@ -95,6 +95,8 @@ require_cmd python3
 
 echo "[1/5] bootstrap (RUN_BOOTSTRAP=$RUN_BOOTSTRAP)"
 if [[ "$RUN_BOOTSTRAP" == "1" ]]; then
+  require_cmd cmake
+  require_cmd ctest
   PROFILE=deepseek_int8 bash "$SCRIPT_DIR/bootstrap.sh"
 else
   echo "[skip] bootstrap skipped"

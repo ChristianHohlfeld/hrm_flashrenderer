@@ -5,7 +5,8 @@ Native HRM retrieval + native DeepSeek INT8 inference for heterogeneous multi-GP
 ## First-User Path (One Command, Full Stack, Final Prompt)
 
 If your server has:
-- Python 3.10-3.12
+- Python 3.10-3.12 (hard requirement)
+- `cmake` + `ctest` (needed when `RUN_BOOTSTRAP=1`)
 - NVIDIA driver + CUDA (`nvidia-smi`, `nvcc`)
 - 4 GPUs (22/11/11/10 GB) with one NVLink pair on the two 11 GB cards
 - an HRM index at `./model_index` (`router_index.bin` + `index.sqlite`)
