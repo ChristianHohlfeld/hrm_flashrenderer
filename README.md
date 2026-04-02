@@ -196,6 +196,8 @@ The mode behavior is implemented in visible Python source files (not only in a c
 - `hrm_flash/serve.py`
   - `_build_prompt`: `deepseek_only` returns early (no `run_hrm_query` call)
   - `/v1/generate`: `hrm_active` and source exposure are mode-dependent
+  - runtime `audit` fields per response: `hrm_called`, `source_injected_count`, `prompt_template`
+  - `/v1/health` audit counters: `hrm_query_calls_total`, `hrm_query_calls_by_mode`, `mode_counts`
 - `hrm_flash/router.py`
   - `_resolve_mode`, `_resolve_show_sources`
   - `deepseek_only` forces `show_sources=False` and logs `mode=deepseek_only no retrieval`
@@ -215,6 +217,23 @@ RUN_HARD_SCRIPT_TESTS=1 bash scripts/test.sh
 # End-to-end mode matrix only
 bash scripts/test_prod_live_e2e.sh
 ```
+
+## Comparable DeepSeek Benchmarks (Real Router Path)
+
+Use the dedicated benchmark runner for reproducible latency/throughput comparisons:
+
+```bash
+BENCH_MODES=mixed,deepseek_only,retrieval \
+BENCH_ROUTE_HINTS=balanced,fast,quality \
+BENCH_SCENARIOS=short,medium,long \
+BENCH_REPEATS=5 BENCH_WARMUP=1 \
+bash scripts/benchmark_deepseek.sh http://127.0.0.1:8090 ./.run/benchmarks/deepseek_live
+```
+
+Output files:
+- `raw.csv` (all runs)
+- `summary.csv` (p50/p95/mean by scenario+mode+route_hint)
+- `summary.txt` (top combinations by score = mean_tokens_per_s / p95_latency_ms)
 
 The start scripts now pin runtime to this checkout by default (`python -m hrm_flash.cli`) to avoid stale global `hrm-flash` binaries.
 Optional override for advanced setups:
@@ -252,6 +271,7 @@ Native DeepSeek path supports dense HF safetensors layouts and does not support 
 
 - `scripts/prod_live_e2e.sh`
 - `scripts/prod_preflight.sh`
+- `scripts/benchmark_deepseek.sh`
 - `scripts/start_easy.sh`
 - `scripts/start_native_stack.sh`
 - `scripts/stop_native_stack.sh`

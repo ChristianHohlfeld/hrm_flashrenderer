@@ -30,6 +30,8 @@ echo "[python] three-mode tests"
 "$PYTHON_BIN" -m unittest tests.test_modes
 echo "[python] serve mode tests"
 "$PYTHON_BIN" -m unittest tests.test_serve_modes
+echo "[python] mode audit runtime tests"
+"$PYTHON_BIN" -m unittest tests.test_mode_audit_runtime
 echo "[python] router logic tests"
 "$PYTHON_BIN" -m unittest tests.test_router_logic
 echo "[python] hrm_api test"
@@ -54,6 +56,8 @@ if [[ "${RUN_HARD_SCRIPT_TESTS:-0}" == "1" ]]; then
   bash scripts/test_prod_preflight.sh
   echo "[bash] prod_live_e2e hard test"
   bash scripts/test_prod_live_e2e.sh
+  echo "[bash] benchmark_deepseek hard test"
+  bash scripts/test_benchmark_deepseek.sh
 else
   echo "[skip] hard script tests disabled (set RUN_HARD_SCRIPT_TESTS=1 to enable)"
 fi

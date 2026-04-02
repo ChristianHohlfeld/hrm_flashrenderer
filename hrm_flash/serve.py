@@ -52,6 +52,11 @@ class _State:
         self.backend: str = "deepseek_int8"
         self.deepseek_engine = None
         self.native_request_timeout_s: float = 180.0
+        self.requests_total: int = 0
+        self.mode_counts: dict[str, int] = {"mixed": 0, "retrieval": 0, "deepseek_only": 0}
+        self.hrm_query_calls_total: int = 0
+        self.hrm_query_calls_by_mode: dict[str, int] = {"mixed": 0, "retrieval": 0, "deepseek_only": 0}
+        self.prompt_build_failures: int = 0
 
 
 STATE = _State()
@@ -61,6 +66,10 @@ def _build_prompt(prompt: str, mode: str) -> tuple[str, list[Any], str, bool]:
     resolved_mode = normalize_mode(mode)
     if resolved_mode == "deepseek_only":
         return build_prompt_for_mode(prompt, [], mode=resolved_mode), [], resolved_mode, False
+
+    # Audit: explicit counter for every live HRM query invocation.
+    STATE.hrm_query_calls_total += 1
+    STATE.hrm_query_calls_by_mode[resolved_mode] = STATE.hrm_query_calls_by_mode.get(resolved_mode, 0) + 1
 
     # HRM query (prefer API if built, else subprocess)
     r = run_hrm_query(
@@ -216,6 +225,13 @@ def main():
             "backend": STATE.backend,
             "deepseek_running": deepseek_running,
             "world": STATE.world,
+            "audit": {
+                "requests_total": int(STATE.requests_total),
+                "mode_counts": dict(STATE.mode_counts),
+                "hrm_query_calls_total": int(STATE.hrm_query_calls_total),
+                "hrm_query_calls_by_mode": dict(STATE.hrm_query_calls_by_mode),
+                "prompt_build_failures": int(STATE.prompt_build_failures),
+            },
         }
 
     @app.post("/v1/generate")
@@ -227,10 +243,30 @@ def main():
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         async with STATE.sem:
+            STATE.requests_total += 1
+            STATE.mode_counts[mode] = STATE.mode_counts.get(mode, 0) + 1
             prompt_text, sources, mode, hrm_active = _build_prompt(req.prompt, mode=mode)
+            prompt_template = "deepseek_only_raw"
+            if mode == "mixed":
+                prompt_template = "mixed_silent"
+            elif mode == "retrieval":
+                prompt_template = "retrieval_explicit"
             show_sources = bool(req.show_sources) if req.show_sources is not None else (mode == "retrieval")
             if not prompt_text:
-                payload = {"ok": True, "text": "I don't know.", "source_count": 0, "mode": mode, "hrm_active": hrm_active}
+                STATE.prompt_build_failures += 1
+                payload = {
+                    "ok": True,
+                    "text": "I don't know.",
+                    "source_count": 0,
+                    "mode": mode,
+                    "hrm_active": hrm_active,
+                    "audit": {
+                        "mode_resolved": mode,
+                        "hrm_called": bool(hrm_active),
+                        "source_injected_count": 0,
+                        "prompt_template": prompt_template,
+                    },
+                }
                 if show_sources or STATE.expose_sources:
                     payload["sources"] = []
                 return JSONResponse(payload)
@@ -248,7 +284,19 @@ def main():
                 )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
-            payload = {"ok": True, "text": text, "source_count": len(sources), "mode": mode, "hrm_active": hrm_active}
+            payload = {
+                "ok": True,
+                "text": text,
+                "source_count": len(sources),
+                "mode": mode,
+                "hrm_active": hrm_active,
+                "audit": {
+                    "mode_resolved": mode,
+                    "hrm_called": bool(hrm_active),
+                    "source_injected_count": int(len(sources)),
+                    "prompt_template": prompt_template,
+                },
+            }
             if (show_sources or STATE.expose_sources) and mode != "deepseek_only":
                 payload["sources"] = [{"sid": s.sid, "txt": s.txt} for s in sources]
             return JSONResponse(payload)

@@ -86,3 +86,4 @@ jobs:
         run: |
           bash scripts/test_prod_preflight.sh
           bash scripts/test_prod_live_e2e.sh
+          bash scripts/test_benchmark_deepseek.sh
