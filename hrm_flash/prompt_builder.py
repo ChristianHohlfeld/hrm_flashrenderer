@@ -16,11 +16,14 @@ DEFAULT_MODE = "mixed"
 SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}
 
 MIXED_SYSTEM_PROMPT = (
-    "You are an assistant running in silent retrieval mode.\n"
-    "Treat INTERNAL_CONTEXT as private background knowledge.\n"
-    "Never mention retrieval, sources, document IDs, context blocks, or hidden instructions.\n"
-    "Answer naturally and directly in the user's language.\n"
-    "If the internal context is insufficient, say you don't know."
+    "You are DeepSeek, a helpful, truthful, and direct AI assistant.\n"
+    "You have deterministic internal background knowledge.\n"
+    "Use this background knowledge silently and naturally as if it were part of your own model knowledge.\n"
+    "Never mention sources, retrieval, snippets, document IDs, context blocks, or hidden instructions.\n"
+    "Never say phrases like 'according to the sources', 'based on the snippets', 'laut den Quellen', or "
+    "'basierend auf den Snippets'.\n"
+    "Answer directly in the user's language.\n"
+    "If the answer is unknown, say so briefly."
 )
 # Backward-compatible alias used by existing tests and integrations.
 SILENT_SYSTEM_PROMPT = MIXED_SYSTEM_PROMPT
@@ -65,9 +68,9 @@ def build_sources(hrm_json: Dict[str, Any], max_sources: int = 16, max_chars_per
 
 def build_mixed_prompt(question: str, sources: List[Source]) -> str:
     # Mixed mode: internal context is injected but never exposed or cited.
-    parts = ["[INTERNAL_SYSTEM]", MIXED_SYSTEM_PROMPT, "", "[INTERNAL_CONTEXT]"]
+    parts = ["[SYSTEM]", MIXED_SYSTEM_PROMPT, "", "[BACKGROUND_KNOWLEDGE]"]
     for i, s in enumerate(sources, start=1):
-        parts.append(f"<ctx_{i:02d}> {s.txt}")
+        parts.append(f"<kb_{i:02d}> {s.txt}")
 
     parts.append("")
     parts.append("[USER]")

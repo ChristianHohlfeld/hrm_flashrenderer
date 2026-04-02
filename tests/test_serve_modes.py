@@ -37,7 +37,7 @@ class TestServeModes(unittest.TestCase):
         self.assertEqual(mode, "deepseek_only")
         self.assertEqual(sources, [])
         self.assertIn("[USER]", p)
-        self.assertNotIn("[INTERNAL_CONTEXT]", p)
+        self.assertNotIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertNotIn("[SOURCES]", p)
 
     def test_mixed_mode_uses_silent_injection(self):
@@ -48,7 +48,7 @@ class TestServeModes(unittest.TestCase):
         p, sources, mode = serve._build_prompt("Frage", mode="mixed")
         self.assertEqual(mode, "mixed")
         self.assertEqual(len(sources), 1)
-        self.assertIn("[INTERNAL_CONTEXT]", p)
+        self.assertIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertIn("Alpha fact", p)
         self.assertNotIn("s0001", p)  # source id hidden in mixed mode
 

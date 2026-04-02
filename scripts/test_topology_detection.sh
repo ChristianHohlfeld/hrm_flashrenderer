@@ -77,7 +77,7 @@ run_and_capture() {
   local extra_env="$1"
   set +e
   # shellcheck disable=SC2086
-  out=$(env PATH="$FAKE_BIN:$PATH" LOG_DIR="$LOG_DIR" STARTUP_WAIT_TIMEOUT_S=1 STARTUP_POLL_INTERVAL_S=1 $extra_env \
+  out=$(env PATH="$FAKE_BIN:$PATH" HRM_FLASH_BIN="$FAKE_BIN/hrm-flash" LOG_DIR="$LOG_DIR" STARTUP_WAIT_TIMEOUT_S=1 STARTUP_POLL_INTERVAL_S=1 $extra_env \
     bash "$ROOT_DIR/scripts/start_native_topology.sh" "$MODEL_DIR" auto 2>&1)
   code=$?
   set -e

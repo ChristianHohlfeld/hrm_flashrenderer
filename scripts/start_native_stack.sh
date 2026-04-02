@@ -28,6 +28,8 @@ set -euo pipefail
 #   PREPARE_MODELS (default: 1 for deepseek_int8 backend)
 #   STARTUP_WAIT_TIMEOUT_S, STARTUP_POLL_INTERVAL_S (forwarded to topology and router wait)
 #   LOG_DIR
+#   PYTHON_BIN (default: python3, fallback: python)
+#   HRM_FLASH_BIN (optional: explicit hrm-flash executable override)
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <hrm_model_dir> [default_llm_model|auto]" >&2
@@ -70,6 +72,23 @@ fi
 if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" ]]; then
   echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane)." >&2
   exit 2
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    echo "ERR: python3/python not found. Install Python 3.10-3.12." >&2
+    exit 1
+  fi
+fi
+if [[ -n "${HRM_FLASH_BIN:-}" ]]; then
+  HRM_FLASH_CMD=("$HRM_FLASH_BIN")
+else
+  # Force local repo code path so mode/prompt logic cannot silently drift to a stale global install.
+  export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)
 fi
 
 PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
@@ -256,7 +275,7 @@ if [[ "$ROUTER_DISABLE_TOKENIZER" == "1" ]]; then
 fi
 
 echo "[stack] starting router on $ROUTER_HOST:$ROUTER_PORT"
-nohup hrm-flash router "${router_flags[@]}" >"$LOG_DIR/router.log" 2>&1 &
+nohup "${HRM_FLASH_CMD[@]}" router "${router_flags[@]}" >"$LOG_DIR/router.log" 2>&1 &
 echo $! > "$LOG_DIR/router.pid"
 
 if command -v curl >/dev/null 2>&1; then

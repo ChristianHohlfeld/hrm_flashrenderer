@@ -30,18 +30,18 @@ class TestThreeModes(unittest.TestCase):
 
     def test_mixed_mode_hides_source_ids(self):
         p = build_prompt_for_mode(self.q, self.sources, mode="mixed")
-        self.assertIn("[INTERNAL_CONTEXT]", p)
+        self.assertIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertIn("Alpha Fakt", p)
         self.assertNotIn("s0001", p)
         self.assertNotIn("s0002", p)
-        self.assertIn("Never mention retrieval", p)
+        self.assertIn("Never mention sources, retrieval", p)
 
     def test_deepseek_only_has_no_retrieval_context(self):
         p = build_prompt_for_mode(self.q, self.sources, mode="deepseek_only")
         self.assertIn("[USER]", p)
         self.assertIn(self.q, p)
         self.assertNotIn("[SOURCES]", p)
-        self.assertNotIn("[INTERNAL_CONTEXT]", p)
+        self.assertNotIn("[BACKGROUND_KNOWLEDGE]", p)
 
 
 if __name__ == "__main__":

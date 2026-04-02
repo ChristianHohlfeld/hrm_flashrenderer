@@ -104,7 +104,7 @@ TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
 ## Generation Modes (Single Endpoint)
 
 `POST /v1/generate` supports three modes via JSON field `mode`:
-- `mixed` (default): HRM runs deterministically in background (`top_k=16`, `k=16`, `1.8s`), sources are internal/hidden, model must not mention retrieval.
+- `mixed` (default): HRM runs deterministically in background (`top_k=16`, `k=16`, `1.8s`), sources are internal/hidden, and the silent system prompt explicitly forbids source/retrieval mentions.
 - `retrieval`: HRM sources are explicit in prompt context and model is instructed to cite source ids.
 - `deepseek_only`: no HRM query, no source injection, pure model response path.
 
@@ -139,6 +139,13 @@ curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d
 
 # deepseek_only (no HRM)
 curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d '{"prompt":"Nur Modellwissen.","mode":"deepseek_only"}'
+```
+
+The start scripts now pin runtime to this checkout by default (`python -m hrm_flash.cli`) to avoid stale global `hrm-flash` binaries.
+Optional override for advanced setups:
+
+```bash
+HRM_FLASH_BIN=/usr/local/bin/hrm-flash bash scripts/start_native_stack.sh ./model_index auto
 ```
 
 ## Dynamic GPU Mapping (No Static Order Assumptions)

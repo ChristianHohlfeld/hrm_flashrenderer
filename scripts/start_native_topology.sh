@@ -62,6 +62,8 @@ set -euo pipefail
 #   LOG_DIR           default: ./.run/services
 #   STARTUP_WAIT_TIMEOUT_S default: 240
 #   STARTUP_POLL_INTERVAL_S default: 2
+#   PYTHON_BIN default: python3 (fallback: python)
+#   HRM_FLASH_BIN optional: explicit hrm-flash executable override
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <hrm_model_dir> [llm_model_dir|auto]" >&2
@@ -81,6 +83,25 @@ fi
 if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" ]]; then
   echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane)." >&2
   exit 2
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    echo "ERR: python3/python not found. Install Python 3.10-3.12." >&2
+    exit 1
+  fi
+fi
+if [[ -n "${HRM_FLASH_BIN:-}" ]]; then
+  HRM_FLASH_CMD=("$HRM_FLASH_BIN")
+else
+  # Force local repo code path so serve runtime always matches this checkout.
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+  export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)
 fi
 
 RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
@@ -408,7 +429,7 @@ start_service() {
     serve_args+=(--local_files_only)
   fi
 
-  CUDA_VISIBLE_DEVICES="$devices" nohup hrm-flash serve "${serve_args[@]}" >"$LOG_DIR/${name}.log" 2>&1 &
+  CUDA_VISIBLE_DEVICES="$devices" nohup "${HRM_FLASH_CMD[@]}" serve "${serve_args[@]}" >"$LOG_DIR/${name}.log" 2>&1 &
   echo $! > "$LOG_DIR/${name}.pid"
 }
 

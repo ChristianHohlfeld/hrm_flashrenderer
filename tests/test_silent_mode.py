@@ -17,12 +17,13 @@ class TestSilentMode(unittest.TestCase):
         ]
         p = build_renderer_prompt(question, sources)
 
-        self.assertIn("silent retrieval mode", p)
+        self.assertIn("You are DeepSeek, a helpful, truthful, and direct AI assistant.", p)
         self.assertIn(question, p)
         self.assertNotIn("0001#s0001", p)
         self.assertNotIn("0001#s0002", p)
         self.assertNotIn("Cite sources", p)
         self.assertNotIn("[SOURCES]", p)
+        self.assertIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertNotIn("[QUESTION]", p)
         self.assertNotIn("[ANSWER]", p)
 

@@ -187,8 +187,27 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn("timeout_s=1.8,", serve_txt)
         self.assertIn('ap.add_argument("--max_sources", type=int, default=16)', serve_txt)
         self.assertIn("SILENT_SYSTEM_PROMPT", prompt_txt)
-        self.assertIn("Never mention retrieval, sources", prompt_txt)
+        self.assertIn("Never mention sources, retrieval", prompt_txt)
         self.assertIn("max_sources: int = 16", prompt_txt)
+
+    def test_start_scripts_pin_local_runtime_by_default(self):
+        stack_txt = _read_text(REPO_ROOT / "scripts" / "start_native_stack.sh")
+        topo_txt = _read_text(REPO_ROOT / "scripts" / "start_native_topology.sh")
+        serve_txt = _read_text(REPO_ROOT / "scripts" / "serve.sh")
+        gen_txt = _read_text(REPO_ROOT / "scripts" / "hrm_flash_generate.sh")
+
+        self.assertIn('if [[ -n "${HRM_FLASH_BIN:-}" ]]; then', stack_txt)
+        self.assertIn('HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)', stack_txt)
+        self.assertIn('nohup "${HRM_FLASH_CMD[@]}" router', stack_txt)
+        self.assertIn('if [[ -n "${HRM_FLASH_BIN:-}" ]]; then', topo_txt)
+        self.assertIn('HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)', topo_txt)
+        self.assertIn('nohup "${HRM_FLASH_CMD[@]}" serve', topo_txt)
+        self.assertIn('if [[ -n "${HRM_FLASH_BIN:-}" ]]; then', serve_txt)
+        self.assertIn('HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)', serve_txt)
+        self.assertIn('"${HRM_FLASH_CMD[@]}" serve', serve_txt)
+        self.assertIn('if [[ -n "${HRM_FLASH_BIN:-}" ]]; then', gen_txt)
+        self.assertIn('HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)', gen_txt)
+        self.assertIn('"${HRM_FLASH_CMD[@]}" generate', gen_txt)
 
     def test_three_modes_are_wired_in_mainline(self):
         cli_txt = _read_text(REPO_ROOT / "hrm_flash" / "cli.py")
