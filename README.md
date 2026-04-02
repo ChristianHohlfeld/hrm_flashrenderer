@@ -187,6 +187,35 @@ Single-mode E2E run (optional):
 RUN_MODE_MATRIX=0 ROUTER_MODE=mixed bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz."
 ```
 
+### Mode-Implementation Proof (Source, not binary-only)
+
+The mode behavior is implemented in visible Python source files (not only in a compiled artifact):
+- `hrm_flash/prompt_builder.py`
+  - `MIXED_SYSTEM_PROMPT` (silent prompt)
+  - `build_mixed_prompt`, `build_retrieval_prompt`, `build_deepseek_only_prompt`
+- `hrm_flash/serve.py`
+  - `_build_prompt`: `deepseek_only` returns early (no `run_hrm_query` call)
+  - `/v1/generate`: `hrm_active` and source exposure are mode-dependent
+- `hrm_flash/router.py`
+  - `_resolve_mode`, `_resolve_show_sources`
+  - `deepseek_only` forces `show_sources=False` and logs `mode=deepseek_only no retrieval`
+- `scripts/start_native_stack.sh`
+  - validates `ROUTER_DEFAULT_MODE` (`retrieval|mixed|deepseek_only`)
+  - passes `--default_mode` into router startup
+
+Quick verification commands:
+
+```bash
+# Unit-level mode logic
+python -m unittest tests.test_modes tests.test_serve_modes tests.test_router_logic
+
+# Hard script checks (includes mode-matrix + determinism)
+RUN_HARD_SCRIPT_TESTS=1 bash scripts/test.sh
+
+# End-to-end mode matrix only
+bash scripts/test_prod_live_e2e.sh
+```
+
 The start scripts now pin runtime to this checkout by default (`python -m hrm_flash.cli`) to avoid stale global `hrm-flash` binaries.
 Optional override for advanced setups:
 
