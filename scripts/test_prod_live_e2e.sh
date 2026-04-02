@@ -87,10 +87,12 @@ start_mock() {
 run_e2e() {
   local allow_empty="$1"
   local prompt="$2"
+  local mode="${3:-mixed}"
   RUN_BOOTSTRAP=0 \
   EXPECTED_GPUS=4 \
   AUTO_STOP=1 \
   ALLOW_EMPTY_SOURCES="$allow_empty" \
+  ROUTER_MODE="$mode" \
   PREFLIGHT_SCRIPT="$TMP_DIR/preflight_ok.sh" \
   START_STACK_SCRIPT="$TMP_DIR/start_ok.sh" \
   STOP_STACK_SCRIPT="$TMP_DIR/stop_ok.sh" \
@@ -103,12 +105,21 @@ run_e2e() {
 
 echo "[test] prod_live_e2e success path with sources"
 start_mock ""
-run_e2e 0 "Nenne den wichtigsten Punkt."
+out_mixed="$(run_e2e 0 "Nenne den wichtigsten Punkt." "mixed" 2>&1)"
+printf '%s' "$out_mixed" | grep -q "Mock DeepSeek answer."
+if printf '%s' "$out_mixed" | grep -qi "laut den quellen"; then
+  echo "ERR: mixed mode should not emit retrieval-style wording" >&2
+  exit 1
+fi
+
+echo "[test] prod_live_e2e deepseek_only path"
+out_deepseek_only="$(run_e2e 0 "Antwort nur aus Modell." "deepseek_only" 2>&1)"
+printf '%s' "$out_deepseek_only" | grep -q "Mock DeepSeek-only answer."
 
 echo "[test] prod_live_e2e fails hard when sources are empty"
 start_mock "--empty-sources"
 set +e
-out_empty="$(run_e2e 0 "Leere Quellen testen." 2>&1)"
+out_empty="$(run_e2e 0 "Leere Quellen testen." "mixed" 2>&1)"
 code_empty=$?
 set -e
 if [[ "$code_empty" -eq 0 ]]; then
@@ -118,6 +129,6 @@ fi
 printf '%s' "$out_empty" | grep -Eq "sources are empty|source_count is 0"
 
 echo "[test] prod_live_e2e can allow empty sources when explicitly enabled"
-run_e2e 1 "Leere Quellen mit Allow."
+run_e2e 1 "Leere Quellen mit Allow." "mixed"
 
 echo "[ok] prod_live_e2e hard checks"

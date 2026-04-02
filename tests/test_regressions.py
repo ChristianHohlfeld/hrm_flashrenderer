@@ -196,6 +196,7 @@ class TestNativeProdRegressions(unittest.TestCase):
         router_txt = _read_text(REPO_ROOT / "hrm_flash" / "router.py")
         prompt_txt = _read_text(REPO_ROOT / "hrm_flash" / "prompt_builder.py")
         stack_txt = _read_text(REPO_ROOT / "scripts" / "start_native_stack.sh")
+        e2e_txt = _read_text(REPO_ROOT / "scripts" / "prod_live_e2e.sh")
 
         self.assertIn('g.add_argument("--mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")', cli_txt)
         self.assertIn('rt.add_argument("--default_mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")', cli_txt)
@@ -208,6 +209,8 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('"show_sources": show_sources,', router_txt)
         self.assertIn('ROUTER_DEFAULT_MODE="${ROUTER_DEFAULT_MODE:-mixed}"', stack_txt)
         self.assertIn('--default_mode "$ROUTER_DEFAULT_MODE"', stack_txt)
+        self.assertIn('ROUTER_MODE="${ROUTER_MODE:-mixed}"', e2e_txt)
+        self.assertIn('if router_mode == "deepseek_only":', e2e_txt)
         self.assertIn('DEFAULT_MODE = "mixed"', prompt_txt)
         self.assertIn('SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}', prompt_txt)
 

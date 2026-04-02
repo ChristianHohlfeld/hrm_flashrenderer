@@ -28,6 +28,8 @@ echo "[python] silent mode tests"
 "$PYTHON_BIN" -m unittest tests.test_silent_mode
 echo "[python] three-mode tests"
 "$PYTHON_BIN" -m unittest tests.test_modes
+echo "[python] serve mode tests"
+"$PYTHON_BIN" -m unittest tests.test_serve_modes
 echo "[python] router logic tests"
 "$PYTHON_BIN" -m unittest tests.test_router_logic
 echo "[python] hrm_api test"

@@ -116,6 +116,7 @@ ROUTER_DEFAULT_MODE=mixed bash scripts/start_native_stack.sh ./model_index auto
 
 Optional JSON flag:
 - `show_sources`: include `sources` array in HTTP response (off by default, ignored for `deepseek_only`).
+- default behavior: `retrieval` auto-enables source output; `mixed` keeps sources hidden unless explicitly requested.
 
 Example:
 
@@ -125,6 +126,19 @@ Example:
   "mode": "mixed",
   "show_sources": false
 }
+```
+
+Mode quick checks:
+
+```bash
+# mixed (silent HRM, hidden sources)
+curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d '{"prompt":"Kurz antworten.","mode":"mixed"}'
+
+# retrieval (explicit sources/citations behavior)
+curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d '{"prompt":"Belege nennen.","mode":"retrieval"}'
+
+# deepseek_only (no HRM)
+curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d '{"prompt":"Nur Modellwissen.","mode":"deepseek_only"}'
 ```
 
 ## Dynamic GPU Mapping (No Static Order Assumptions)

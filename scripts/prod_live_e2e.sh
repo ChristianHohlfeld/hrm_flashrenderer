@@ -47,6 +47,13 @@ ROUTER_ROUTE_HINT="${ROUTER_ROUTE_HINT:-balanced}"
 ROUTER_MAX_NEW_TOKENS="${ROUTER_MAX_NEW_TOKENS:-256}"
 AUTO_STOP="${AUTO_STOP:-0}"
 ALLOW_EMPTY_SOURCES="${ALLOW_EMPTY_SOURCES:-0}"
+case "$ROUTER_MODE" in
+  retrieval|mixed|deepseek_only) ;;
+  *)
+    echo "ERR: unsupported ROUTER_MODE=$ROUTER_MODE (supported: retrieval, mixed, deepseek_only)" >&2
+    exit 2
+    ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -179,6 +186,9 @@ if not txt:
 sources = d.get("sources", None)
 source_count = d.get("source_count", None)
 allow_empty = os.environ.get("ALLOW_EMPTY_SOURCES", "0") == "1"
+router_mode = os.environ.get("ROUTER_MODE", "mixed")
+if router_mode == "deepseek_only":
+    allow_empty = True
 if not allow_empty:
     if isinstance(source_count, int):
         if source_count <= 0:

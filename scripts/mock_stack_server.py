@@ -65,20 +65,36 @@ def _handler_for(name: str, empty_sources: bool):
                 self._write_json(400, {"ok": False, "error": "prompt required"})
                 return
 
-            sources = [] if empty_sources else [{"sid": "0001#s0001", "txt": "Mock source evidence."}]
+            mode = str(req.get("mode", "mixed")).strip().lower()
+            show_sources_req = bool(req.get("show_sources", False))
+            if mode == "deepseek_only":
+                sources = []
+                text = "Mock DeepSeek-only answer."
+            elif mode == "retrieval":
+                sources = [] if empty_sources else [{"sid": "0001#s0001", "txt": "Mock source evidence."}]
+                text = "Mock answer laut den Quellen."
+            else:
+                # mixed
+                sources = [] if empty_sources else [{"sid": "0001#s0001", "txt": "Mock source evidence."}]
+                text = "Mock DeepSeek answer."
+
+            include_sources = show_sources_req or (mode == "retrieval")
+            payload = {
+                "ok": True,
+                "text": text,
+                "source_count": len(sources),
+                "mode": mode,
+                "route": {
+                    "selected": "nvlink_pair",
+                    "prompt_tokens": 42,
+                    "latency_ms": 7,
+                },
+            }
+            if include_sources and mode != "deepseek_only":
+                payload["sources"] = sources
             self._write_json(
                 200,
-                {
-                    "ok": True,
-                    "text": "Mock DeepSeek answer.",
-                    "sources": sources,
-                    "source_count": len(sources),
-                    "route": {
-                        "selected": "nvlink_pair",
-                        "prompt_tokens": 42,
-                        "latency_ms": 7,
-                    },
-                },
+                payload,
             )
 
         def log_message(self, fmt: str, *args: Any) -> None:
