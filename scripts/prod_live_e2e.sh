@@ -13,7 +13,7 @@ set -euo pipefail
 #
 # Environment knobs:
 #   RUN_BOOTSTRAP=1|0         default: 1
-#   EXPECTED_GPUS=<int>       default: 4
+#   EXPECTED_GPUS=<int>       default: 3
 #   TOPOLOGY_MODE             default: max_model_fast
 #   ROUTER_URL=<url>          default: http://127.0.0.1:8090
 #   ROUTER_MODE               default: mixed (retrieval|mixed|deepseek_only)
@@ -24,6 +24,7 @@ set -euo pipefail
 #   PROMPT_MIXED              default: [final_prompt arg]
 #   PROMPT_RETRIEVAL          default: retrieval-specific prompt
 #   PROMPT_DEEPSEEK_ONLY      default: deepseek-only prompt
+#   EXPECT_SOLO_3080          default: auto (auto|0|1)
 #   AUTO_STOP=1|0             default: 0
 #   ALLOW_EMPTY_SOURCES=1|0   default: 0 (0 = require non-empty sources => real pipeline)
 #   PREFLIGHT_SCRIPT          default: scripts/prod_preflight.sh
@@ -44,7 +45,7 @@ HRM_MODEL="$1"
 FINAL_PROMPT="${2:-Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.}"
 
 RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-1}"
-EXPECTED_GPUS="${EXPECTED_GPUS:-4}"
+EXPECTED_GPUS="${EXPECTED_GPUS:-3}"
 TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8090}"
 ROUTER_MODE="${ROUTER_MODE:-mixed}"
@@ -57,6 +58,7 @@ ALLOW_EMPTY_SOURCES="${ALLOW_EMPTY_SOURCES:-0}"
 PROMPT_MIXED="${PROMPT_MIXED:-$FINAL_PROMPT}"
 PROMPT_RETRIEVAL="${PROMPT_RETRIEVAL:-Nenne die wichtigste Aussage und gib mindestens eine Quellen-ID in eckigen Klammern an.}"
 PROMPT_DEEPSEEK_ONLY="${PROMPT_DEEPSEEK_ONLY:-Explain in two short sentences the difference between retrieval and pure model knowledge.}"
+EXPECT_SOLO_3080="${EXPECT_SOLO_3080:-auto}"
 
 if [[ "$RUN_MODE_MATRIX" != "0" && "$RUN_MODE_MATRIX" != "1" ]]; then
   echo "ERR: RUN_MODE_MATRIX must be 0 or 1 (got: $RUN_MODE_MATRIX)" >&2
@@ -75,6 +77,16 @@ if [[ "$RUN_MODE_MATRIX" == "0" ]]; then
       ;;
   esac
 fi
+if [[ "$EXPECT_SOLO_3080" == "auto" ]]; then
+  EXPECT_SOLO_3080="${ENABLE_SOLO_3080:-0}"
+fi
+case "$EXPECT_SOLO_3080" in
+  0|1) ;;
+  *)
+    echo "ERR: EXPECT_SOLO_3080 must be auto, 0 or 1 (got: $EXPECT_SOLO_3080)" >&2
+    exit 2
+    ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -171,12 +183,18 @@ STACK_STARTED=1
 echo "[4/5] verify service health"
 health_wait_ok "$HEALTH_URL_SOLO_22GB" 180 2 || { echo "ERR: solo_22gb did not become healthy" >&2; exit 1; }
 health_wait_ok "$HEALTH_URL_NVLINK_PAIR" 180 2 || { echo "ERR: nvlink_pair did not become healthy" >&2; exit 1; }
-health_wait_ok "$HEALTH_URL_SOLO_3080" 180 2 || { echo "ERR: solo_3080 did not become healthy" >&2; exit 1; }
+if [[ "$EXPECT_SOLO_3080" == "1" ]]; then
+  health_wait_ok "$HEALTH_URL_SOLO_3080" 180 2 || { echo "ERR: solo_3080 did not become healthy" >&2; exit 1; }
+else
+  echo "[skip] solo_3080 health not required (EXPECT_SOLO_3080=0)"
+fi
 health_wait_ok "$ROUTER_URL/v1/health" 180 2 || { echo "ERR: router did not become healthy" >&2; exit 1; }
 
 check_backend_deepseek "solo_22gb" "$HEALTH_URL_SOLO_22GB"
 check_backend_deepseek "nvlink_pair" "$HEALTH_URL_NVLINK_PAIR"
-check_backend_deepseek "solo_3080" "$HEALTH_URL_SOLO_3080"
+if [[ "$EXPECT_SOLO_3080" == "1" ]]; then
+  check_backend_deepseek "solo_3080" "$HEALTH_URL_SOLO_3080"
+fi
 
 echo "[5/5] mode verification + determinism checks"
 ROUTER_URL="$ROUTER_URL" \

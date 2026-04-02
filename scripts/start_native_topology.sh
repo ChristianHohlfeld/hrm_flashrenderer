@@ -18,6 +18,7 @@ set -euo pipefail
 # Optional env vars:
 #   BACKEND           default: deepseek_int8 (deepseek-only production mainline)
 #   TOPOLOGY_MODE     default: max_model_fast (supported: max_model_fast, hetero_3lane)
+#   HW_BASE_PROFILE   default: auto (auto|A|B|C|D fixed hardware presets)
 #   GPU_NVLINK_PAIR   default: auto (detect NVLink pair)
 #   GPU_22GB          default: auto (largest remaining VRAM card)
 #   GPU_3080          default: auto (smallest remaining VRAM card)
@@ -28,10 +29,11 @@ set -euo pipefail
 #   LLM_MODEL_SOLO_22GB      default: profile or <llm_model_dir arg>
 #   LLM_MODEL_NVLINK_PAIR    default: profile or <llm_model_dir arg>
 #   LLM_MODEL_SOLO_3080      default: profile or <llm_model_dir arg>
+#   ENABLE_SOLO_3080         default: derived from HW_BASE_PROFILE (set 1 to run dedicated 3080/11GB lane)
 #   LLM_MODEL_TRIPLE_MAX     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
-#   RECO_MODEL_SOLO_22GB     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-#   RECO_MODEL_NVLINK_PAIR   default: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-#   RECO_MODEL_SOLO_3080     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+#   RECO_MODEL_SOLO_22GB     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+#   RECO_MODEL_NVLINK_PAIR   default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+#   RECO_MODEL_SOLO_3080     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 #   RECO_MODEL_TRIPLE_MAX    default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 #   MODEL_BIN_SOLO_22GB      default: unset
 #   MODEL_BIN_NVLINK_PAIR    default: unset
@@ -75,6 +77,7 @@ LLM_MODEL="${2:-auto}"
 BACKEND="${BACKEND:-deepseek_int8}"
 TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 MODEL_PROFILE="${MODEL_PROFILE:-max_vram_hetero}"
+HW_BASE_PROFILE="${HW_BASE_PROFILE:-auto}"
 
 if [[ "$BACKEND" != "deepseek_int8" ]]; then
   echo "ERR: BACKEND=$BACKEND is not supported in production mainline. Use deepseek_int8." >&2
@@ -104,10 +107,35 @@ else
   HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)
 fi
 
-RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
-RECO_MODEL_NVLINK_PAIR="${RECO_MODEL_NVLINK_PAIR:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
-RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
+RECO_MODEL_NVLINK_PAIR="${RECO_MODEL_NVLINK_PAIR:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
+RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
 RECO_MODEL_TRIPLE_MAX="${RECO_MODEL_TRIPLE_MAX:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
+case "${HW_BASE_PROFILE,,}" in
+  auto|a|option_a|b|option_b|c|option_c|d|option_d) ;;
+  *)
+    echo "ERR: unsupported HW_BASE_PROFILE=$HW_BASE_PROFILE (supported: auto, A, B, C, D)." >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z "${ENABLE_SOLO_3080+x}" ]]; then
+  case "${HW_BASE_PROFILE,,}" in
+    b|option_b|c|option_c)
+      ENABLE_SOLO_3080="1"
+      ;;
+    *)
+      ENABLE_SOLO_3080="0"
+      ;;
+  esac
+fi
+case "$ENABLE_SOLO_3080" in
+  0|1) ;;
+  *)
+    echo "ERR: ENABLE_SOLO_3080 must be 0 or 1 (got: $ENABLE_SOLO_3080)." >&2
+    exit 2
+    ;;
+esac
 
 use_profile=0
 case "$LLM_MODEL" in
@@ -146,6 +174,40 @@ else
     LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$LLM_MODEL}"
     LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$LLM_MODEL}"
   fi
+fi
+
+is_supported_deepseek_model() {
+  local model="$1"
+  case "$model" in
+    deepseek-ai/DeepSeek-R1-Distill-Qwen-32B|deepseek-ai/DeepSeek-R1-Distill-Llama-70B)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+validate_supported_model() {
+  local label="$1"
+  local model="$2"
+  if [[ -z "$model" ]]; then
+    echo "ERR: $label is empty; set one of: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B or deepseek-ai/DeepSeek-R1-Distill-Llama-70B" >&2
+    exit 2
+  fi
+  if ! is_supported_deepseek_model "$model"; then
+    echo "ERR: unsupported deepseek model for $label: $model" >&2
+    echo "Supported models: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B, deepseek-ai/DeepSeek-R1-Distill-Llama-70B" >&2
+    exit 2
+  fi
+}
+
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  validate_supported_model "LLM_MODEL_TRIPLE_MAX" "$LLM_MODEL_SOLO_22GB"
+else
+  validate_supported_model "LLM_MODEL_SOLO_22GB" "$LLM_MODEL_SOLO_22GB"
+  validate_supported_model "LLM_MODEL_NVLINK_PAIR" "$LLM_MODEL_NVLINK_PAIR"
+fi
+if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+  validate_supported_model "LLM_MODEL_SOLO_3080" "$LLM_MODEL_SOLO_3080"
 fi
 MODEL_BIN_SOLO_22GB="${MODEL_BIN_SOLO_22GB:-}"
 MODEL_BIN_NVLINK_PAIR="${MODEL_BIN_NVLINK_PAIR:-}"
@@ -208,12 +270,30 @@ detect_gpu_layout() {
 
   local detected
   detected="$(python3 - <<'PY'
+import os
 import re
 import subprocess
 import sys
 
 def run(cmd):
     return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+profile_raw = os.getenv("HW_BASE_PROFILE", "auto").strip().lower()
+profile_alias = {
+    "auto": "auto",
+    "a": "a",
+    "option_a": "a",
+    "b": "b",
+    "option_b": "b",
+    "c": "c",
+    "option_c": "c",
+    "d": "d",
+    "option_d": "d",
+}
+if profile_raw not in profile_alias:
+    print(f"ERR: unsupported HW_BASE_PROFILE={profile_raw}", file=sys.stderr)
+    sys.exit(2)
+profile = profile_alias[profile_raw]
 
 try:
     mem_out = run(["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"])
@@ -239,6 +319,24 @@ idxs = sorted(mem.keys())
 if len(idxs) < 2:
     sys.exit(1)
 
+g22 = [i for i in idxs if mem[i] >= 20000]
+g11 = [i for i in idxs if 10500 <= mem[i] < 20000]
+g10 = [i for i in idxs if 9000 <= mem[i] < 10500]
+
+def require(cond, msg):
+    if not cond:
+        print(f"ERR: {msg}", file=sys.stderr)
+        sys.exit(2)
+
+if profile == "a":
+    require(len(idxs) >= 3 and len(g22) >= 1 and len(g11) >= 2, "HW profile A requires >=1x22GB and >=2x11GB GPUs")
+elif profile == "b":
+    require(len(idxs) >= 4 and len(g22) >= 1 and len(g11) >= 2 and len(g10) >= 1, "HW profile B requires 22GB + 11GB + 11GB + 10GB")
+elif profile == "c":
+    require(len(idxs) >= 4 and len(g22) >= 1 and len(g11) >= 2 and len(g10) >= 1, "HW profile C requires 22GB + 11GB + 11GB + 10GB")
+elif profile == "d":
+    require(len(idxs) >= 4 and len(g22) >= 2 and len(g11) >= 2, "HW profile D requires 22GB + 22GB + 11GB + 11GB")
+
 matrix = {}
 try:
     topo = run(["nvidia-smi", "topo", "-m"])
@@ -261,39 +359,49 @@ try:
 except Exception:
     matrix = {}
 
-pairs = []
-for i in idxs:
-    for j in idxs:
-        if i >= j:
-            continue
-        link = matrix.get((f"GPU{i}", f"GPU{j}")) or matrix.get((f"GPU{j}", f"GPU{i}")) or ""
-        if not str(link).startswith("NV"):
-            continue
-        m = re.match(r"NV(\d+)", str(link))
-        width = int(m.group(1)) if m else 1
-        score = (100000 if abs(mem[i] - mem[j]) <= 2048 else 0) + min(mem[i], mem[j]) * 100 + width
-        pairs.append((score, i, j))
+def link_info(i, j):
+    link = matrix.get((f"GPU{i}", f"GPU{j}")) or matrix.get((f"GPU{j}", f"GPU{i}")) or ""
+    m = re.match(r"NV(\d+)", str(link))
+    width = int(m.group(1)) if m else 0
+    is_nv = str(link).startswith("NV")
+    return link, is_nv, width
 
-if pairs:
-    pairs.sort(reverse=True)
-    _, p0, p1 = pairs[0]
-    pair_link = "NVLINK"
-    nvlink_detected = 1
+def choose_pair(candidates):
+    nv_pairs = []
+    any_pairs = []
+    for x in range(len(candidates)):
+        for y in range(x + 1, len(candidates)):
+            i = candidates[x]
+            j = candidates[y]
+            _, is_nv, width = link_info(i, j)
+            same_tier_bonus = 100000 if abs(mem[i] - mem[j]) <= 2048 else 0
+            score = same_tier_bonus + min(mem[i], mem[j]) * 100 + width
+            any_pairs.append((score, i, j))
+            if is_nv:
+                nv_pairs.append((score + 1000000, i, j))
+    if nv_pairs:
+        nv_pairs.sort(reverse=True)
+        _, p0, p1 = nv_pairs[0]
+        return p0, p1, "NVLINK", 1
+    if any_pairs:
+        any_pairs.sort(reverse=True)
+        _, p0, p1 = any_pairs[0]
+        return p0, p1, "PCIE", 0
+    return None, None, "", 0
+
+if profile == "c":
+    p0, p1, pair_link, nvlink_detected = choose_pair(g11)
+    require(p0 is not None and nvlink_detected == 1, "HW profile C requires NVLink between the two 11GB cards")
+elif profile == "d":
+    # Prefer the 22GB pair for max-model triple lane throughput.
+    p0, p1, pair_link, nvlink_detected = choose_pair(g22)
+    if p0 is None:
+        p0, p1, pair_link, nvlink_detected = choose_pair(idxs)
 else:
-    # Fallback when no NVLink edge is present: choose the best same-tier pair.
-    fallback = []
-    for i in idxs:
-        for j in idxs:
-            if i >= j:
-                continue
-            score = (100000 if abs(mem[i] - mem[j]) <= 2048 else 0) + min(mem[i], mem[j]) * 100
-            fallback.append((score, i, j))
-    if not fallback:
-        sys.exit(2)
-    fallback.sort(reverse=True)
-    _, p0, p1 = fallback[0]
-    pair_link = "PCIE"
-    nvlink_detected = 0
+    p0, p1, pair_link, nvlink_detected = choose_pair(idxs)
+
+if p0 is None or p1 is None:
+    sys.exit(2)
 
 remaining = [i for i in idxs if i not in (p0, p1)]
 if len(remaining) >= 2:
@@ -308,9 +416,12 @@ else:
     others = [i for i in idxs if i != solo22]
     solo3080 = min(others, key=lambda x: mem[x]) if others else solo22
 
+print(f"AUTO_HW_BASE_PROFILE={profile}")
+print(f"AUTO_GPU_COUNT={len(idxs)}")
 print(f"AUTO_GPU_NVLINK_PAIR={p0},{p1}")
 print(f"AUTO_GPU_22GB={solo22}")
 print(f"AUTO_GPU_3080={solo3080}")
+print(f"AUTO_GPU_3080_MEM={mem.get(solo3080, 0)}")
 print(f"AUTO_GPU_PAIR_LINK={pair_link}")
 print(f"AUTO_GPU_NVLINK_DETECTED={nvlink_detected}")
 PY
@@ -378,16 +489,26 @@ elif [[ "$STRICT_GPU_TOPOLOGY" == "1" && "$GPU_3080" != "$AUTO_GPU_3080" ]]; the
   exit 1
 fi
 
-echo "[gpu-map] detected pair=$AUTO_GPU_NVLINK_PAIR link=${AUTO_GPU_PAIR_LINK:-unknown} nvlink_detected=${AUTO_GPU_NVLINK_DETECTED:-0} solo_22gb=$AUTO_GPU_22GB solo_3080=$AUTO_GPU_3080 strict=$STRICT_GPU_TOPOLOGY"
+echo "[gpu-map] profile=${AUTO_HW_BASE_PROFILE:-auto} gpu_count=${AUTO_GPU_COUNT:-0} detected pair=$AUTO_GPU_NVLINK_PAIR link=${AUTO_GPU_PAIR_LINK:-unknown} nvlink_detected=${AUTO_GPU_NVLINK_DETECTED:-0} solo_22gb=$AUTO_GPU_22GB solo_3080=$AUTO_GPU_3080 strict=$STRICT_GPU_TOPOLOGY"
 echo "[gpu-map] final mapping nvlink_pair=$GPU_NVLINK_PAIR solo_22gb=$GPU_22GB solo_3080=$GPU_3080"
 
 echo "[profile] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE auto_profile=$use_profile"
 if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
-  echo "[profile] models: triple_max=$LLM_MODEL_SOLO_22GB solo_3080=$LLM_MODEL_SOLO_3080"
-  echo "[profile] seq/prefill: triple_max=${MAX_SEQ_TRIPLE_MAX}/${PREFILL_TRIPLE_MAX} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+  if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+    echo "[profile] models: triple_max=$LLM_MODEL_SOLO_22GB solo_3080=$LLM_MODEL_SOLO_3080"
+    echo "[profile] seq/prefill: triple_max=${MAX_SEQ_TRIPLE_MAX}/${PREFILL_TRIPLE_MAX} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+  else
+    echo "[profile] models: triple_max=$LLM_MODEL_SOLO_22GB solo_3080=<disabled>"
+    echo "[profile] seq/prefill: triple_max=${MAX_SEQ_TRIPLE_MAX}/${PREFILL_TRIPLE_MAX} solo_3080=<disabled>"
+  fi
 else
-  echo "[profile] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
-  echo "[profile] seq/prefill: solo_22gb=${MAX_SEQ_SOLO_22GB}/${PREFILL_SOLO_22GB} nvlink_pair=${MAX_SEQ_NVLINK_PAIR}/${PREFILL_NVLINK_PAIR} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+  if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+    echo "[profile] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
+    echo "[profile] seq/prefill: solo_22gb=${MAX_SEQ_SOLO_22GB}/${PREFILL_SOLO_22GB} nvlink_pair=${MAX_SEQ_NVLINK_PAIR}/${PREFILL_NVLINK_PAIR} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+  else
+    echo "[profile] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=<disabled>"
+    echo "[profile] seq/prefill: solo_22gb=${MAX_SEQ_SOLO_22GB}/${PREFILL_SOLO_22GB} nvlink_pair=${MAX_SEQ_NVLINK_PAIR}/${PREFILL_NVLINK_PAIR} solo_3080=<disabled>"
+  fi
 fi
 
 start_service() {
@@ -480,21 +601,29 @@ if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
   TRIPLE_TOKENIZER_MODEL="${TOKENIZER_MODEL_TRIPLE_MAX:-$TOKENIZER_MODEL_SOLO_22GB}"
 
   start_service "solo_22gb" "$TRIPLE_DEVICES" "$LLM_MODEL_SOLO_22GB" "$TRIPLE_MODEL_BIN" "$TRIPLE_TOKENIZER_MODEL" 3 "$PORT_SOLO_22GB" "$MAX_SEQ_TRIPLE_MAX" "$PREFILL_TRIPLE_MAX"
-  start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+  if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+    start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+  fi
 else
   start_service "solo_22gb" "$GPU_22GB" "$LLM_MODEL_SOLO_22GB" "$MODEL_BIN_SOLO_22GB" "$TOKENIZER_MODEL_SOLO_22GB" 1 "$PORT_SOLO_22GB" "$MAX_SEQ_SOLO_22GB" "$PREFILL_SOLO_22GB"
   start_service "nvlink_pair" "$GPU_NVLINK_PAIR" "$LLM_MODEL_NVLINK_PAIR" "$MODEL_BIN_NVLINK_PAIR" "$TOKENIZER_MODEL_NVLINK_PAIR" 2 "$PORT_NVLINK_PAIR" "$MAX_SEQ_NVLINK_PAIR" "$PREFILL_NVLINK_PAIR"
-  start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+  if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+    start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+  fi
 fi
 
 if command -v curl >/dev/null 2>&1; then
   if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
     wait_service "solo_22gb" "$PORT_SOLO_22GB"
-    wait_service "solo_3080" "$PORT_SOLO_3080"
+    if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+      wait_service "solo_3080" "$PORT_SOLO_3080"
+    fi
   else
     wait_service "solo_22gb" "$PORT_SOLO_22GB"
     wait_service "nvlink_pair" "$PORT_NVLINK_PAIR"
-    wait_service "solo_3080" "$PORT_SOLO_3080"
+    if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+      wait_service "solo_3080" "$PORT_SOLO_3080"
+    fi
   fi
 else
   echo "[warn] curl not found; skipping service health wait."
@@ -516,6 +645,10 @@ if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
   printf ' (alias lane -> same max-model endpoint)'
 fi
 )
-  solo_3080   -> http://127.0.0.1:$PORT_SOLO_3080/v1/health
+  solo_3080   -> http://127.0.0.1:$PORT_SOLO_3080/v1/health$(
+if [[ "$ENABLE_SOLO_3080" == "0" ]]; then
+  printf ' (disabled)'
+fi
+)
 
 EOF

@@ -44,16 +44,22 @@ echo "[test] start scripts reject unsupported topology mode"
 expect_fail_contains "unsupported TOPOLOGY_MODE" env PREPARE_MODELS=0 TOPOLOGY_MODE=invalid bash "$ROOT_DIR/scripts/start_native_stack.sh" "$MODEL_DIR" auto
 expect_fail_contains "unsupported TOPOLOGY_MODE" env TOPOLOGY_MODE=invalid bash "$ROOT_DIR/scripts/start_native_topology.sh" "$MODEL_DIR" auto
 
+echo "[test] easy launcher rejects invalid preset"
+expect_fail_contains "unsupported profile" bash "$ROOT_DIR/scripts/start_easy.sh" "$MODEL_DIR" Z q8
+
+echo "[test] start scripts reject unsupported DeepSeek model sizes"
+expect_fail_contains "unsupported deepseek model" env PREPARE_MODELS=0 LLM_MODEL_TRIPLE_MAX=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B bash "$ROOT_DIR/scripts/start_native_stack.sh" "$MODEL_DIR" auto
+
 echo "[test] serve helper rejects non-deepseek backend"
-expect_fail_contains "not supported in production mainline" env BACKEND=torch_tp bash "$ROOT_DIR/scripts/serve.sh" "$MODEL_DIR" "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" 18080
+expect_fail_contains "not supported in production mainline" env BACKEND=torch_tp bash "$ROOT_DIR/scripts/serve.sh" "$MODEL_DIR" "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" 18080
 
 echo "[test] generate helper rejects non-deepseek backend"
-expect_fail_contains "not supported in production mainline" env BACKEND=torch_tp bash "$ROOT_DIR/scripts/hrm_flash_generate.sh" "$MODEL_DIR" "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" "Hallo"
+expect_fail_contains "not supported in production mainline" env BACKEND=torch_tp bash "$ROOT_DIR/scripts/hrm_flash_generate.sh" "$MODEL_DIR" "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" "Hallo"
 
 echo "[test] cli serve parser rejects torch_tp backend"
-expect_fail_contains "invalid choice" python3 -m hrm_flash.cli serve --hrm_model "$MODEL_DIR" --llm_model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" --world 1 --backend torch_tp
+expect_fail_contains "invalid choice" python3 -m hrm_flash.cli serve --hrm_model "$MODEL_DIR" --llm_model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" --world 1 --backend torch_tp
 
 echo "[test] cli generate parser rejects torch_tp backend"
-expect_fail_contains "invalid choice" python3 -m hrm_flash.cli generate --hrm_model "$MODEL_DIR" --llm_model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" --prompt "Hallo" --backend torch_tp
+expect_fail_contains "invalid choice" python3 -m hrm_flash.cli generate --hrm_model "$MODEL_DIR" --llm_model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" --prompt "Hallo" --backend torch_tp
 
 echo "[ok] native deepseek-only lock guards"

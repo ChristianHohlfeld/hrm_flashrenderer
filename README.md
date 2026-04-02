@@ -8,13 +8,28 @@ If your server has:
 - Python 3.10-3.12 (hard requirement)
 - `cmake` + `ctest` (needed when `RUN_BOOTSTRAP=1`)
 - NVIDIA driver + CUDA (`nvidia-smi`, `nvcc`)
-- 4 GPUs (22/11/11/10 GB) with one NVLink pair on the two 11 GB cards
+- first-user default preset `A`: `22/11/11` (3x RTX 2080 Ti, no 3080 required)
 - an HRM index at `./model_index` (`router_index.bin` + `index.sqlite`)
 
 run exactly this from repo root:
 
 ```bash
 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis."
+```
+
+Or use hardware preset launcher (recommended):
+
+```bash
+# A|B|C|D + q8|q4
+bash scripts/start_easy.sh ./model_index A q8
+```
+
+Then prompt through router:
+
+```bash
+curl -s http://127.0.0.1:8090/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.","mode":"mixed","route_hint":"balanced","max_new_tokens":256}'
 ```
 
 This single command does:
@@ -47,6 +62,13 @@ Skip reinstall/rebuild:
 
 ```bash
 RUN_BOOTSTRAP=0 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis."
+```
+
+With fixed preset during E2E (recommended):
+
+```bash
+RUN_BOOTSTRAP=0 EXPECTED_GPUS=3 HW_BASE_PROFILE=A MODEL_QUANT=q8 ENABLE_SOLO_3080=0 \
+  bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz."
 ```
 
 ## Keep Running / Stop
@@ -87,19 +109,28 @@ curl -s http://127.0.0.1:8090/v1/generate \
 Default startup mode is `TOPOLOGY_MODE=max_model_fast` with `auto` profile (`max_vram_hetero`):
 - max-model lane (`solo_22gb`, world=3 on `22GB + 11GB + 11GB NVLink pair`):
   `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
-- fast lane (`solo_3080`, world=1 on `10GB`):
-  `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
-- router `balanced` and `quality` both target the 32B lane (nvlink logical lane is an alias)
-- router `fast` targets the 3080 lane
+- optional second lane (`solo_3080`, world=1 on `10GB` normal RTX 3080) can be enabled per preset/env
+- router `balanced` and `quality` target the max-model lane (nvlink logical lane is an alias)
+- router `fast` uses 3080 lane only when enabled; otherwise aliases to max-model lane
 
 Per-service defaults in `max_model_fast`:
 - 32B lane: `max_seq_len=3072`, `prefill_chunk_size=512`
-- 3080 lane: `max_seq_len=3072`, `prefill_chunk_size=384`
+- optional 3080 lane: `max_seq_len=3072`, `prefill_chunk_size=384`
 
-If you explicitly want the old 3-lane split (14B/14B/7B), use:
+Supported DeepSeek models in production mainline (fixed allowlist):
+- `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
+- `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` (use `MODEL_QUANT=q4`)
+
+Hardware presets (easy launcher `scripts/start_easy.sh`):
+- `A`: 22GB + 11GB + 11GB, no NVLink required, 3080 lane disabled
+- `B`: 22GB + 11GB + 11GB + 10GB (RTX 3080), no NVLink required
+- `C`: 22GB + 11GB + 11GB + 10GB (RTX 3080), NVLink required on 11GB pair
+- `D`: 22GB + 22GB + 11GB + 11GB, 3080 lane disabled
+
+Direct equivalent (without helper):
 
 ```bash
-TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
+HW_BASE_PROFILE=A MODEL_QUANT=q8 ENABLE_SOLO_3080=0 bash scripts/start_native_stack.sh ./model_index auto
 ```
 
 ## Generation Modes (Single Endpoint)
@@ -168,6 +199,7 @@ HRM_FLASH_BIN=/usr/local/bin/hrm-flash bash scripts/start_native_stack.sh ./mode
 `scripts/start_native_topology.sh` always infers:
 - NVLink pair from `nvidia-smi topo -m`
 - VRAM tiers from `nvidia-smi --query-gpu=index,memory.total`
+- optional fixed hardware profile via `HW_BASE_PROFILE=auto|A|B|C|D`
 
 Strict mode is on by default:
 - `STRICT_GPU_TOPOLOGY=1`
@@ -191,6 +223,7 @@ Native DeepSeek path supports dense HF safetensors layouts and does not support 
 
 - `scripts/prod_live_e2e.sh`
 - `scripts/prod_preflight.sh`
+- `scripts/start_easy.sh`
 - `scripts/start_native_stack.sh`
 - `scripts/stop_native_stack.sh`
 - `scripts/smoke_router.sh`

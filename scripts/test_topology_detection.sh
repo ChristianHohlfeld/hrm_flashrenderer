@@ -87,7 +87,7 @@ run_and_capture() {
 
 output_ok="$(run_and_capture "STRICT_GPU_TOPOLOGY=1" || true)"
 cleanup_pids
-echo "$output_ok" | grep -q "\[gpu-map\] detected pair=1,2 link=NVLINK nvlink_detected=1 solo_22gb=0 solo_3080=3 strict=1"
+echo "$output_ok" | grep -q "\[gpu-map\] profile=auto gpu_count=4 detected pair=1,2 link=NVLINK nvlink_detected=1 solo_22gb=0 solo_3080=3 strict=1"
 echo "$output_ok" | grep -q "\[gpu-map\] final mapping nvlink_pair=1,2 solo_22gb=0 solo_3080=3"
 
 output_mismatch="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 GPU_NVLINK_PAIR=0,1" || true)"
@@ -97,10 +97,14 @@ echo "$output_mismatch" | grep -q "mismatches detected NVLink pair=1,2"
 output_no_nvlink="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 FAKE_NO_NVLINK=1" || true)"
 cleanup_pids
 echo "$output_no_nvlink" | grep -q "\[warn\] no NVLink pair detected; using PCIe pair fallback: 1,2"
-echo "$output_no_nvlink" | grep -q "\[gpu-map\] detected pair=1,2 link=PCIE nvlink_detected=0 solo_22gb=0 solo_3080=3 strict=1"
+echo "$output_no_nvlink" | grep -q "\[gpu-map\] profile=auto gpu_count=4 detected pair=1,2 link=PCIE nvlink_detected=0 solo_22gb=0 solo_3080=3 strict=1"
 
 output_require_nvlink="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 FAKE_NO_NVLINK=1 REQUIRE_NVLINK=1" || true)"
 cleanup_pids
 echo "$output_require_nvlink" | grep -q "ERR: no NVLink pair detected, but REQUIRE_NVLINK=1."
+
+output_profile_c_no_nvlink="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 HW_BASE_PROFILE=C FAKE_NO_NVLINK=1" || true)"
+cleanup_pids
+echo "$output_profile_c_no_nvlink" | grep -q "HW profile C requires NVLink between the two 11GB cards"
 
 echo "[ok] topology detection + strict validation + PCIe fallback"
