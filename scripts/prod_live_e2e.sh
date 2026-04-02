@@ -14,6 +14,7 @@ set -euo pipefail
 # Environment knobs:
 #   RUN_BOOTSTRAP=1|0         default: 1
 #   EXPECTED_GPUS=<int>       default: 4
+#   TOPOLOGY_MODE             default: max_model_fast
 #   ROUTER_URL=<url>          default: http://127.0.0.1:8090
 #   ROUTER_ROUTE_HINT         default: balanced
 #   ROUTER_MAX_NEW_TOKENS     default: 256
@@ -23,7 +24,9 @@ set -euo pipefail
 #   START_STACK_SCRIPT        default: scripts/start_native_stack.sh
 #   STOP_STACK_SCRIPT         default: scripts/stop_native_stack.sh
 #   HEALTH_URL_SOLO_22GB      default: http://127.0.0.1:8081/v1/health
-#   HEALTH_URL_NVLINK_PAIR    default: http://127.0.0.1:8082/v1/health
+#   HEALTH_URL_NVLINK_PAIR    default:
+#                             - max_model_fast: alias to solo_22gb URL
+#                             - hetero_3lane: http://127.0.0.1:8082/v1/health
 #   HEALTH_URL_SOLO_3080      default: http://127.0.0.1:8083/v1/health
 
 if [[ $# -lt 1 ]]; then
@@ -36,6 +39,7 @@ FINAL_PROMPT="${2:-Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack
 
 RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-1}"
 EXPECTED_GPUS="${EXPECTED_GPUS:-4}"
+TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8090}"
 ROUTER_ROUTE_HINT="${ROUTER_ROUTE_HINT:-balanced}"
 ROUTER_MAX_NEW_TOKENS="${ROUTER_MAX_NEW_TOKENS:-256}"
@@ -48,9 +52,16 @@ LOG_DIR="${LOG_DIR:-$ROOT_DIR/.run/services}"
 PREFLIGHT_SCRIPT="${PREFLIGHT_SCRIPT:-$SCRIPT_DIR/prod_preflight.sh}"
 START_STACK_SCRIPT="${START_STACK_SCRIPT:-$SCRIPT_DIR/start_native_stack.sh}"
 STOP_STACK_SCRIPT="${STOP_STACK_SCRIPT:-$SCRIPT_DIR/stop_native_stack.sh}"
-HEALTH_URL_SOLO_22GB="${HEALTH_URL_SOLO_22GB:-http://127.0.0.1:8081/v1/health}"
-HEALTH_URL_NVLINK_PAIR="${HEALTH_URL_NVLINK_PAIR:-http://127.0.0.1:8082/v1/health}"
-HEALTH_URL_SOLO_3080="${HEALTH_URL_SOLO_3080:-http://127.0.0.1:8083/v1/health}"
+PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-$PORT_SOLO_22GB}"
+else
+  PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-8082}"
+fi
+PORT_SOLO_3080="${PORT_SOLO_3080:-8083}"
+HEALTH_URL_SOLO_22GB="${HEALTH_URL_SOLO_22GB:-http://127.0.0.1:${PORT_SOLO_22GB}/v1/health}"
+HEALTH_URL_NVLINK_PAIR="${HEALTH_URL_NVLINK_PAIR:-http://127.0.0.1:${PORT_NVLINK_PAIR}/v1/health}"
+HEALTH_URL_SOLO_3080="${HEALTH_URL_SOLO_3080:-http://127.0.0.1:${PORT_SOLO_3080}/v1/health}"
 
 STACK_STARTED=0
 cleanup() {
@@ -123,6 +134,7 @@ bash "$PREFLIGHT_SCRIPT" "$HRM_MODEL" "$EXPECTED_GPUS"
 echo "[3/5] start native stack"
 export BACKEND=deepseek_int8
 export PREPARE_MODELS=1
+export TOPOLOGY_MODE="$TOPOLOGY_MODE"
 bash "$START_STACK_SCRIPT" "$HRM_MODEL" auto
 STACK_STARTED=1
 

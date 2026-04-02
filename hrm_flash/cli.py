@@ -8,14 +8,8 @@ from pathlib import Path
 
 from hrm_flash.hrm_client import run_hrm_query
 from hrm_flash.prompt_builder import build_sources, build_renderer_prompt, fit_prompt_to_token_budget
-from hrm_flash.flash_runner import run_flash_generate
-from hrm_flash.flash_daemon_client import parse_daemon_addr, generate as daemon_generate
 from hrm_flash.utils import (
-    ensure_local_llm_model,
     find_hrm_binary,
-    validate_native_model_config,
-    validate_native_weight_layout,
-    validate_tp_world,
 )
 
 
@@ -51,7 +45,7 @@ def main():
     s.add_argument("--disable_token_budget", action="store_true")
     s.add_argument("--hrm_bin", default=None)
     s.add_argument("--max_concurrent", type=int, default=1)
-    s.add_argument("--backend", type=str, choices=["torch_tp", "deepseek_int8"], default="deepseek_int8")
+    s.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
     s.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
     s.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     s.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
@@ -100,7 +94,7 @@ def main():
     g.add_argument("--max_seq_len", type=int, default=8192)
     g.add_argument("--prefill_chunk_size", type=int, default=1024)
     g.add_argument("--local_files_only", action="store_true")
-    g.add_argument("--backend", type=str, choices=["torch_tp", "deepseek_int8"], default="deepseek_int8")
+    g.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
     g.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
     g.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     g.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
@@ -189,73 +183,30 @@ def main():
         if not (hrm_model / "router_index.bin").is_file() or not (hrm_model / "index.sqlite").is_file():
             raise SystemExit(f"ERR: HRM model directory must contain router_index.bin and index.sqlite: {hrm_model}")
 
-        llm_model = None
         tokenizer_model_for_budget = None
-        cfg = None
         deepseek_ctx = None
 
-        if args.backend == "torch_tp":
-            # Fail fast: check CUDA if not explicitly using CPU
-            if args.device != "cpu":
-                try:
-                    import torch
-                    if not torch.cuda.is_available():
-                        print("WARN: CUDA not available. Results might be slow or fail if GPU is required.")
-                    elif torch.cuda.device_count() == 0:
-                        print("WARN: torch reports 0 CUDA devices.")
-                except ImportError:
-                    raise SystemExit("ERR: torch is not installed. Required for LLM operations.")
-                except Exception as e:
-                    print(f"WARN: Error checking CUDA: {e}")
+        from hrm_flash.deepseek_native import ensure_deepseek_q8_model, resolve_deepseek_engine_bin
 
-            try:
-                llm_model = ensure_local_llm_model(
-                    args.llm_model,
-                    local_files_only=bool(args.local_files_only),
-                    project_root=repo_root,
-                )
-            except RuntimeError as e:
-                raise SystemExit(f"ERR: Failed to resolve/download model '{args.llm_model}': {e}") from e
-            tokenizer_model_for_budget = str(llm_model)
-
-            try:
-                from transformers import AutoConfig
-            except ImportError as e:
-                raise SystemExit(f"ERR: transformers is required for native model validation: {e}")
-            except Exception as e:
-                raise SystemExit(f"ERR: Failed to initialize transformers: {e}")
-            cfg = AutoConfig.from_pretrained(str(llm_model), local_files_only=bool(args.local_files_only))
-            try:
-                validate_native_model_config(cfg)
-                validate_native_weight_layout(llm_model)
-            except ValueError as e:
-                raise SystemExit(f"ERR: model not compatible with native hrm-flash path: {e}")
-
-            # Validate TP compatibility early (production behavior: fail fast with clear error)
-            if args.world is not None:
-                validate_tp_world(cfg, int(args.world))
-        else:
-            from hrm_flash.deepseek_native import ensure_deepseek_q8_model, resolve_deepseek_engine_bin
-
-            try:
-                model_bin, tok_src = ensure_deepseek_q8_model(
-                    args.llm_model,
-                    model_bin=args.model_bin,
-                    local_files_only=bool(args.local_files_only),
-                    project_root=repo_root,
-                )
-            except RuntimeError as e:
-                raise SystemExit(f"ERR: Failed to resolve/export deepseek model: {e}") from e
-            tokenizer_model_for_budget = str(args.tokenizer_model or tok_src)
-            try:
-                engine_bin = resolve_deepseek_engine_bin(repo_root, explicit=args.native_engine_bin)
-            except RuntimeError as e:
-                raise SystemExit(f"ERR: {e}") from e
-            deepseek_ctx = {
-                "model_bin": model_bin,
-                "tokenizer_source": tokenizer_model_for_budget,
-                "engine_bin": engine_bin,
-            }
+        try:
+            model_bin, tok_src = ensure_deepseek_q8_model(
+                args.llm_model,
+                model_bin=args.model_bin,
+                local_files_only=bool(args.local_files_only),
+                project_root=repo_root,
+            )
+        except RuntimeError as e:
+            raise SystemExit(f"ERR: Failed to resolve/export deepseek model: {e}") from e
+        tokenizer_model_for_budget = str(args.tokenizer_model or tok_src)
+        try:
+            engine_bin = resolve_deepseek_engine_bin(repo_root, explicit=args.native_engine_bin)
+        except RuntimeError as e:
+            raise SystemExit(f"ERR: {e}") from e
+        deepseek_ctx = {
+            "model_bin": model_bin,
+            "tokenizer_source": tokenizer_model_for_budget,
+            "engine_bin": engine_bin,
+        }
 
         r = run_hrm_query(
             hrm_bin=hrm_bin,
@@ -304,53 +255,32 @@ def main():
             return
 
         if args.use_daemon:
-            if args.backend == "deepseek_int8":
-                raise SystemExit("ERR: --use_daemon is only supported for backend=torch_tp")
-            addr = parse_daemon_addr()
-            if addr is None:
-                raise SystemExit("ERR: --use_daemon set but HRM_FLASH_DAEMON is not configured (host:port)")
-            text = daemon_generate(addr, prompt_text, args.max_new_tokens, args.prefill_chunk_size)
-            print(text)
-            return
+            raise SystemExit("ERR: --use_daemon is not supported in deepseek-only production mainline.")
 
-        if args.backend == "deepseek_int8":
-            from hrm_flash.deepseek_native import DeepSeekNativeEngine
+        from hrm_flash.deepseek_native import DeepSeekNativeEngine
 
-            assert deepseek_ctx is not None
-            runner = DeepSeekNativeEngine(
-                repo_root=repo_root,
-                model_bin=deepseek_ctx["model_bin"],
-                tokenizer_source=deepseek_ctx["tokenizer_source"],
-                engine_bin=deepseek_ctx["engine_bin"],
-                runtime_name=f"generate-{os.getpid()}",
-                local_files_only=bool(args.local_files_only),
-                max_new_tokens=max(1, int(args.max_new_tokens)),
-                startup_timeout_s=float(args.native_startup_timeout_s),
-                request_timeout_s=float(args.native_request_timeout_s),
-            )
-            try:
-                text = runner.generate(
-                    prompt_text,
-                    max_new_tokens=int(args.max_new_tokens),
-                    timeout_s=float(args.native_request_timeout_s),
-                )
-            finally:
-                runner.stop()
-            print(text)
-            return
-
-        code = run_flash_generate(
+        assert deepseek_ctx is not None
+        runner = DeepSeekNativeEngine(
             repo_root=repo_root,
-            llm_model_dir=llm_model,
-            prompt_text=prompt_text,
-            world=args.world,
-            max_new_tokens=args.max_new_tokens,
-            max_seq_len=args.max_seq_len,
-            prefill_chunk_size=args.prefill_chunk_size,
+            model_bin=deepseek_ctx["model_bin"],
+            tokenizer_source=deepseek_ctx["tokenizer_source"],
+            engine_bin=deepseek_ctx["engine_bin"],
+            runtime_name=f"generate-{os.getpid()}",
             local_files_only=bool(args.local_files_only),
-            device=args.device,
+            max_new_tokens=max(1, int(args.max_new_tokens)),
+            startup_timeout_s=float(args.native_startup_timeout_s),
+            request_timeout_s=float(args.native_request_timeout_s),
         )
-        raise SystemExit(code)
+        try:
+            text = runner.generate(
+                prompt_text,
+                max_new_tokens=int(args.max_new_tokens),
+                timeout_s=float(args.native_request_timeout_s),
+            )
+        finally:
+            runner.stop()
+        print(text)
+        return
 
 
 if __name__ == "__main__":

@@ -7,12 +7,11 @@ This document describes what the native `hrm-flash` path can run today.
 Run regular HF safetensors models directly through `hrm-flash` (native TP path),
 not only through the GGUF `renderer/hrm_render.py` wrapper.
 
-## Backends
+## Backend
 
-- `torch_tp` (existing TP + FlashAttention path)
 - `deepseek_int8` (native no-torch DeepSeek INT8 engine path)
 
-Both are available via `hrm-flash generate/serve --backend ...`.
+Production mainline is deepseek-only.
 
 ## Supported now
 
@@ -32,18 +31,19 @@ Both are available via `hrm-flash generate/serve --backend ...`.
 
 ## Practical DeepSeek guidance
 
-- `torch_tp`: use dense safetensors distill variants.
 - `deepseek_int8`: uses exported `model_q8.bin` + native engine process, with
   prompt token prefill and decoded output (no torch runtime in this path).
+- For heterogeneous `22/11/11/10 GB` production hosts, default max-size target is:
+  `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` on world=3 (`22GB + NVLink 11+11`).
 
 ## Example (native generate)
 
 ```bash
 hrm-flash generate \
   --hrm_model ./model \
-  --llm_model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B \
+  --llm_model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
   --backend deepseek_int8 \
-  --world 2 \
+  --world 3 \
   --prompt "Explain the retrieval evidence briefly."
 ```
 
@@ -52,13 +52,12 @@ hrm-flash generate \
 ```bash
 hrm-flash serve \
   --hrm_model ./model \
-  --llm_model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B \
+  --llm_model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
   --backend deepseek_int8 \
-  --world 2 \
+  --world 3 \
   --host 0.0.0.0 \
-  --port 8082
+  --port 8081
 ```
 
 `generate` and `serve` perform an explicit native compatibility preflight and
 fail fast with a clear message if the selected model layout is unsupported.
-The daemon path remains `torch_tp` only.

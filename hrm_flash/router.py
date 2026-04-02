@@ -140,6 +140,18 @@ def _normalize_backend_name(value: Optional[str]) -> Optional[str]:
     return aliases.get(s, s)
 
 
+def _collapsed_max_model_mode() -> bool:
+    solo = STATE.backends.get("solo_22gb")
+    pair = STATE.backends.get("nvlink_pair")
+    fast = STATE.backends.get("solo_3080")
+    if solo is None or pair is None or fast is None:
+        return False
+    return bool(
+        solo.base_url == pair.base_url
+        and solo.base_url != fast.base_url
+    )
+
+
 def _primary_backend(prompt_tokens: int, requested_max_new_tokens: int, route_hint: Optional[str], prefer_backend: Optional[str]) -> str:
     preferred = _normalize_backend_name(prefer_backend)
     if preferred in STATE.backends:
@@ -148,6 +160,11 @@ def _primary_backend(prompt_tokens: int, requested_max_new_tokens: int, route_hi
     hint = _normalize_backend_name(route_hint)
     if hint in STATE.backends:
         return hint
+
+    # In collapsed max-model mode (quality + balanced share same endpoint),
+    # default to that max-model lane unless caller explicitly requested "fast".
+    if _collapsed_max_model_mode():
+        return "nvlink_pair"
 
     if prompt_tokens <= STATE.short_prompt_tokens and requested_max_new_tokens <= STATE.short_max_new_tokens:
         return "solo_3080"
@@ -271,6 +288,7 @@ def main():
             "ok": all_ok,
             "router": {
                 "tokenizer": STATE.tokenizer_name,
+                "collapsed_max_model_mode": _collapsed_max_model_mode(),
                 "request_timeout_s": STATE.request_timeout_s,
                 "max_concurrent": STATE.max_concurrent,
                 "thresholds": {

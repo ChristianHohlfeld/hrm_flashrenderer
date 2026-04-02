@@ -83,15 +83,23 @@ curl -s http://127.0.0.1:8090/v1/generate \
 
 ## Model + Hardware Alignment (Default)
 
-`auto` startup profile (`max_vram_hetero`) uses:
-- `solo_22gb`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
-- `nvlink_pair`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
-- `solo_3080`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
+Default startup mode is `TOPOLOGY_MODE=max_model_fast` with `auto` profile (`max_vram_hetero`):
+- max-model lane (`solo_22gb`, world=3 on `22GB + 11GB + 11GB NVLink pair`):
+  `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
+- fast lane (`solo_3080`, world=1 on `10GB`):
+  `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
+- router `balanced` and `quality` both target the 32B lane (nvlink logical lane is an alias)
+- router `fast` targets the 3080 lane
 
-Per-service defaults:
-- `solo_22gb`: `max_seq_len=4096`, `prefill_chunk_size=768`
-- `nvlink_pair`: `max_seq_len=4096`, `prefill_chunk_size=768`
-- `solo_3080`: `max_seq_len=3072`, `prefill_chunk_size=384`
+Per-service defaults in `max_model_fast`:
+- 32B lane: `max_seq_len=3072`, `prefill_chunk_size=512`
+- 3080 lane: `max_seq_len=3072`, `prefill_chunk_size=384`
+
+If you explicitly want the old 3-lane split (14B/14B/7B), use:
+
+```bash
+TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
+```
 
 ## Dynamic GPU Mapping (No Static Order Assumptions)
 
@@ -107,9 +115,6 @@ Strict mode is on by default:
 
 Main production backend:
 - `deepseek_int8` (default)
-
-Optional:
-- `torch_tp` (separate dependency profile)
 
 Native DeepSeek path supports dense HF safetensors layouts and does not support MoE/GGUF/GPTQ/AWQ in this backend.
 

@@ -24,11 +24,16 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 echo "[python] regression tests"
 "$PYTHON_BIN" -m unittest tests.test_regressions
+echo "[python] router logic tests"
+"$PYTHON_BIN" -m unittest tests.test_router_logic
 echo "[python] hrm_api test"
 "$PYTHON_BIN" -m tests.test_hrm_api
 
 echo "[bash] topology detection test"
 bash scripts/test_topology_detection.sh
+
+echo "[bash] native deepseek lock test"
+bash scripts/test_native_lock.sh
 
 if command -v flash-kernel-test >/dev/null 2>&1 && "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
   echo "[cuda] flash kernel tests"

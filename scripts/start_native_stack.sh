@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Starts full native heterogeneous stack:
-# 1) three hrm-flash serve services (22GB solo, 11+11 NVLink pair, 3080 solo)
+# 1) native services according to TOPOLOGY_MODE
 # 2) one hrm-flash router endpoint with auto-dispatch + failover
 #
 # Usage:
@@ -10,8 +10,10 @@ set -euo pipefail
 #
 # Important env vars (optional):
 #   BACKEND (default: deepseek_int8)
+#   TOPOLOGY_MODE (default: max_model_fast; supported: max_model_fast, hetero_3lane)
 #   MODEL_PROFILE (default: max_vram_hetero for auto mode)
 #   LLM_MODEL_SOLO_22GB / LLM_MODEL_NVLINK_PAIR / LLM_MODEL_SOLO_3080
+#   LLM_MODEL_TRIPLE_MAX
 #   STRICT_GPU_TOPOLOGY (default: 1, enforced by start_native_topology.sh)
 #   PORT_SOLO_22GB, PORT_NVLINK_PAIR, PORT_SOLO_3080
 #   ROUTER_HOST, ROUTER_PORT
@@ -40,6 +42,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/.run/services}"
 mkdir -p "$LOG_DIR"
 BACKEND="${BACKEND:-deepseek_int8}"
+TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 PREPARE_MODELS="${PREPARE_MODELS:-1}"
 MODEL_PROFILE="${MODEL_PROFILE:-max_vram_hetero}"
 STRICT_GPU_TOPOLOGY="${STRICT_GPU_TOPOLOGY:-1}"
@@ -54,6 +57,15 @@ if [[ -z "${STARTUP_POLL_INTERVAL_S:-}" || "$STARTUP_POLL_INTERVAL_S" -lt 1 ]]; 
   STARTUP_POLL_INTERVAL_S=2
 fi
 
+if [[ "$BACKEND" != "deepseek_int8" ]]; then
+  echo "ERR: BACKEND=$BACKEND is not supported in production mainline. Use deepseek_int8." >&2
+  exit 2
+fi
+if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" ]]; then
+  echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane)." >&2
+  exit 2
+fi
+
 PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
 PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-8082}"
 PORT_SOLO_3080="${PORT_SOLO_3080:-8083}"
@@ -61,6 +73,7 @@ PORT_SOLO_3080="${PORT_SOLO_3080:-8083}"
 RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 RECO_MODEL_NVLINK_PAIR="${RECO_MODEL_NVLINK_PAIR:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+RECO_MODEL_TRIPLE_MAX="${RECO_MODEL_TRIPLE_MAX:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
 
 use_profile=0
 case "$DEFAULT_LLM_MODEL" in
@@ -78,17 +91,38 @@ if [[ "$use_profile" == "1" ]]; then
     echo "ERR: unsupported MODEL_PROFILE=$MODEL_PROFILE (supported: max_vram_hetero)." >&2
     exit 2
   fi
-  LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$RECO_MODEL_SOLO_22GB}"
-  LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$RECO_MODEL_NVLINK_PAIR}"
-  LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
-  DEFAULT_LLM_MODEL="$LLM_MODEL_SOLO_22GB"
+  if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+    LLM_MODEL_TRIPLE_MAX="${LLM_MODEL_TRIPLE_MAX:-$RECO_MODEL_TRIPLE_MAX}"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+    # Router keeps three logical lanes; quality and balanced can point to the same max-model service.
+    PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
+    LLM_MODEL_SOLO_22GB="$LLM_MODEL_TRIPLE_MAX"
+    LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_TRIPLE_MAX"
+    DEFAULT_LLM_MODEL="$LLM_MODEL_TRIPLE_MAX"
+  else
+    LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$RECO_MODEL_SOLO_22GB}"
+    LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$RECO_MODEL_NVLINK_PAIR}"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+    DEFAULT_LLM_MODEL="$LLM_MODEL_SOLO_22GB"
+  fi
 else
-  LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}"
-  LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$DEFAULT_LLM_MODEL}"
-  LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}"
+  if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+    LLM_MODEL_TRIPLE_MAX="${LLM_MODEL_TRIPLE_MAX:-$DEFAULT_LLM_MODEL}"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+    PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
+    LLM_MODEL_SOLO_22GB="$LLM_MODEL_TRIPLE_MAX"
+    LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_TRIPLE_MAX"
+  else
+    LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}"
+    LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$DEFAULT_LLM_MODEL}"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}"
+  fi
 fi
 
-echo "[stack] backend=$BACKEND profile=$MODEL_PROFILE auto_profile=$use_profile"
+echo "[stack] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE auto_profile=$use_profile"
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  echo "[stack] max_model_fast: route default targets 32B lane; use route_hint=fast for 3080 fast lane"
+fi
 echo "[stack] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
@@ -139,17 +173,32 @@ if [[ "$BACKEND" == "deepseek_int8" && "$PREPARE_MODELS" == "1" ]]; then
       bash "$BUILD_SCRIPT" "$model"
     fi
   }
-  build_one "${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_22GB:-}"
-  build_one "${LLM_MODEL_NVLINK_PAIR:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_NVLINK_PAIR:-}"
-  build_one "${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_3080:-}"
+  if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+    build_one "${LLM_MODEL_TRIPLE_MAX:-$LLM_MODEL_SOLO_22GB}" "${MODEL_BIN_TRIPLE_MAX:-${MODEL_BIN_SOLO_22GB:-}}"
+    build_one "${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_3080:-}"
+  else
+    build_one "${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_22GB:-}"
+    build_one "${LLM_MODEL_NVLINK_PAIR:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_NVLINK_PAIR:-}"
+    build_one "${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_3080:-}"
+  fi
 fi
 
 echo "[stack] starting native topology services..."
 MODEL_PROFILE="$MODEL_PROFILE" \
+TOPOLOGY_MODE="$TOPOLOGY_MODE" \
 STRICT_GPU_TOPOLOGY="$STRICT_GPU_TOPOLOGY" \
 LLM_MODEL_SOLO_22GB="$LLM_MODEL_SOLO_22GB" \
 LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_NVLINK_PAIR" \
 LLM_MODEL_SOLO_3080="$LLM_MODEL_SOLO_3080" \
+LLM_MODEL_TRIPLE_MAX="${LLM_MODEL_TRIPLE_MAX:-}" \
+MODEL_BIN_SOLO_22GB="${MODEL_BIN_SOLO_22GB:-}" \
+MODEL_BIN_NVLINK_PAIR="${MODEL_BIN_NVLINK_PAIR:-}" \
+MODEL_BIN_SOLO_3080="${MODEL_BIN_SOLO_3080:-}" \
+MODEL_BIN_TRIPLE_MAX="${MODEL_BIN_TRIPLE_MAX:-}" \
+TOKENIZER_MODEL_SOLO_22GB="${TOKENIZER_MODEL_SOLO_22GB:-}" \
+TOKENIZER_MODEL_NVLINK_PAIR="${TOKENIZER_MODEL_NVLINK_PAIR:-}" \
+TOKENIZER_MODEL_SOLO_3080="${TOKENIZER_MODEL_SOLO_3080:-}" \
+TOKENIZER_MODEL_TRIPLE_MAX="${TOKENIZER_MODEL_TRIPLE_MAX:-}" \
 STARTUP_WAIT_TIMEOUT_S="$STARTUP_WAIT_TIMEOUT_S" \
 STARTUP_POLL_INTERVAL_S="$STARTUP_POLL_INTERVAL_S" \
 bash "$SCRIPT_DIR/start_native_topology.sh" "$HRM_MODEL" "$DEFAULT_LLM_MODEL"

@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Starts three hrm-flash HTTP services for heterogeneous 4-GPU hosts:
-# - nvlink_pair (world=2): two 11GB 2080 Ti cards connected via NVLink
-# - solo_22gb   (world=1): standalone 22GB 2080 Ti
-# - solo_3080   (world=1): standalone 3080 (10GB)
+# Starts native hrm-flash HTTP services for heterogeneous 4-GPU hosts.
+# Supported modes:
+# - max_model_fast (default):
+#   - solo_22gb  (world=3) on 22GB + NVLink 11+11 for max-size model
+#   - solo_3080  (world=1) on standalone 3080 (10GB) for low-latency lane
+#   - nvlink_pair endpoint is an alias lane in router (same max-model endpoint)
+# - hetero_3lane:
+#   - nvlink_pair (world=2): two 11GB cards connected via NVLink
+#   - solo_22gb   (world=1): standalone 22GB card
+#   - solo_3080   (world=1): standalone 3080 card
 #
 # Usage:
 #   scripts/start_native_topology.sh <hrm_model_dir> [llm_model_dir|auto]
 #
 # Optional env vars:
-#   BACKEND           default: deepseek_int8   (or torch_tp)
+#   BACKEND           default: deepseek_int8 (deepseek-only production mainline)
+#   TOPOLOGY_MODE     default: max_model_fast (supported: max_model_fast, hetero_3lane)
 #   GPU_NVLINK_PAIR   default: auto (detect NVLink pair)
 #   GPU_22GB          default: auto (largest remaining VRAM card)
 #   GPU_3080          default: auto (smallest remaining VRAM card)
@@ -19,15 +26,19 @@ set -euo pipefail
 #   LLM_MODEL_SOLO_22GB      default: profile or <llm_model_dir arg>
 #   LLM_MODEL_NVLINK_PAIR    default: profile or <llm_model_dir arg>
 #   LLM_MODEL_SOLO_3080      default: profile or <llm_model_dir arg>
+#   LLM_MODEL_TRIPLE_MAX     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 #   RECO_MODEL_SOLO_22GB     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
 #   RECO_MODEL_NVLINK_PAIR   default: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
 #   RECO_MODEL_SOLO_3080     default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+#   RECO_MODEL_TRIPLE_MAX    default: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 #   MODEL_BIN_SOLO_22GB      default: unset
 #   MODEL_BIN_NVLINK_PAIR    default: unset
 #   MODEL_BIN_SOLO_3080      default: unset
+#   MODEL_BIN_TRIPLE_MAX     default: unset
 #   TOKENIZER_MODEL_SOLO_22GB   default: unset (falls back to per-service llm_model)
 #   TOKENIZER_MODEL_NVLINK_PAIR default: unset
 #   TOKENIZER_MODEL_SOLO_3080   default: unset
+#   TOKENIZER_MODEL_TRIPLE_MAX  default: unset
 #   NATIVE_ENGINE_BIN         default: unset
 #   NATIVE_STARTUP_TIMEOUT_S  default: 120
 #   NATIVE_REQUEST_TIMEOUT_S  default: 180
@@ -37,9 +48,11 @@ set -euo pipefail
 #   MAX_SEQ_SOLO_22GB default: 4096
 #   MAX_SEQ_NVLINK_PAIR default: 4096
 #   MAX_SEQ_SOLO_3080 default: 3072
+#   MAX_SEQ_TRIPLE_MAX default: 3072
 #   PREFILL_SOLO_22GB default: 768
 #   PREFILL_NVLINK_PAIR default: 768
 #   PREFILL_SOLO_3080 default: 384
+#   PREFILL_TRIPLE_MAX default: 512
 #   Legacy fallback env:
 #     MAX_SEQ_SOLO / MAX_SEQ_NVLINK, PREFILL_SOLO / PREFILL_NVLINK
 #   MAX_NEW_TOKENS    default: 256
@@ -56,11 +69,22 @@ fi
 HRM_MODEL="$1"
 LLM_MODEL="${2:-auto}"
 BACKEND="${BACKEND:-deepseek_int8}"
+TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 MODEL_PROFILE="${MODEL_PROFILE:-max_vram_hetero}"
+
+if [[ "$BACKEND" != "deepseek_int8" ]]; then
+  echo "ERR: BACKEND=$BACKEND is not supported in production mainline. Use deepseek_int8." >&2
+  exit 2
+fi
+if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" ]]; then
+  echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane)." >&2
+  exit 2
+fi
 
 RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 RECO_MODEL_NVLINK_PAIR="${RECO_MODEL_NVLINK_PAIR:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
+RECO_MODEL_TRIPLE_MAX="${RECO_MODEL_TRIPLE_MAX:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
 
 use_profile=0
 case "$LLM_MODEL" in
@@ -78,20 +102,36 @@ if [[ "$use_profile" == "1" ]]; then
     echo "ERR: unsupported MODEL_PROFILE=$MODEL_PROFILE (supported: max_vram_hetero)." >&2
     exit 2
   fi
-  LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$RECO_MODEL_SOLO_22GB}"
-  LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$RECO_MODEL_NVLINK_PAIR}"
-  LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+  if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+    LLM_MODEL_TRIPLE_MAX="${LLM_MODEL_TRIPLE_MAX:-$RECO_MODEL_TRIPLE_MAX}"
+    LLM_MODEL_SOLO_22GB="$LLM_MODEL_TRIPLE_MAX"
+    LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_TRIPLE_MAX"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+  else
+    LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$RECO_MODEL_SOLO_22GB}"
+    LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$RECO_MODEL_NVLINK_PAIR}"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+  fi
 else
-  LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$LLM_MODEL}"
-  LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$LLM_MODEL}"
-  LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$LLM_MODEL}"
+  if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+    LLM_MODEL_TRIPLE_MAX="${LLM_MODEL_TRIPLE_MAX:-$LLM_MODEL}"
+    LLM_MODEL_SOLO_22GB="$LLM_MODEL_TRIPLE_MAX"
+    LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_TRIPLE_MAX"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+  else
+    LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$LLM_MODEL}"
+    LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$LLM_MODEL}"
+    LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$LLM_MODEL}"
+  fi
 fi
 MODEL_BIN_SOLO_22GB="${MODEL_BIN_SOLO_22GB:-}"
 MODEL_BIN_NVLINK_PAIR="${MODEL_BIN_NVLINK_PAIR:-}"
 MODEL_BIN_SOLO_3080="${MODEL_BIN_SOLO_3080:-}"
+MODEL_BIN_TRIPLE_MAX="${MODEL_BIN_TRIPLE_MAX:-}"
 TOKENIZER_MODEL_SOLO_22GB="${TOKENIZER_MODEL_SOLO_22GB:-}"
 TOKENIZER_MODEL_NVLINK_PAIR="${TOKENIZER_MODEL_NVLINK_PAIR:-}"
 TOKENIZER_MODEL_SOLO_3080="${TOKENIZER_MODEL_SOLO_3080:-}"
+TOKENIZER_MODEL_TRIPLE_MAX="${TOKENIZER_MODEL_TRIPLE_MAX:-}"
 NATIVE_ENGINE_BIN="${NATIVE_ENGINE_BIN:-}"
 NATIVE_STARTUP_TIMEOUT_S="${NATIVE_STARTUP_TIMEOUT_S:-120}"
 NATIVE_REQUEST_TIMEOUT_S="${NATIVE_REQUEST_TIMEOUT_S:-180}"
@@ -104,13 +144,19 @@ STRICT_GPU_TOPOLOGY="${STRICT_GPU_TOPOLOGY:-1}"
 PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
 PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-8082}"
 PORT_SOLO_3080="${PORT_SOLO_3080:-8083}"
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  # Keep three logical router lanes; balanced + quality share the max-model endpoint.
+  PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
+fi
 
 MAX_SEQ_SOLO_22GB="${MAX_SEQ_SOLO_22GB:-${MAX_SEQ_SOLO:-4096}}"
 MAX_SEQ_NVLINK_PAIR="${MAX_SEQ_NVLINK_PAIR:-${MAX_SEQ_NVLINK:-4096}}"
 MAX_SEQ_SOLO_3080="${MAX_SEQ_SOLO_3080:-${MAX_SEQ_SOLO:-3072}}"
+MAX_SEQ_TRIPLE_MAX="${MAX_SEQ_TRIPLE_MAX:-3072}"
 PREFILL_SOLO_22GB="${PREFILL_SOLO_22GB:-${PREFILL_SOLO:-768}}"
 PREFILL_NVLINK_PAIR="${PREFILL_NVLINK_PAIR:-${PREFILL_NVLINK:-768}}"
 PREFILL_SOLO_3080="${PREFILL_SOLO_3080:-${PREFILL_SOLO:-384}}"
+PREFILL_TRIPLE_MAX="${PREFILL_TRIPLE_MAX:-512}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
 STARTUP_WAIT_TIMEOUT_S="${STARTUP_WAIT_TIMEOUT_S:-240}"
@@ -282,9 +328,14 @@ fi
 echo "[gpu-map] detected NVLink pair=$AUTO_GPU_NVLINK_PAIR solo_22gb=$AUTO_GPU_22GB solo_3080=$AUTO_GPU_3080 strict=$STRICT_GPU_TOPOLOGY"
 echo "[gpu-map] final mapping nvlink_pair=$GPU_NVLINK_PAIR solo_22gb=$GPU_22GB solo_3080=$GPU_3080"
 
-echo "[profile] backend=$BACKEND profile=$MODEL_PROFILE auto_profile=$use_profile"
-echo "[profile] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
-echo "[profile] seq/prefill: solo_22gb=${MAX_SEQ_SOLO_22GB}/${PREFILL_SOLO_22GB} nvlink_pair=${MAX_SEQ_NVLINK_PAIR}/${PREFILL_NVLINK_PAIR} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+echo "[profile] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE auto_profile=$use_profile"
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  echo "[profile] models: triple_max=$LLM_MODEL_SOLO_22GB solo_3080=$LLM_MODEL_SOLO_3080"
+  echo "[profile] seq/prefill: triple_max=${MAX_SEQ_TRIPLE_MAX}/${PREFILL_TRIPLE_MAX} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+else
+  echo "[profile] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
+  echo "[profile] seq/prefill: solo_22gb=${MAX_SEQ_SOLO_22GB}/${PREFILL_SOLO_22GB} nvlink_pair=${MAX_SEQ_NVLINK_PAIR}/${PREFILL_NVLINK_PAIR} solo_3080=${MAX_SEQ_SOLO_3080}/${PREFILL_SOLO_3080}"
+fi
 
 start_service() {
   local name="$1"
@@ -370,14 +421,28 @@ wait_service() {
   return 1
 }
 
-start_service "solo_22gb" "$GPU_22GB" "$LLM_MODEL_SOLO_22GB" "$MODEL_BIN_SOLO_22GB" "$TOKENIZER_MODEL_SOLO_22GB" 1 "$PORT_SOLO_22GB" "$MAX_SEQ_SOLO_22GB" "$PREFILL_SOLO_22GB"
-start_service "nvlink_pair" "$GPU_NVLINK_PAIR" "$LLM_MODEL_NVLINK_PAIR" "$MODEL_BIN_NVLINK_PAIR" "$TOKENIZER_MODEL_NVLINK_PAIR" 2 "$PORT_NVLINK_PAIR" "$MAX_SEQ_NVLINK_PAIR" "$PREFILL_NVLINK_PAIR"
-start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  TRIPLE_DEVICES="$GPU_22GB,$GPU_NVLINK_PAIR"
+  TRIPLE_MODEL_BIN="${MODEL_BIN_TRIPLE_MAX:-$MODEL_BIN_SOLO_22GB}"
+  TRIPLE_TOKENIZER_MODEL="${TOKENIZER_MODEL_TRIPLE_MAX:-$TOKENIZER_MODEL_SOLO_22GB}"
+
+  start_service "solo_22gb" "$TRIPLE_DEVICES" "$LLM_MODEL_SOLO_22GB" "$TRIPLE_MODEL_BIN" "$TRIPLE_TOKENIZER_MODEL" 3 "$PORT_SOLO_22GB" "$MAX_SEQ_TRIPLE_MAX" "$PREFILL_TRIPLE_MAX"
+  start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+else
+  start_service "solo_22gb" "$GPU_22GB" "$LLM_MODEL_SOLO_22GB" "$MODEL_BIN_SOLO_22GB" "$TOKENIZER_MODEL_SOLO_22GB" 1 "$PORT_SOLO_22GB" "$MAX_SEQ_SOLO_22GB" "$PREFILL_SOLO_22GB"
+  start_service "nvlink_pair" "$GPU_NVLINK_PAIR" "$LLM_MODEL_NVLINK_PAIR" "$MODEL_BIN_NVLINK_PAIR" "$TOKENIZER_MODEL_NVLINK_PAIR" 2 "$PORT_NVLINK_PAIR" "$MAX_SEQ_NVLINK_PAIR" "$PREFILL_NVLINK_PAIR"
+  start_service "solo_3080" "$GPU_3080" "$LLM_MODEL_SOLO_3080" "$MODEL_BIN_SOLO_3080" "$TOKENIZER_MODEL_SOLO_3080" 1 "$PORT_SOLO_3080" "$MAX_SEQ_SOLO_3080" "$PREFILL_SOLO_3080"
+fi
 
 if command -v curl >/dev/null 2>&1; then
-  wait_service "solo_22gb" "$PORT_SOLO_22GB"
-  wait_service "nvlink_pair" "$PORT_NVLINK_PAIR"
-  wait_service "solo_3080" "$PORT_SOLO_3080"
+  if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+    wait_service "solo_22gb" "$PORT_SOLO_22GB"
+    wait_service "solo_3080" "$PORT_SOLO_3080"
+  else
+    wait_service "solo_22gb" "$PORT_SOLO_22GB"
+    wait_service "nvlink_pair" "$PORT_NVLINK_PAIR"
+    wait_service "solo_3080" "$PORT_SOLO_3080"
+  fi
 else
   echo "[warn] curl not found; skipping service health wait."
 fi
@@ -388,8 +453,16 @@ Services started.
 Logs: $LOG_DIR
 
 Endpoints:
-  solo_22gb   -> http://127.0.0.1:$PORT_SOLO_22GB/v1/health
-  nvlink_pair -> http://127.0.0.1:$PORT_NVLINK_PAIR/v1/health
+  solo_22gb   -> http://127.0.0.1:$PORT_SOLO_22GB/v1/health$(
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  printf ' (world=3 on 22GB+NVLink pair, max-model lane)'
+fi
+)
+  nvlink_pair -> http://127.0.0.1:$PORT_NVLINK_PAIR/v1/health$(
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+  printf ' (alias lane -> same max-model endpoint)'
+fi
+)
   solo_3080   -> http://127.0.0.1:$PORT_SOLO_3080/v1/health
 
 EOF

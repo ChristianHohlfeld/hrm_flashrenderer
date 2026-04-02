@@ -18,7 +18,7 @@ set -euo pipefail
 
 WORKDIR="${WORKDIR:-$PWD}"
 PYTHON="${PYTHON:-python3}"
-MODEL_REPO="${MODEL_REPO:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
+MODEL_REPO="${MODEL_REPO:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
 MODEL_BIN="${MODEL_BIN:-model_q8.bin}"
 ENGINE_BIN="${ENGINE_BIN:-$WORKDIR/.run/bin/deepseek_engine}"
 SM="${SM:-75}"  # Backward-compatible single-arch override.

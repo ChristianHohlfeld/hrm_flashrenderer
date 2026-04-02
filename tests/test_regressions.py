@@ -38,6 +38,33 @@ def _backend_arg_defaults(py_file: Path) -> list[str]:
     return out
 
 
+def _backend_arg_choices(py_file: Path) -> list[list[str]]:
+    tree = ast.parse(_read_text(py_file))
+    out: list[list[str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "add_argument":
+            continue
+        arg_values: list[str] = []
+        for a in node.args:
+            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                arg_values.append(a.value)
+        if "--backend" not in arg_values:
+            continue
+        for kw in node.keywords:
+            if kw.arg != "choices":
+                continue
+            if isinstance(kw.value, (ast.List, ast.Tuple)):
+                vals: list[str] = []
+                for e in kw.value.elts:
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                        vals.append(e.value)
+                if vals:
+                    out.append(vals)
+    return out
+
+
 def _state_backend_default(py_file: Path) -> str | None:
     tree = ast.parse(_read_text(py_file))
     for node in ast.walk(tree):
@@ -75,11 +102,19 @@ class TestNativeProdRegressions(unittest.TestCase):
             all(v == "deepseek_int8" for v in defaults),
             f"unexpected backend default(s): {defaults}",
         )
+        choices = _backend_arg_choices(cli_path)
+        self.assertGreaterEqual(len(choices), 2, "expected backend choices for serve and generate")
+        self.assertTrue(
+            all(c == ["deepseek_int8"] for c in choices),
+            f"unexpected backend choice set(s): {choices}",
+        )
 
     def test_serve_backend_defaults_to_deepseek(self):
         serve_path = REPO_ROOT / "hrm_flash" / "serve.py"
         arg_defaults = _backend_arg_defaults(serve_path)
         self.assertEqual(arg_defaults, ["deepseek_int8"], f"unexpected serve backend arg defaults: {arg_defaults}")
+        arg_choices = _backend_arg_choices(serve_path)
+        self.assertEqual(arg_choices, [["deepseek_int8"]], f"unexpected serve backend arg choices: {arg_choices}")
         state_default = _state_backend_default(serve_path)
         self.assertEqual(state_default, "deepseek_int8", f"unexpected STATE.backend default: {state_default}")
 
@@ -108,6 +143,35 @@ class TestNativeProdRegressions(unittest.TestCase):
             txt = _read_text(REPO_ROOT / rel)
             for needle in needles:
                 self.assertIn(needle, txt, f"missing '{needle}' in {rel}")
+
+    def test_native_lock_guards_in_scripts(self):
+        checks = {
+            "scripts/bootstrap.sh": "PROFILE=$PROFILE is not supported in production mainline",
+            "scripts/start_native_stack.sh": "BACKEND=$BACKEND is not supported in production mainline",
+            "scripts/start_native_topology.sh": "BACKEND=$BACKEND is not supported in production mainline",
+            "scripts/serve.sh": "BACKEND=$BACKEND is not supported in production mainline",
+            "scripts/hrm_flash_generate.sh": "BACKEND=$BACKEND is not supported in production mainline",
+        }
+        for rel, needle in checks.items():
+            txt = _read_text(REPO_ROOT / rel)
+            self.assertIn(needle, txt, f"missing native lock guard in {rel}")
+
+    def test_max_model_fast_defaults_are_hardened(self):
+        stack_txt = _read_text(REPO_ROOT / "scripts" / "start_native_stack.sh")
+        topo_txt = _read_text(REPO_ROOT / "scripts" / "start_native_topology.sh")
+        e2e_txt = _read_text(REPO_ROOT / "scripts" / "prod_live_e2e.sh")
+
+        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', stack_txt)
+        self.assertIn(
+            'RECO_MODEL_TRIPLE_MAX="${RECO_MODEL_TRIPLE_MAX:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"',
+            stack_txt,
+        )
+        self.assertIn('PORT_NVLINK_PAIR="$PORT_SOLO_22GB"', stack_txt)
+        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', topo_txt)
+        self.assertIn('MAX_SEQ_TRIPLE_MAX="${MAX_SEQ_TRIPLE_MAX:-3072}"', topo_txt)
+        self.assertIn('PREFILL_TRIPLE_MAX="${PREFILL_TRIPLE_MAX:-512}"', topo_txt)
+        self.assertIn('TRIPLE_DEVICES="$GPU_22GB,$GPU_NVLINK_PAIR"', topo_txt)
+        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', e2e_txt)
 
 
 if __name__ == "__main__":

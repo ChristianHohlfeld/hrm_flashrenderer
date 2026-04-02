@@ -2,8 +2,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROFILE="${PROFILE:-deepseek_int8}"  # deepseek_int8 | torch_tp
+PROFILE="${PROFILE:-deepseek_int8}"  # deepseek-only production mainline
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if [[ "$PROFILE" != "deepseek_int8" ]]; then
+  echo "ERR: PROFILE=$PROFILE is not supported in production mainline. Use PROFILE=deepseek_int8." >&2
+  exit 2
+fi
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python >/dev/null 2>&1; then
@@ -34,18 +39,8 @@ ctest --test-dir "$ROOT/hrm_core/build"
 echo "[3/4] Install Python dependencies (profile=$PROFILE)"
 "$PYTHON_BIN" -m pip install -r "$ROOT/requirements.prod.txt"
 "$PYTHON_BIN" -m pip install -r "$ROOT/requirements.server.txt"
-if [[ "$PROFILE" == "torch_tp" ]]; then
-  export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.5;8.6}"
-  "$PYTHON_BIN" -m pip install -r "$ROOT/requirements.torch.txt"
-fi
 "$PYTHON_BIN" -m pip install -e "$ROOT"
 
-if [[ "$PROFILE" == "torch_tp" ]]; then
-  echo "[4/4] Flash kernel tests"
-  flash-kernel-test
-  flash-append-test
-else
-  echo "[4/4] Skip torch kernel tests for profile=$PROFILE"
-fi
+echo "[4/4] Native DeepSeek profile ready (torch path intentionally disabled in mainline)."
 
 echo "OK"

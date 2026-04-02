@@ -36,6 +36,11 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-512}"
 
+if [[ "$BACKEND" != "deepseek_int8" ]]; then
+  echo "ERR: BACKEND=$BACKEND is not supported in production mainline. Use deepseek_int8." >&2
+  exit 2
+fi
+
 args=(
   --hrm_model "$HRM_MODEL"
   --llm_model "$LLM_MODEL"

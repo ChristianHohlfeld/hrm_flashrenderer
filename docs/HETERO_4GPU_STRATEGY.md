@@ -17,10 +17,15 @@ Use multiple native services instead of one global TP graph.
 
 ## Recommended service topology
 
-Run 3 native `hrm-flash serve` instances:
-- `solo_22gb` on the 22 GB card, `world=1` (largest context / best quality tier)
-- `nvlink_pair` on the two 11 GB cards, `world=2` (balanced throughput tier)
-- `solo_3080` on the 10 GB card, `world=1` (fast lightweight tier)
+Default production mode (`TOPOLOGY_MODE=max_model_fast`) prioritizes model size:
+- max-model lane (`solo_22gb`): `world=3` on `22GB + 11GB + 11GB NVLink pair`
+- fast lane (`solo_3080`): `world=1` on `10GB`
+- `nvlink_pair` remains a logical router lane alias to the same max-model endpoint
+
+Optional compatibility mode (`TOPOLOGY_MODE=hetero_3lane`):
+- `solo_22gb` (`world=1`)
+- `nvlink_pair` (`world=2`)
+- `solo_3080` (`world=1`)
 
 This repo already includes helper scripts:
 - `scripts/start_native_topology.sh`
@@ -33,10 +38,9 @@ You can set per-service model overrides in `start_native_topology.sh`:
 - `LLM_MODEL_NVLINK_PAIR`
 - `LLM_MODEL_SOLO_3080`
 
-Default `auto` profile (`MODEL_PROFILE=max_vram_hetero`):
-- `solo_22gb`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
-- `nvlink_pair`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B`
-- `solo_3080`: `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
+Default `auto` profile (`MODEL_PROFILE=max_vram_hetero`, `TOPOLOGY_MODE=max_model_fast`):
+- max-model lane: `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
+- fast lane: `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
 
 GPU mapping is dynamically inferred (no static ordering assumptions):
 - Detect NVLink pair from `nvidia-smi topo -m`
@@ -51,11 +55,17 @@ Start full topology plus router:
 bash scripts/start_native_stack.sh ./model_index auto
 ```
 
+Optional legacy split:
+
+```bash
+TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
+```
+
 Build/export native DeepSeek assets explicitly (optional, done automatically by
 `start_native_stack.sh` when `BACKEND=deepseek_int8`):
 
 ```bash
-bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 ```
 
@@ -93,7 +103,6 @@ Startup reliability knobs:
 ## Dependency profiles
 
 - `requirements.prod.txt`: lean no-torch core.
-- `requirements.torch.txt`: adds torch TP path.
 - `requirements.server.txt`: HTTP server dependencies.
 
 ## Model policy for native path
@@ -112,9 +121,9 @@ Avoid:
 ## Routing policy (gateway layer)
 
 Use a thin router (reverse proxy or app logic) in front of the 3 endpoints:
-- Send long-context or highest-quality prompts to `solo_22gb`.
-- Send standard generation traffic to `nvlink_pair`.
-- Send short/low-latency prompts to `solo_3080`.
+- In default `max_model_fast`, `balanced` and `quality` land on the same 32B endpoint.
+- Send explicit low-latency prompts to `fast` (`solo_3080`).
+- Keep failover enabled for operational resilience.
 
 Start conservative and adapt from measurements:
 - `max_concurrent=1` per service
@@ -123,8 +132,7 @@ Start conservative and adapt from measurements:
 
 ## Suggested starting params
 
-- `solo_22gb`: `max_seq_len=4096`, `prefill_chunk_size=768`
-- `nvlink_pair`: `max_seq_len=4096`, `prefill_chunk_size=768`
+- max-model lane (`world=3`): `max_seq_len=3072`, `prefill_chunk_size=512`
 - `solo_3080`: `max_seq_len=3072`, `prefill_chunk_size=384`
 
 Tune in this order:
@@ -135,14 +143,14 @@ Tune in this order:
 ## Build/runtime notes for mixed 2080/3080 hosts
 
 - Build kernels for both arch families:
-  - `TORCH_CUDA_ARCH_LIST="7.5;8.6"`
+  - `CUDA_ARCH_LIST=75,86`
 - Keep separate service processes pinned by `CUDA_VISIBLE_DEVICES`.
 - Prefer local model cache (`llm_models/`) to avoid startup variance.
 - Validate model compatibility before production rollout (native preflight is now built in).
 
 ## Rollout sequence
 
-1. Start all three services with one dense model family.
+1. Start default `max_model_fast` topology and verify the 32B lane is healthy.
 2. Run health checks and short canary prompts on each endpoint.
 3. Run mixed load for 30-60 minutes, monitor OOM and p95 latency.
 4. Freeze routing thresholds and only then raise context windows.

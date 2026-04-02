@@ -13,25 +13,28 @@ Mainline production stack:
 Primary startup flow:
 - `scripts/prod_live_e2e.sh`
 
-## Optional Path
+## Backend Policy
 
-Optional fallback profile:
-- `torch_tp` (requires `requirements.torch.txt`)
+Production mainline is deepseek-only:
+- `deepseek_int8`
 
-This path is not the default.
+Non-native torch fallback is intentionally blocked in production scripts and CLI backend options.
 
 ## Hardware Strategy
 
 For `22/11/11/10 GB` with a single NVLink bridge on the two 11GB cards:
 - do not use `world=4` as default
-- run three services with dynamic GPU topology detection
+- default mode `max_model_fast` runs:
+  - one world=3 max-model lane (`22GB + 11GB + 11GB`) with DeepSeek 32B
+  - one world=1 fast lane (`10GB`) with DeepSeek 7B
+  - router keeps three logical lanes; `balanced` + `quality` map to the 32B lane
+- optional mode `hetero_3lane` runs separate `22GB`, `11+11 NVLink`, `10GB` services
 - route per request class (`fast`, `balanced`, `quality`)
 
 ## Dependency Profiles
 
 - `requirements.prod.txt`: lean no-torch core
 - `requirements.server.txt`: HTTP server
-- `requirements.torch.txt`: optional torch profile
 
 ## Key Guarantees
 

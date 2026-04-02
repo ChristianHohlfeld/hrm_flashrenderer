@@ -19,9 +19,16 @@ This validates build, dependencies, GPU topology, backend health, and a final en
 
 After startup (`scripts/start_native_stack.sh`):
 - `solo_22gb`: `http://127.0.0.1:8081/v1/health`
-- `nvlink_pair`: `http://127.0.0.1:8082/v1/health`
+- `nvlink_pair`: `http://127.0.0.1:8081/v1/health` (logical alias lane in default `max_model_fast` mode)
 - `solo_3080`: `http://127.0.0.1:8083/v1/health`
 - router: `http://127.0.0.1:8090/v1/health`
+
+Default mode is `TOPOLOGY_MODE=max_model_fast`:
+- max-model lane: DeepSeek 32B on `22GB + 11GB + 11GB` (world=3)
+- fast lane: DeepSeek 7B on `10GB` (world=1)
+
+Optional:
+- `TOPOLOGY_MODE=hetero_3lane` for explicit separate `22GB` / `11+11 NVLink` / `10GB` lanes.
 
 Inference entrypoint:
 
@@ -41,8 +48,7 @@ Optional request fields for `/v1/generate`:
 ## Backend Policy
 
 Default backend in CLI and service is `deepseek_int8`.
-
-`torch_tp` remains available as optional fallback profile, but it is not the default production path.
+Production mainline is deepseek-only. Non-native torch fallback is intentionally blocked in production scripts and CLI backend options.
 
 ## Systemd Template
 
