@@ -1,15 +1,22 @@
 [Unit]
-Description=HRM-FlashRenderer HTTP Service
-After=network.target
+Description=HRM FlashRenderer Native DeepSeek Stack (3 backends + router)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 WorkingDirectory=/opt/hrm_flashrenderer
-Environment=TORCH_CUDA_ARCH_LIST=7.5
-Environment=HRM_FLASH_AUTHKEY=hrmflash
-ExecStart=/usr/bin/env bash -lc 'hrm-flash serve --hrm_model /opt/hrm_flashrenderer/model --llm_model /opt/models/llm --world 2 --host 0.0.0.0 --port 8080 --local_files_only'
-Restart=on-failure
-RestartSec=2
+Environment=BACKEND=deepseek_int8
+Environment=PREPARE_MODELS=1
+Environment=STRICT_GPU_TOPOLOGY=1
+Environment=LOCAL_FILES_ONLY=1
+# Replace with your real HRM index path before enabling this unit.
+Environment=HRM_MODEL_DIR=/opt/hrm_flashrenderer/model_index
+ExecStart=/usr/bin/env bash -lc 'bash scripts/start_native_stack.sh "$HRM_MODEL_DIR" auto'
+ExecStop=/usr/bin/env bash -lc 'bash scripts/stop_native_stack.sh'
+TimeoutStartSec=900
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

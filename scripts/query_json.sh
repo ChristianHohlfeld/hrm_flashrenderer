@@ -6,4 +6,8 @@ if [[ $# -lt 2 ]]; then
 fi
 MODEL="$1"
 PROMPT="$2"
-./hrm_core/build/hrm query --model "$MODEL" --format json --prompt "$PROMPT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+HRM_BIN="$ROOT_DIR/hrm_core/build/hrm"
+[[ -x "$HRM_BIN" ]] || { echo "ERR: missing HRM binary: $HRM_BIN (run scripts/build.sh first)" >&2; exit 1; }
+"$HRM_BIN" query --model "$MODEL" --format json --prompt "$PROMPT"

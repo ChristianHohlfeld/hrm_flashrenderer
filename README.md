@@ -27,6 +27,19 @@ This single command does:
 
 If it ends with `E2E PASS`, your pipeline is live.
 
+## If You Do Not Have `./model_index` Yet
+
+Create one (example):
+
+```bash
+cat > input.txt <<'EOF'
+HRM FlashRenderer verbindet deterministische Retrieval-Quellen mit nativer DeepSeek-Inferenz.
+Die Topologie nutzt drei Dienste: solo_22gb, nvlink_pair, solo_3080.
+EOF
+bash scripts/build.sh
+bash scripts/make_model.sh input.txt ./model_index 200
+```
+
 ## If Bootstrap Already Done
 
 Skip reinstall/rebuild:
@@ -115,3 +128,5 @@ Native DeepSeek path supports dense HF safetensors layouts and does not support 
 - `docs/DEEPSEEK_NATIVE_NO_TORCH.md`
 - `docs/HETERO_4GPU_STRATEGY.md`
 - `docs/NATIVE_MODELS.md`
+- `docs/INTEGRATION.md`
+- `STACK.md`

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR"
+
 if command -v cmake >/dev/null 2>&1; then
   echo "[cpp] hrm_core build + tests"
   cmake -S hrm_core -B hrm_core/build -DCMAKE_BUILD_TYPE=Release
@@ -24,10 +28,10 @@ fi
 echo "[bash] topology detection test"
 bash scripts/test_topology_detection.sh
 
-if command -v flash-kernel-test >/dev/null 2>&1; then
+if command -v flash-kernel-test >/dev/null 2>&1 && "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
   echo "[cuda] flash kernel tests"
   flash-kernel-test
   flash-append-test
 else
-  echo "[skip] flash-kernel-test not found; skipping flash kernel tests"
+  echo "[skip] torch flash tests unavailable (missing torch or flash-kernel-test)"
 fi

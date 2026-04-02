@@ -1,68 +1,52 @@
-# Integration Guide (Production)
+# Integration Guide (Production, Native DeepSeek)
 
-This project is designed as a **frontstack**:
+This repository is production-focused on:
+- deterministic HRM retrieval (C++ core)
+- native DeepSeek INT8 inference (`deepseek_int8`)
+- heterogeneous 4-GPU routing (`22GB`, `11+11 NVLink`, `10GB`)
 
-- HRM = deterministic local retrieval over a large knowledge mass (SSD/RAM)
-- FlashRenderer = small local HF model (7B–9B) using SM75 fused attention + TP
+## Fastest Path
 
-You integrate via one of these stable interfaces:
-
-## 1) HTTP API (recommended)
-
-Start:
+From repo root:
 
 ```bash
-hrm-flash serve --hrm_model ./model --llm_model /path/to/llm --world 2 --port 8080 --local_files_only
+bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz mit Quellen."
 ```
 
-Request:
+This validates build, dependencies, GPU topology, backend health, and a final end-to-end prompt.
+
+## Service Endpoints
+
+After startup (`scripts/start_native_stack.sh`):
+- `solo_22gb`: `http://127.0.0.1:8081/v1/health`
+- `nvlink_pair`: `http://127.0.0.1:8082/v1/health`
+- `solo_3080`: `http://127.0.0.1:8083/v1/health`
+- router: `http://127.0.0.1:8090/v1/health`
+
+Inference entrypoint:
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/generate \
+curl -s http://127.0.0.1:8090/v1/generate \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"...","max_new_tokens":128}'
+  -d '{"prompt":"Fasse die relevanten Quellen in 3 Punkten zusammen.","route_hint":"balanced","max_new_tokens":256}'
 ```
 
-Response:
+## Routing Controls
 
-```json
-{
-  "ok": true,
-  "text": "...",
-  "sources": [
-    {"sid":"0001#s0000","cid":"0001","rel":123,"txt":"...","txt_c":"..."}
-  ]
-}
-```
+Optional request fields for `/v1/generate`:
+- `route_hint`: `fast`, `balanced`, `quality`
+- `prefer_backend`: `solo_3080`, `nvlink_pair`, `solo_22gb`
+- `allow_failover`: `true` or `false`
 
-Notes:
-- Deterministic no-sources: returns "I don't know." with empty sources.
-- Prompt budgeting prevents overshooting max_seq_len.
+## Backend Policy
 
-## 2) Persistent daemon + CLI
+Default backend in CLI and service is `deepseek_int8`.
 
-Daemon:
+`torch_tp` remains available as optional fallback profile, but it is not the default production path.
 
-```bash
-export HRM_FLASH_DAEMON=127.0.0.1:5555
-export HRM_FLASH_AUTHKEY=hrmflash
-hrm-flash daemon --model /path/to/llm --world 2 --port 5555 --local_files_only
-```
+## Systemd Template
 
-Client:
+Template unit file:
+- `scripts/systemd/hrm-flash.service`
 
-```bash
-hrm-flash generate --hrm_model ./model --llm_model /path/to/llm --prompt "..." --use_daemon
-```
-
-## 3) Embedding HRM retrieval without subprocess
-
-If you build `hrm_core/build/libhrm_api.so`, Python will use it automatically.
-Otherwise, `hrm` subprocess is used as a fallback.
-
-Build:
-
-```bash
-cmake -S hrm_core -B hrm_core/build -DCMAKE_BUILD_TYPE=Release
-cmake --build hrm_core/build -j
-```
+It starts/stops the full native stack (`start_native_stack.sh` / `stop_native_stack.sh`) as a `Type=oneshot` service.

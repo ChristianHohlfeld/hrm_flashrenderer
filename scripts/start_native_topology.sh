@@ -64,7 +64,7 @@ RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qw
 
 use_profile=0
 case "$LLM_MODEL" in
-  ""|auto|max|max_vram|max_vram_hetero|"<dein-deepseek-distill>")
+  ""|auto|max|max_vram|max_vram_hetero)
     use_profile=1
     ;;
 esac

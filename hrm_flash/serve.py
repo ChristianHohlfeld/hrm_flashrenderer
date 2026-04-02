@@ -59,7 +59,7 @@ class _State:
         self.daemon_proc: subprocess.Popen | None = None
         self.sem: asyncio.Semaphore | None = None
         self.device: str = 'cuda'
-        self.backend: str = "torch_tp"
+        self.backend: str = "deepseek_int8"
         self.deepseek_engine = None
         self.native_request_timeout_s: float = 180.0
 
@@ -191,7 +191,7 @@ def main():
     ap.add_argument("--max_concurrent", type=int, default=1)
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
                     help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
-    ap.add_argument("--backend", type=str, choices=["torch_tp", "deepseek_int8"], default="torch_tp")
+    ap.add_argument("--backend", type=str, choices=["torch_tp", "deepseek_int8"], default="deepseek_int8")
     ap.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
     ap.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     ap.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
