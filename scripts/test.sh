@@ -14,7 +14,6 @@ else
   echo "[skip] cmake not found; skipping hrm_core build/tests"
 fi
 
-echo "[python] hrm_api test"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   PYTHON_BIN="python"
@@ -23,6 +22,9 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "ERR: python3/python not found; cannot run python tests" >&2
   exit 1
 fi
+echo "[python] regression tests"
+"$PYTHON_BIN" -m unittest tests.test_regressions
+echo "[python] hrm_api test"
 "$PYTHON_BIN" -m tests.test_hrm_api
 
 echo "[bash] topology detection test"
