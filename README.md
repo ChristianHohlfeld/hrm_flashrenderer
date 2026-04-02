@@ -135,7 +135,14 @@ Example:
 
 Strict mode is on by default:
 - `STRICT_GPU_TOPOLOGY=1`
-- startup fails if detected topology is missing/mismatched
+- startup fails on mapping mismatch
+
+If NVLink bridge is temporarily missing, startup still works by default:
+- falls back to best PCIe pair (`ALLOW_PCIE_PAIR_FALLBACK=1`, default)
+- prints a warning and continues
+
+To enforce hard NVLink-only startup:
+- `REQUIRE_NVLINK=1`
 
 ## Backend Scope
 

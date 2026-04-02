@@ -169,6 +169,8 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('MAX_SEQ_TRIPLE_MAX="${MAX_SEQ_TRIPLE_MAX:-3072}"', topo_txt)
         self.assertIn('PREFILL_TRIPLE_MAX="${PREFILL_TRIPLE_MAX:-512}"', topo_txt)
         self.assertIn('TRIPLE_DEVICES="$GPU_22GB,$GPU_NVLINK_PAIR"', topo_txt)
+        self.assertIn('ALLOW_PCIE_PAIR_FALLBACK="${ALLOW_PCIE_PAIR_FALLBACK:-1}"', topo_txt)
+        self.assertIn('REQUIRE_NVLINK="${REQUIRE_NVLINK:-0}"', topo_txt)
         self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', e2e_txt)
 
     def test_silent_mode_defaults_are_enabled(self):

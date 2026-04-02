@@ -22,6 +22,8 @@ set -euo pipefail
 #   GPU_22GB          default: auto (largest remaining VRAM card)
 #   GPU_3080          default: auto (smallest remaining VRAM card)
 #   STRICT_GPU_TOPOLOGY default: 1 (fail if dynamic topology inference fails or manual mapping mismatches detection)
+#   ALLOW_PCIE_PAIR_FALLBACK default: 1 (if no NVLink pair is detected, continue with best PCIe pair)
+#   REQUIRE_NVLINK    default: 0 (set 1 to fail startup when no NVLink pair is detected)
 #   MODEL_PROFILE             default: max_vram_hetero
 #   LLM_MODEL_SOLO_22GB      default: profile or <llm_model_dir arg>
 #   LLM_MODEL_NVLINK_PAIR    default: profile or <llm_model_dir arg>
@@ -140,6 +142,8 @@ GPU_NVLINK_PAIR="${GPU_NVLINK_PAIR:-auto}"
 GPU_22GB="${GPU_22GB:-auto}"
 GPU_3080="${GPU_3080:-auto}"
 STRICT_GPU_TOPOLOGY="${STRICT_GPU_TOPOLOGY:-1}"
+ALLOW_PCIE_PAIR_FALLBACK="${ALLOW_PCIE_PAIR_FALLBACK:-1}"
+REQUIRE_NVLINK="${REQUIRE_NVLINK:-0}"
 
 PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
 PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-8082}"
@@ -252,9 +256,23 @@ for i in idxs:
 if pairs:
     pairs.sort(reverse=True)
     _, p0, p1 = pairs[0]
+    pair_link = "NVLINK"
+    nvlink_detected = 1
 else:
-    # Strict requirement: NVLink pair must be explicitly detected.
-    sys.exit(2)
+    # Fallback when no NVLink edge is present: choose the best same-tier pair.
+    fallback = []
+    for i in idxs:
+        for j in idxs:
+            if i >= j:
+                continue
+            score = (100000 if abs(mem[i] - mem[j]) <= 2048 else 0) + min(mem[i], mem[j]) * 100
+            fallback.append((score, i, j))
+    if not fallback:
+        sys.exit(2)
+    fallback.sort(reverse=True)
+    _, p0, p1 = fallback[0]
+    pair_link = "PCIE"
+    nvlink_detected = 0
 
 remaining = [i for i in idxs if i not in (p0, p1)]
 if len(remaining) >= 2:
@@ -272,6 +290,8 @@ else:
 print(f"AUTO_GPU_NVLINK_PAIR={p0},{p1}")
 print(f"AUTO_GPU_22GB={solo22}")
 print(f"AUTO_GPU_3080={solo3080}")
+print(f"AUTO_GPU_PAIR_LINK={pair_link}")
+print(f"AUTO_GPU_NVLINK_DETECTED={nvlink_detected}")
 PY
 )" || return 1
 
@@ -300,6 +320,18 @@ if ! detect_gpu_layout; then
   exit 1
 fi
 
+if [[ "${AUTO_GPU_NVLINK_DETECTED:-0}" != "1" ]]; then
+  if [[ "$REQUIRE_NVLINK" == "1" ]]; then
+    echo "ERR: no NVLink pair detected, but REQUIRE_NVLINK=1." >&2
+    exit 1
+  fi
+  if [[ "$ALLOW_PCIE_PAIR_FALLBACK" != "1" ]]; then
+    echo "ERR: no NVLink pair detected and ALLOW_PCIE_PAIR_FALLBACK=$ALLOW_PCIE_PAIR_FALLBACK." >&2
+    exit 1
+  fi
+  echo "[warn] no NVLink pair detected; using PCIe pair fallback: $AUTO_GPU_NVLINK_PAIR"
+fi
+
 DETECTED_PAIR_NORM="$(normalize_pair "$AUTO_GPU_NVLINK_PAIR")"
 if [[ "$GPU_NVLINK_PAIR" == "auto" ]]; then
   GPU_NVLINK_PAIR="$AUTO_GPU_NVLINK_PAIR"
@@ -325,7 +357,7 @@ elif [[ "$STRICT_GPU_TOPOLOGY" == "1" && "$GPU_3080" != "$AUTO_GPU_3080" ]]; the
   exit 1
 fi
 
-echo "[gpu-map] detected NVLink pair=$AUTO_GPU_NVLINK_PAIR solo_22gb=$AUTO_GPU_22GB solo_3080=$AUTO_GPU_3080 strict=$STRICT_GPU_TOPOLOGY"
+echo "[gpu-map] detected pair=$AUTO_GPU_NVLINK_PAIR link=${AUTO_GPU_PAIR_LINK:-unknown} nvlink_detected=${AUTO_GPU_NVLINK_DETECTED:-0} solo_22gb=$AUTO_GPU_22GB solo_3080=$AUTO_GPU_3080 strict=$STRICT_GPU_TOPOLOGY"
 echo "[gpu-map] final mapping nvlink_pair=$GPU_NVLINK_PAIR solo_22gb=$GPU_22GB solo_3080=$GPU_3080"
 
 echo "[profile] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE auto_profile=$use_profile"

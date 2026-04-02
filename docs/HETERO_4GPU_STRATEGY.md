@@ -45,7 +45,9 @@ Default `auto` profile (`MODEL_PROFILE=max_vram_hetero`, `TOPOLOGY_MODE=max_mode
 GPU mapping is dynamically inferred (no static ordering assumptions):
 - Detect NVLink pair from `nvidia-smi topo -m`
 - Detect VRAM tiers from `nvidia-smi --query-gpu=index,memory.total`
-- Enforce strict matching by default (`STRICT_GPU_TOPOLOGY=1`)
+- Enforce strict mapping validation by default (`STRICT_GPU_TOPOLOGY=1`)
+- If NVLink is temporarily unavailable, default behavior is PCIe pair fallback (`ALLOW_PCIE_PAIR_FALLBACK=1`)
+- Set `REQUIRE_NVLINK=1` if startup must fail without an NVLink pair
 
 ## One-command startup
 
