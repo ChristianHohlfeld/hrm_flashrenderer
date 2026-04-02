@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from hrm_flash import serve
 
@@ -71,6 +72,27 @@ class TestServeModes(unittest.TestCase):
         serve.STATE.tokenizer_source = None
         p, sources, mode = serve._build_prompt("Frage", mode="mixed")
         self.assertEqual((p, sources, mode), ("", [], "mixed"))
+
+    def test_missing_tokenizer_source_never_imports_transformers(self):
+        def _ok(*_a, **_kw):
+            return _FakeHRMResult({"chosen": [{"sid": "s0001", "txt": "Alpha fact"}]})
+
+        serve.run_hrm_query = _ok
+        serve.STATE.disable_token_budget = False
+        serve.STATE.tokenizer_source = None
+
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
+            if name == "transformers":
+                raise ModuleNotFoundError("No module named 'transformers'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=_guarded_import):
+            p, sources, mode = serve._build_prompt("Frage", mode="mixed")
+            self.assertEqual((p, sources, mode), ("", [], "mixed"))
 
 
 if __name__ == "__main__":
