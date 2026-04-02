@@ -200,7 +200,7 @@ The mode behavior is implemented in visible Python source files (not only in a c
   - `/v1/health` audit counters: `hrm_query_calls_total`, `hrm_query_calls_by_mode`, `mode_counts`
 - `hrm_flash/router.py`
   - `_resolve_mode`, `_resolve_show_sources`
-  - `deepseek_only` forces `show_sources=False` and logs `mode=deepseek_only no retrieval`
+  - `deepseek_only` forces `show_sources=False` and logs `mode=deepseek_only HRM disabled (no retrieval)`
 - `scripts/start_native_stack.sh`
   - validates `ROUTER_DEFAULT_MODE` (`retrieval|mixed|deepseek_only`)
   - passes `--default_mode` into router startup

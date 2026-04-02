@@ -1,7 +1,13 @@
 import unittest
 from textwrap import dedent
 
-from hrm_flash.prompt_builder import MIXED_SYSTEM_PROMPT, Source, build_prompt_for_mode, normalize_mode
+from hrm_flash.prompt_builder import (
+    MIXED_SYSTEM_PROMPT,
+    RETRIEVAL_SYSTEM_PROMPT,
+    Source,
+    build_prompt_for_mode,
+    normalize_mode,
+)
 
 
 class TestThreeModes(unittest.TestCase):
@@ -37,6 +43,8 @@ class TestThreeModes(unittest.TestCase):
         self.assertNotIn("s0002", p)
         self.assertIn('Never mention "sources"', p)
         self.assertIn("Never refer to the fact that you were given additional context.", p)
+        self.assertIn(MIXED_SYSTEM_PROMPT, p)
+        self.assertNotIn(RETRIEVAL_SYSTEM_PROMPT, p)
 
     def test_deepseek_only_has_no_retrieval_context(self):
         p = build_prompt_for_mode(self.q, self.sources, mode="deepseek_only")

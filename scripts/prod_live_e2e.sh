@@ -328,8 +328,8 @@ if deepseek_resp.get("hrm_active", None) is not False:
 router_log = Path(os.environ.get("LOG_DIR", "")) / "router.log"
 if router_log.is_file():
     router_log_txt = router_log.read_text(encoding="utf-8", errors="replace").lower()
-    if ("hrm disabled" not in router_log_txt) and ("no retrieval" not in router_log_txt):
-        raise SystemExit("deepseek_only-no-hrm-test: router log missing 'HRM disabled'/'no retrieval' marker")
+    if "hrm disabled" not in router_log_txt:
+        raise SystemExit("deepseek_only-no-hrm-test: router log missing 'HRM disabled' marker")
 
 print("[fp] 3) determinism-test (mixed sources)")
 mixed_sources_hash = None

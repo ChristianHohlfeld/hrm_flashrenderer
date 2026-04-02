@@ -339,7 +339,7 @@ def main():
             requested_max_new_tokens = max(1, min(4096, requested_max_new_tokens))
             prompt_tokens, estimator = _estimate_prompt_tokens(req.prompt)
             if mode == "deepseek_only":
-                print("[router] mode=deepseek_only no retrieval", file=sys.stderr, flush=True)
+                print("[router] mode=deepseek_only HRM disabled (no retrieval)", file=sys.stderr, flush=True)
 
             primary = _primary_backend(
                 prompt_tokens=prompt_tokens,

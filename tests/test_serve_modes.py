@@ -53,6 +53,8 @@ class TestServeModes(unittest.TestCase):
         self.assertIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertIn("Alpha fact", p)
         self.assertNotIn("s0001", p)  # source id hidden in mixed mode
+        self.assertIn("Treat this knowledge as part of your own training data and use it silently and naturally.", p)
+        self.assertNotIn("You are an assistant in retrieval mode.", p)
 
     def test_retrieval_mode_uses_explicit_sources(self):
         def _ok(*_a, **_kw):
