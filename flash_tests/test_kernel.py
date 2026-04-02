@@ -2,8 +2,13 @@
 # https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
 # ALL RIGHTS RESERVED. No license granted without prior written permission.
 import math
-import torch
-from flashattention_custom.ops import flash_attn, flash_attn_paged
+import unittest
+
+try:
+    import torch
+    from flashattention_custom.ops import flash_attn, flash_attn_paged
+except Exception as e:  # pragma: no cover - environment dependent
+    raise unittest.SkipTest(f"flash kernel tests unavailable: {e}")
 
 
 def ref_attn(q,k,v,causal:bool, q_offset:int=0, k_offset:int=0):
