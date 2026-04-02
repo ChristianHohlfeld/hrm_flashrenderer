@@ -218,6 +218,18 @@ RUN_HARD_SCRIPT_TESTS=1 bash scripts/test.sh
 bash scripts/test_prod_live_e2e.sh
 ```
 
+Source-visibility + simple compile step (no black-box router):
+
+```bash
+bash scripts/verify_router_source.sh
+```
+
+This command prints the exact source file paths used at runtime (`cli`, `router`, `serve`, `prompt_builder`) and compile-checks them (`py_compile` + `compileall`) before any live run.
+
+`scripts/start_native_stack.sh` now also prints the active router source path at startup:
+- local source path (default, via `python -m hrm_flash.cli`)
+- or explicit external binary warning when `HRM_FLASH_BIN` is set
+
 ## Comparable DeepSeek Benchmarks (Real Router Path)
 
 Use the dedicated benchmark runner for reproducible latency/throughput comparisons:

@@ -34,6 +34,8 @@ echo "[python] mode audit runtime tests"
 "$PYTHON_BIN" -m unittest tests.test_mode_audit_runtime
 echo "[python] router logic tests"
 "$PYTHON_BIN" -m unittest tests.test_router_logic
+echo "[python] router source transparency tests"
+"$PYTHON_BIN" -m unittest tests.test_router_source_transparency
 echo "[python] hrm_api test"
 "$PYTHON_BIN" -m tests.test_hrm_api
 
@@ -42,6 +44,9 @@ bash scripts/test_topology_detection.sh
 
 echo "[bash] native deepseek lock test"
 bash scripts/test_native_lock.sh
+
+echo "[bash] router source verify"
+bash scripts/verify_router_source.sh
 
 if command -v flash-kernel-test >/dev/null 2>&1 && "$PYTHON_BIN" -c "import torch" >/dev/null 2>&1; then
   echo "[cuda] flash kernel tests"

@@ -94,6 +94,31 @@ else
   HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)
 fi
 
+if [[ -z "${HRM_FLASH_BIN:-}" ]]; then
+  ROUTER_SOURCE_PATH="$(
+    "$PYTHON_BIN" - <<'PY'
+import inspect
+import pathlib
+import py_compile
+
+import hrm_flash.prompt_builder as prompt_builder
+import hrm_flash.router as router
+import hrm_flash.serve as serve
+
+modules = [router, serve, prompt_builder]
+for mod in modules:
+    src = pathlib.Path(inspect.getsourcefile(mod) or inspect.getfile(mod)).resolve()
+    py_compile.compile(str(src), doraise=True)
+
+router_src = pathlib.Path(inspect.getsourcefile(router) or inspect.getfile(router)).resolve()
+print(str(router_src))
+PY
+  )"
+  echo "[stack] router source=$ROUTER_SOURCE_PATH (compile-checked)"
+else
+  echo "[stack] router source=external binary (\$HRM_FLASH_BIN) - source visibility depends on that binary"
+fi
+
 PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
 PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-8082}"
 PORT_SOLO_3080="${PORT_SOLO_3080:-8083}"
