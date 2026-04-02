@@ -45,6 +45,7 @@ BACKEND="${BACKEND:-deepseek_int8}"
 TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 PREPARE_MODELS="${PREPARE_MODELS:-1}"
 MODEL_PROFILE="${MODEL_PROFILE:-max_vram_hetero}"
+MODEL_QUANT="${MODEL_QUANT:-q8}"
 STRICT_GPU_TOPOLOGY="${STRICT_GPU_TOPOLOGY:-1}"
 STARTUP_WAIT_TIMEOUT_S="${STARTUP_WAIT_TIMEOUT_S:-240}"
 STARTUP_POLL_INTERVAL_S="${STARTUP_POLL_INTERVAL_S:-2}"
@@ -61,6 +62,10 @@ if [[ "$BACKEND" != "deepseek_int8" ]]; then
   echo "ERR: BACKEND=$BACKEND is not supported in production mainline. Use deepseek_int8." >&2
   exit 2
 fi
+if [[ "$MODEL_QUANT" != "q8" && "$MODEL_QUANT" != "q4" ]]; then
+  echo "ERR: unsupported MODEL_QUANT=$MODEL_QUANT (supported: q8, q4)." >&2
+  exit 2
+fi
 if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" ]]; then
   echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane)." >&2
   exit 2
@@ -73,7 +78,15 @@ PORT_SOLO_3080="${PORT_SOLO_3080:-8083}"
 RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 RECO_MODEL_NVLINK_PAIR="${RECO_MODEL_NVLINK_PAIR:-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B}"
 RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
-RECO_MODEL_TRIPLE_MAX="${RECO_MODEL_TRIPLE_MAX:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
+RECO_MODEL_TRIPLE_MAX_Q8="${RECO_MODEL_TRIPLE_MAX_Q8:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
+RECO_MODEL_TRIPLE_MAX_Q4="${RECO_MODEL_TRIPLE_MAX_Q4:-deepseek-ai/DeepSeek-R1-Distill-Llama-70B}"
+if [[ -z "${RECO_MODEL_TRIPLE_MAX:-}" ]]; then
+  if [[ "$MODEL_QUANT" == "q4" ]]; then
+    RECO_MODEL_TRIPLE_MAX="$RECO_MODEL_TRIPLE_MAX_Q4"
+  else
+    RECO_MODEL_TRIPLE_MAX="$RECO_MODEL_TRIPLE_MAX_Q8"
+  fi
+fi
 
 use_profile=0
 case "$DEFAULT_LLM_MODEL" in
@@ -119,9 +132,9 @@ else
   fi
 fi
 
-echo "[stack] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE auto_profile=$use_profile"
+echo "[stack] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE auto_profile=$use_profile quant=$MODEL_QUANT"
 if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
-  echo "[stack] max_model_fast: route default targets 32B lane; use route_hint=fast for 3080 fast lane"
+  echo "[stack] max_model_fast: route default targets max-model lane; use route_hint=fast for 3080 fast lane"
 fi
 echo "[stack] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
 
@@ -168,9 +181,9 @@ if [[ "$BACKEND" == "deepseek_int8" && "$PREPARE_MODELS" == "1" ]]; then
     local model="$1"
     local out_bin="$2"
     if [[ -n "${out_bin:-}" ]]; then
-      bash "$BUILD_SCRIPT" "$model" "$out_bin"
+      MODEL_QUANT="$MODEL_QUANT" bash "$BUILD_SCRIPT" "$model" "$out_bin"
     else
-      bash "$BUILD_SCRIPT" "$model"
+      MODEL_QUANT="$MODEL_QUANT" bash "$BUILD_SCRIPT" "$model"
     fi
   }
   if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
@@ -186,6 +199,7 @@ fi
 echo "[stack] starting native topology services..."
 MODEL_PROFILE="$MODEL_PROFILE" \
 TOPOLOGY_MODE="$TOPOLOGY_MODE" \
+MODEL_QUANT="$MODEL_QUANT" \
 STRICT_GPU_TOPOLOGY="$STRICT_GPU_TOPOLOGY" \
 LLM_MODEL_SOLO_22GB="$LLM_MODEL_SOLO_22GB" \
 LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_NVLINK_PAIR" \

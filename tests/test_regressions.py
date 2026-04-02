@@ -162,10 +162,8 @@ class TestNativeProdRegressions(unittest.TestCase):
         e2e_txt = _read_text(REPO_ROOT / "scripts" / "prod_live_e2e.sh")
 
         self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', stack_txt)
-        self.assertIn(
-            'RECO_MODEL_TRIPLE_MAX="${RECO_MODEL_TRIPLE_MAX:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"',
-            stack_txt,
-        )
+        self.assertIn('RECO_MODEL_TRIPLE_MAX_Q8="${RECO_MODEL_TRIPLE_MAX_Q8:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"', stack_txt)
+        self.assertIn('RECO_MODEL_TRIPLE_MAX_Q4="${RECO_MODEL_TRIPLE_MAX_Q4:-deepseek-ai/DeepSeek-R1-Distill-Llama-70B}"', stack_txt)
         self.assertIn('PORT_NVLINK_PAIR="$PORT_SOLO_22GB"', stack_txt)
         self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', topo_txt)
         self.assertIn('MAX_SEQ_TRIPLE_MAX="${MAX_SEQ_TRIPLE_MAX:-3072}"', topo_txt)
@@ -189,6 +187,21 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn("SILENT_SYSTEM_PROMPT", prompt_txt)
         self.assertIn("Never mention retrieval, sources", prompt_txt)
         self.assertIn("max_sources: int = 16", prompt_txt)
+
+    def test_three_modes_are_wired_in_mainline(self):
+        cli_txt = _read_text(REPO_ROOT / "hrm_flash" / "cli.py")
+        serve_txt = _read_text(REPO_ROOT / "hrm_flash" / "serve.py")
+        router_txt = _read_text(REPO_ROOT / "hrm_flash" / "router.py")
+        prompt_txt = _read_text(REPO_ROOT / "hrm_flash" / "prompt_builder.py")
+
+        self.assertIn('g.add_argument("--mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")', cli_txt)
+        self.assertIn('mode: Optional[str] = None', serve_txt)
+        self.assertIn('show_sources: Optional[bool] = False', serve_txt)
+        self.assertIn('payload = {"ok": True, "text": text, "source_count": len(sources), "mode": mode}', serve_txt)
+        self.assertIn('"mode": req.mode,', router_txt)
+        self.assertIn('"show_sources": bool(req.show_sources),', router_txt)
+        self.assertIn('DEFAULT_MODE = "mixed"', prompt_txt)
+        self.assertIn('SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}', prompt_txt)
 
 
 if __name__ == "__main__":

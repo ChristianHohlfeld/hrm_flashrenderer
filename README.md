@@ -1,6 +1,6 @@
 # HRM FlashRenderer
 
-Native HRM retrieval + native DeepSeek INT8 inference for heterogeneous multi-GPU hosts.
+Native HRM retrieval + native DeepSeek inference for heterogeneous multi-GPU hosts.
 
 ## First-User Path (One Command, Full Stack, Final Prompt)
 
@@ -78,7 +78,7 @@ Final prompt call:
 ```bash
 curl -s http://127.0.0.1:8090/v1/generate \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.","route_hint":"balanced","max_new_tokens":256}'
+  -d '{"prompt":"Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.","mode":"mixed","route_hint":"balanced","max_new_tokens":256}'
 ```
 
 ## Model + Hardware Alignment (Default)
@@ -101,14 +101,25 @@ If you explicitly want the old 3-lane split (14B/14B/7B), use:
 TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
 ```
 
-## Silent Mode (Default)
+## Generation Modes (Single Endpoint)
 
-Silent mode is always on in production mainline:
-- HRM retrieval runs automatically with deterministic settings (`top_k=16`, `k=16`, timeout budget `1.8s`).
-- Retrieved sources are injected as internal context.
-- The model is instructed to never cite or mention retrieval/sources.
-- User prompt is passed through unchanged.
-- HTTP responses return `text` (+ `source_count` for checks); raw source text is hidden by default.
+`POST /v1/generate` supports three modes via JSON field `mode`:
+- `mixed` (default): HRM runs deterministically in background (`top_k=16`, `k=16`, `1.8s`), sources are internal/hidden, model must not mention retrieval.
+- `retrieval`: HRM sources are explicit in prompt context and model is instructed to cite source ids.
+- `deepseek_only`: no HRM query, no source injection, pure model response path.
+
+Optional JSON flag:
+- `show_sources`: include `sources` array in HTTP response (off by default, ignored for `deepseek_only`).
+
+Example:
+
+```json
+{
+  "prompt": "Dein normaler Prompt",
+  "mode": "mixed",
+  "show_sources": false
+}
+```
 
 ## Dynamic GPU Mapping (No Static Order Assumptions)
 

@@ -16,6 +16,7 @@ set -euo pipefail
 #   EXPECTED_GPUS=<int>       default: 4
 #   TOPOLOGY_MODE             default: max_model_fast
 #   ROUTER_URL=<url>          default: http://127.0.0.1:8090
+#   ROUTER_MODE               default: mixed (retrieval|mixed|deepseek_only)
 #   ROUTER_ROUTE_HINT         default: balanced
 #   ROUTER_MAX_NEW_TOKENS     default: 256
 #   AUTO_STOP=1|0             default: 0
@@ -41,6 +42,7 @@ RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-1}"
 EXPECTED_GPUS="${EXPECTED_GPUS:-4}"
 TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8090}"
+ROUTER_MODE="${ROUTER_MODE:-mixed}"
 ROUTER_ROUTE_HINT="${ROUTER_ROUTE_HINT:-balanced}"
 ROUTER_MAX_NEW_TOKENS="${ROUTER_MAX_NEW_TOKENS:-256}"
 AUTO_STOP="${AUTO_STOP:-0}"
@@ -150,11 +152,12 @@ check_backend_deepseek "solo_3080" "$HEALTH_URL_SOLO_3080"
 
 echo "[5/5] final prompt through full router stack"
 payload="$(
-  FINAL_PROMPT="$FINAL_PROMPT" ROUTER_ROUTE_HINT="$ROUTER_ROUTE_HINT" ROUTER_MAX_NEW_TOKENS="$ROUTER_MAX_NEW_TOKENS" \
+  FINAL_PROMPT="$FINAL_PROMPT" ROUTER_MODE="$ROUTER_MODE" ROUTER_ROUTE_HINT="$ROUTER_ROUTE_HINT" ROUTER_MAX_NEW_TOKENS="$ROUTER_MAX_NEW_TOKENS" \
   python3 - <<'PY'
 import json, os
 print(json.dumps({
     "prompt": os.environ["FINAL_PROMPT"],
+    "mode": os.environ["ROUTER_MODE"],
     "route_hint": os.environ["ROUTER_ROUTE_HINT"],
     "max_new_tokens": int(os.environ["ROUTER_MAX_NEW_TOKENS"]),
     "allow_failover": True,

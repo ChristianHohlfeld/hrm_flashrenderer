@@ -267,6 +267,8 @@ def main():
     class GenerateReq(BaseModel):
         prompt: str
         max_new_tokens: Optional[int] = None
+        mode: Optional[str] = None
+        show_sources: Optional[bool] = False
         route_hint: Optional[str] = None
         prefer_backend: Optional[str] = None
         allow_failover: bool = True
@@ -325,7 +327,12 @@ def main():
             for backend_name in candidates:
                 backend = STATE.backends[backend_name]
                 backend_max_new_tokens = min(requested_max_new_tokens, _max_new_limit_for_backend(backend_name))
-                payload = {"prompt": req.prompt, "max_new_tokens": int(backend_max_new_tokens)}
+                payload = {
+                    "prompt": req.prompt,
+                    "max_new_tokens": int(backend_max_new_tokens),
+                    "mode": req.mode,
+                    "show_sources": bool(req.show_sources),
+                }
                 attempted.append(backend_name)
                 try:
                     body, latency_ms = await asyncio.to_thread(

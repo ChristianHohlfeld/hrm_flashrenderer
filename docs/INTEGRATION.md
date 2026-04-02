@@ -2,7 +2,7 @@
 
 This repository is production-focused on:
 - deterministic HRM retrieval (C++ core)
-- native DeepSeek INT8 inference (`deepseek_int8`)
+- native DeepSeek inference (`deepseek_int8`, quantized model bins)
 - heterogeneous 4-GPU routing (`22GB`, `11+11 NVLink`, `10GB`)
 
 ## Fastest Path
@@ -35,8 +35,13 @@ Inference entrypoint:
 ```bash
 curl -s http://127.0.0.1:8090/v1/generate \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Fasse die relevanten Quellen in 3 Punkten zusammen.","route_hint":"balanced","max_new_tokens":256}'
+  -d '{"prompt":"Fasse die relevanten Quellen in 3 Punkten zusammen.","mode":"mixed","route_hint":"balanced","max_new_tokens":256}'
 ```
+
+Generation modes (same endpoint):
+- `mixed` (default): silent HRM in background
+- `retrieval`: explicit source/citation mode
+- `deepseek_only`: no HRM
 
 ## Routing Controls
 

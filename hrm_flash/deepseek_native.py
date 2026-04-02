@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from hrm_flash.deepseek_export import export_dsi8_v3
+from hrm_flash.deepseek_export import export_dsi_v4
 
 
 def _safe_name(s: str) -> str:
@@ -39,12 +39,23 @@ def resolve_deepseek_engine_bin(repo_root: Path, explicit: str | None = None) ->
     )
 
 
-def ensure_deepseek_q8_model(
+def ensure_deepseek_model(
     model_source: str,
     model_bin: str | None = None,
+    model_quant: str = "q8",
     local_files_only: bool = False,
     project_root: Path | None = None,
 ) -> tuple[Path, str]:
+    model_quant = str(model_quant).strip().lower()
+    if model_quant not in {"q8", "q4"}:
+        raise RuntimeError(f"unsupported model_quant='{model_quant}' (supported: q8, q4)")
+    if model_quant == "q4":
+        raise RuntimeError(
+            "model_quant=q4 is not enabled in production runtime yet "
+            "(native q4 CUDA kernels are not finalized in mainline). "
+            "Use model_quant=q8 for now."
+        )
+
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     if model_bin:
         mb = Path(model_bin).expanduser().resolve()
@@ -56,25 +67,42 @@ def ensure_deepseek_q8_model(
     if ms.is_file() and ms.suffix.lower() == ".bin":
         return ms.resolve(), model_source
     if ms.is_dir():
-        existing = ms / "model_q8.bin"
+        existing = ms / f"model_{model_quant}.bin"
         if existing.is_file():
             return existing.resolve(), str(ms.resolve())
-        out = ms / "model_q8.bin"
-        export_dsi8_v3(str(ms.resolve()), out, local_files_only=local_files_only)
+        out = ms / f"model_{model_quant}.bin"
+        export_dsi_v4(str(ms.resolve()), out, local_files_only=local_files_only, quant=model_quant)
         return out.resolve(), str(ms.resolve())
 
     target_dir = root / "llm_models" / _safe_name(model_source)
-    out = target_dir / "model_q8.bin"
+    out = target_dir / f"model_{model_quant}.bin"
     if not out.is_file():
         target_dir.mkdir(parents=True, exist_ok=True)
-        export_dsi8_v3(model_source, out, local_files_only=local_files_only)
+        export_dsi_v4(model_source, out, local_files_only=local_files_only, quant=model_quant)
     return out.resolve(), model_source
+
+
+def ensure_deepseek_q8_model(
+    model_source: str,
+    model_bin: str | None = None,
+    local_files_only: bool = False,
+    project_root: Path | None = None,
+) -> tuple[Path, str]:
+    # Backward-compatible wrapper used by existing call sites.
+    return ensure_deepseek_model(
+        model_source=model_source,
+        model_bin=model_bin,
+        model_quant="q8",
+        local_files_only=local_files_only,
+        project_root=project_root,
+    )
 
 
 def build_deepseek_engine_if_needed(
     repo_root: Path,
     model_source: str,
     model_bin: Path,
+    model_quant: str = "q8",
     force_rebuild: bool = False,
 ) -> None:
     run_candidates = [
@@ -96,6 +124,7 @@ def build_deepseek_engine_if_needed(
     env["WORKDIR"] = str(repo_root)
     env["MODEL_REPO"] = model_source
     env["MODEL_BIN"] = str(model_bin)
+    env["MODEL_QUANT"] = str(model_quant).strip().lower()
     env["ENGINE_BIN"] = str(engine_bin)
     env["SKIP_RUN"] = "1"
     env["FORCE_REBUILD"] = "1" if force_rebuild else "0"

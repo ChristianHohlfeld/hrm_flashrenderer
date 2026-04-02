@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hrm_flash.hrm_client import run_hrm_query
-from hrm_flash.prompt_builder import build_sources, build_renderer_prompt, fit_prompt_to_token_budget
+from hrm_flash.prompt_builder import (
+    build_prompt_for_mode,
+    build_sources,
+    fit_prompt_to_token_budget,
+    normalize_mode,
+)
 from hrm_flash.utils import find_hrm_binary
 
 
@@ -52,7 +57,11 @@ class _State:
 STATE = _State()
 
 
-def _build_prompt(prompt: str) -> tuple[str, list[dict[str, Any]]]:
+def _build_prompt(prompt: str, mode: str) -> tuple[str, list[Any], str]:
+    resolved_mode = normalize_mode(mode)
+    if resolved_mode == "deepseek_only":
+        return build_prompt_for_mode(prompt, [], mode=resolved_mode), [], resolved_mode
+
     # HRM query (prefer API if built, else subprocess)
     r = run_hrm_query(
         hrm_bin=STATE.hrm_bin,
@@ -68,7 +77,7 @@ def _build_prompt(prompt: str) -> tuple[str, list[dict[str, Any]]]:
 
     sources = build_sources(r.raw, max_sources=STATE.max_sources, max_chars_per_source=STATE.max_chars_per_source)
     if not sources:
-        return "", []
+        return "", [], resolved_mode
 
     q_for_prompt = prompt
     sources_for_prompt = sources
@@ -80,19 +89,25 @@ def _build_prompt(prompt: str) -> tuple[str, list[dict[str, Any]]]:
             return "", []
         tok = AutoTokenizer.from_pretrained(str(tok_src), local_files_only=bool(STATE.local_files_only))
         max_prompt_tokens = int(STATE.max_seq_len) - int(STATE.max_new_tokens) - int(STATE.reserve_prompt_tokens)
-        q_fit, s_fit = fit_prompt_to_token_budget(q_for_prompt, sources_for_prompt, tok, max_prompt_tokens)
+        q_fit, s_fit = fit_prompt_to_token_budget(
+            q_for_prompt,
+            sources_for_prompt,
+            tok,
+            max_prompt_tokens,
+            mode=resolved_mode,
+        )
         if not s_fit:
-            return "", []
+            return "", [], resolved_mode
         q_for_prompt, sources_for_prompt = q_fit, s_fit
 
-    prompt_text = build_renderer_prompt(q_for_prompt, sources_for_prompt)
-    return prompt_text, sources_for_prompt
+    prompt_text = build_prompt_for_mode(q_for_prompt, sources_for_prompt, mode=resolved_mode)
+    return prompt_text, sources_for_prompt, resolved_mode
 
 
 def main():
     FastAPI, HTTPException, JSONResponse, BaseModel = _require_fastapi()
 
-    ap = argparse.ArgumentParser(prog="hrm-flash-serve", description="HRM FlashRenderer HTTP service (HRM retrieval + native DeepSeek INT8 inference).")
+    ap = argparse.ArgumentParser(prog="hrm-flash-serve", description="HRM FlashRenderer HTTP service (HRM retrieval + native DeepSeek inference).")
     ap.add_argument("--hrm_model", required=True)
     ap.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID")
     ap.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
@@ -113,7 +128,8 @@ def main():
     ap.add_argument("--hrm_bin", default=None)
     ap.add_argument("--max_concurrent", type=int, default=1)
     ap.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
-    ap.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
+    ap.add_argument("--model_quant", type=str, choices=["q8", "q4"], default="q8", help="Native model quantization mode")
+    ap.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek model bin path (q8/q4)")
     ap.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     ap.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
     ap.add_argument("--native_startup_timeout_s", type=float, default=120.0)
@@ -145,14 +161,15 @@ def main():
 
     from hrm_flash.deepseek_native import (
         DeepSeekNativeEngine,
-        ensure_deepseek_q8_model,
+        ensure_deepseek_model,
         resolve_deepseek_engine_bin,
     )
 
     try:
-        model_bin, tok_src = ensure_deepseek_q8_model(
+        model_bin, tok_src = ensure_deepseek_model(
             args.llm_model,
             model_bin=args.model_bin,
+            model_quant=str(args.model_quant),
             local_files_only=bool(args.local_files_only),
             project_root=STATE.repo_root,
         )
@@ -183,6 +200,8 @@ def main():
     class GenerateReq(BaseModel):
         prompt: str
         max_new_tokens: Optional[int] = None
+        mode: Optional[str] = None
+        show_sources: Optional[bool] = False
 
     @app.get("/v1/health")
     async def health():
@@ -203,11 +222,15 @@ def main():
     async def generate(req: GenerateReq):
         if not req.prompt:
             raise HTTPException(status_code=400, detail="prompt required")
+        try:
+            mode = normalize_mode(req.mode)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         async with STATE.sem:
-            prompt_text, sources = _build_prompt(req.prompt)
+            prompt_text, sources, mode = _build_prompt(req.prompt, mode=mode)
             if not prompt_text:
-                payload = {"ok": True, "text": "I don't know.", "source_count": 0}
-                if STATE.expose_sources:
+                payload = {"ok": True, "text": "I don't know.", "source_count": 0, "mode": mode}
+                if bool(req.show_sources) or STATE.expose_sources:
                     payload["sources"] = []
                 return JSONResponse(payload)
             max_new = int(req.max_new_tokens) if req.max_new_tokens is not None else STATE.max_new_tokens
@@ -224,8 +247,8 @@ def main():
                 )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
-            payload = {"ok": True, "text": text, "source_count": len(sources)}
-            if STATE.expose_sources:
+            payload = {"ok": True, "text": text, "source_count": len(sources), "mode": mode}
+            if (bool(req.show_sources) or STATE.expose_sources) and mode != "deepseek_only":
                 payload["sources"] = [{"sid": s.sid, "txt": s.txt} for s in sources]
             return JSONResponse(payload)
 

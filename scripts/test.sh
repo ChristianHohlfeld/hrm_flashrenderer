@@ -26,6 +26,8 @@ echo "[python] regression tests"
 "$PYTHON_BIN" -m unittest tests.test_regressions
 echo "[python] silent mode tests"
 "$PYTHON_BIN" -m unittest tests.test_silent_mode
+echo "[python] three-mode tests"
+"$PYTHON_BIN" -m unittest tests.test_modes
 echo "[python] router logic tests"
 "$PYTHON_BIN" -m unittest tests.test_router_logic
 echo "[python] hrm_api test"

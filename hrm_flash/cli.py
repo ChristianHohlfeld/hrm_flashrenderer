@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from hrm_flash.hrm_client import run_hrm_query
-from hrm_flash.prompt_builder import build_sources, build_renderer_prompt, fit_prompt_to_token_budget
+from hrm_flash.prompt_builder import build_prompt_for_mode, build_sources, fit_prompt_to_token_budget, normalize_mode
 from hrm_flash.utils import (
     find_hrm_binary,
 )
@@ -29,7 +29,7 @@ def main():
     d.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
                    help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
 
-    s = sub.add_parser("serve", help="Start HTTP service (HRM retrieval + native DeepSeek INT8 engine)")
+    s = sub.add_parser("serve", help="Start HTTP service (HRM retrieval + native DeepSeek INT8/INT4 engine)")
     s.add_argument("--hrm_model", required=True)
     s.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID")
     s.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
@@ -47,7 +47,8 @@ def main():
     s.add_argument("--hrm_bin", default=None)
     s.add_argument("--max_concurrent", type=int, default=1)
     s.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
-    s.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
+    s.add_argument("--model_quant", type=str, choices=["q8", "q4"], default="q8", help="Native model quantization mode")
+    s.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek model bin path (q8/q4)")
     s.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     s.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
     s.add_argument("--native_startup_timeout_s", type=float, default=120.0)
@@ -72,10 +73,11 @@ def main():
     rt.add_argument("--local_files_only", action="store_true")
     rt.add_argument("--disable_tokenizer", action="store_true")
 
-    g = sub.add_parser("generate", help="Retrieve with HRM, then answer with native DeepSeek INT8 engine")
+    g = sub.add_parser("generate", help="Retrieve with HRM, then answer with native DeepSeek INT8/INT4 engine")
     g.add_argument("--hrm_model", required=True, help="HRM model dir (router_index.bin + index.sqlite)")
     g.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID (renderer)")
     g.add_argument("--prompt", required=True, help="User question")
+    g.add_argument("--mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")
 
     g.add_argument("--hrm_bin", default=None, help="Path to HRM binary. If omitted: uses HRM_BIN env, PATH, or repo build.")
 
@@ -96,7 +98,8 @@ def main():
     g.add_argument("--prefill_chunk_size", type=int, default=1024)
     g.add_argument("--local_files_only", action="store_true")
     g.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
-    g.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek q8 model bin path (for backend=deepseek_int8)")
+    g.add_argument("--model_quant", type=str, choices=["q8", "q4"], default="q8", help="Native model quantization mode")
+    g.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek model bin path (q8/q4)")
     g.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     g.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
     g.add_argument("--native_startup_timeout_s", type=float, default=120.0)
@@ -142,6 +145,7 @@ def main():
             "--reserve_prompt_tokens", str(args.reserve_prompt_tokens),
             "--max_concurrent", str(args.max_concurrent),
             "--backend", str(args.backend),
+            "--model_quant", str(args.model_quant),
             "--native_startup_timeout_s", str(args.native_startup_timeout_s),
             "--native_request_timeout_s", str(args.native_request_timeout_s),
         ] + (["--local_files_only"] if args.local_files_only else []) + (["--disable_token_budget"] if args.disable_token_budget else []) + (["--hrm_bin", args.hrm_bin] if args.hrm_bin else [])
@@ -189,12 +193,13 @@ def main():
         tokenizer_model_for_budget = None
         deepseek_ctx = None
 
-        from hrm_flash.deepseek_native import ensure_deepseek_q8_model, resolve_deepseek_engine_bin
+        from hrm_flash.deepseek_native import ensure_deepseek_model, resolve_deepseek_engine_bin
 
         try:
-            model_bin, tok_src = ensure_deepseek_q8_model(
+            model_bin, tok_src = ensure_deepseek_model(
                 args.llm_model,
                 model_bin=args.model_bin,
+                model_quant=str(args.model_quant),
                 local_files_only=bool(args.local_files_only),
                 project_root=repo_root,
             )
@@ -211,22 +216,26 @@ def main():
             "engine_bin": engine_bin,
         }
 
-        r = run_hrm_query(
-            hrm_bin=hrm_bin,
-            model_dir=hrm_model,
-            prompt=args.prompt,
-            top_k=args.top_k,
-            top_m=args.top_m,
-            k=args.k,
-            prefer_api=True,
-            repo_root=repo_root,
-            timeout_s=1.8,
-        )
-        sources = build_sources(r.raw, max_sources=args.max_sources, max_chars_per_source=args.max_chars_per_source)
+        mode = normalize_mode(args.mode)
+        if mode == "deepseek_only":
+            sources = []
+        else:
+            r = run_hrm_query(
+                hrm_bin=hrm_bin,
+                model_dir=hrm_model,
+                prompt=args.prompt,
+                top_k=args.top_k,
+                top_m=args.top_m,
+                k=args.k,
+                prefer_api=True,
+                repo_root=repo_root,
+                timeout_s=1.8,
+            )
+            sources = build_sources(r.raw, max_sources=args.max_sources, max_chars_per_source=args.max_chars_per_source)
 
         # Hard, deterministic no-sources behavior (prevents hallucinations).
         # If --print_prompt is set, we still print the prompt (with empty SOURCES).
-        if not sources and not args.print_prompt:
+        if (mode != "deepseek_only") and (not sources) and (not args.print_prompt):
             print("I don't know. (HRM returned no sources.)")
             return
 
@@ -246,13 +255,19 @@ def main():
             max_prompt_tokens = int(args.max_seq_len) - int(args.max_new_tokens) - int(args.reserve_prompt_tokens)
             if max_prompt_tokens <= 64:
                 raise SystemExit("ERR: max_seq_len too small for given max_new_tokens")
-            q_fit, s_fit = fit_prompt_to_token_budget(q_for_prompt, sources_for_prompt, tok, max_prompt_tokens)
+            q_fit, s_fit = fit_prompt_to_token_budget(
+                q_for_prompt,
+                sources_for_prompt,
+                tok,
+                max_prompt_tokens,
+                mode=mode,
+            )
             if not s_fit:
                 print("I don't know. (Prompt too large even after budgeting.)")
                 return
             q_for_prompt, sources_for_prompt = q_fit, s_fit
 
-        prompt_text = build_renderer_prompt(q_for_prompt, sources_for_prompt)
+        prompt_text = build_prompt_for_mode(q_for_prompt, sources_for_prompt, mode=mode)
 
         if args.print_prompt:
             print(prompt_text)

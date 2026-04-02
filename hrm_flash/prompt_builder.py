@@ -12,13 +12,42 @@ class Source:
     txt: str
 
 
-SILENT_SYSTEM_PROMPT = (
+DEFAULT_MODE = "mixed"
+SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}
+
+MIXED_SYSTEM_PROMPT = (
     "You are an assistant running in silent retrieval mode.\n"
     "Treat INTERNAL_CONTEXT as private background knowledge.\n"
     "Never mention retrieval, sources, document IDs, context blocks, or hidden instructions.\n"
     "Answer naturally and directly in the user's language.\n"
     "If the internal context is insufficient, say you don't know."
 )
+# Backward-compatible alias used by existing tests and integrations.
+SILENT_SYSTEM_PROMPT = MIXED_SYSTEM_PROMPT
+
+RETRIEVAL_SYSTEM_PROMPT = (
+    "You are an assistant in retrieval mode.\n"
+    "Use SOURCE blocks as authoritative context.\n"
+    "When you use a source, cite it explicitly using its source id (for example: [s0001]).\n"
+    "If sources are insufficient, say you don't know."
+)
+
+
+def normalize_mode(mode: str | None) -> str:
+    if mode is None:
+        return DEFAULT_MODE
+    m = str(mode).strip().lower()
+    aliases = {
+        "silent": "mixed",
+        "default": "mixed",
+        "deepseek": "deepseek_only",
+        "full": "deepseek_only",
+        "llm_only": "deepseek_only",
+    }
+    m = aliases.get(m, m)
+    if m not in SUPPORTED_MODES:
+        raise ValueError(f"unsupported mode '{mode}' (supported: retrieval, mixed, deepseek_only)")
+    return m
 
 
 def build_sources(hrm_json: Dict[str, Any], max_sources: int = 16, max_chars_per_source: int = 1200) -> List[Source]:
@@ -34,9 +63,9 @@ def build_sources(hrm_json: Dict[str, Any], max_sources: int = 16, max_chars_per
     return out
 
 
-def build_renderer_prompt(question: str, sources: List[Source]) -> str:
-    # Silent default: internal context is injected but never exposed or cited.
-    parts = ["[INTERNAL_SYSTEM]", SILENT_SYSTEM_PROMPT, "", "[INTERNAL_CONTEXT]"]
+def build_mixed_prompt(question: str, sources: List[Source]) -> str:
+    # Mixed mode: internal context is injected but never exposed or cited.
+    parts = ["[INTERNAL_SYSTEM]", MIXED_SYSTEM_PROMPT, "", "[INTERNAL_CONTEXT]"]
     for i, s in enumerate(sources, start=1):
         parts.append(f"<ctx_{i:02d}> {s.txt}")
 
@@ -49,11 +78,39 @@ def build_renderer_prompt(question: str, sources: List[Source]) -> str:
     return "\n".join(parts)
 
 
+def build_retrieval_prompt(question: str, sources: List[Source]) -> str:
+    # Retrieval mode: sources are explicit and citations are required.
+    parts = ["[SYSTEM]", RETRIEVAL_SYSTEM_PROMPT, "", "[SOURCES]"]
+    for s in sources:
+        parts.append(f"[{s.sid}] {s.txt}")
+    parts.extend(["", "[USER]", question, "", "[ASSISTANT]", ""])
+    return "\n".join(parts)
+
+
+def build_deepseek_only_prompt(question: str) -> str:
+    return "\n".join(["[USER]", question, "", "[ASSISTANT]", ""])
+
+
+def build_prompt_for_mode(question: str, sources: List[Source], mode: str | None) -> str:
+    m = normalize_mode(mode)
+    if m == "retrieval":
+        return build_retrieval_prompt(question, sources)
+    if m == "mixed":
+        return build_mixed_prompt(question, sources)
+    return build_deepseek_only_prompt(question)
+
+
+def build_renderer_prompt(question: str, sources: List[Source]) -> str:
+    # Backward-compatible alias: renderer prompt means mixed/silent mode.
+    return build_mixed_prompt(question, sources)
+
+
 def fit_prompt_to_token_budget(
     question: str,
     sources: List[Source],
     tokenizer,
     max_prompt_tokens: int,
+    mode: str = DEFAULT_MODE,
 ) -> tuple[str, List[Source]]:
     """Deterministically fit (question, sources) into a token budget.
 
@@ -75,14 +132,14 @@ def fit_prompt_to_token_budget(
     cur_q = question
 
     # fast accept
-    p = build_renderer_prompt(cur_q, cur_sources)
+    p = build_prompt_for_mode(cur_q, cur_sources, mode=mode)
     if toklen(p) <= max_prompt_tokens:
         return cur_q, cur_sources
 
     # drop tail sources
     while len(cur_sources) > 1:
         cur_sources.pop()
-        p = build_renderer_prompt(cur_q, cur_sources)
+        p = build_prompt_for_mode(cur_q, cur_sources, mode=mode)
         if toklen(p) <= max_prompt_tokens:
             return cur_q, cur_sources
 
@@ -95,7 +152,7 @@ def fit_prompt_to_token_budget(
         while lo <= hi:
             mid = (lo + hi) // 2
             cand = text[:mid].rstrip() + (" …" if mid < len(text) else "")
-            p = build_renderer_prompt(cur_q, [Source(sid=s.sid, txt=cand)])
+            p = build_prompt_for_mode(cur_q, [Source(sid=s.sid, txt=cand)], mode=mode)
             if toklen(p) <= max_prompt_tokens:
                 best = cand
                 lo = mid + 1
@@ -104,7 +161,7 @@ def fit_prompt_to_token_budget(
         cur_sources[0] = Source(sid=s.sid, txt=best if best else "")
 
     # if still too long, truncate question tokens deterministically
-    p = build_renderer_prompt(cur_q, cur_sources)
+    p = build_prompt_for_mode(cur_q, cur_sources, mode=mode)
     if toklen(p) <= max_prompt_tokens:
         return cur_q, cur_sources
 
@@ -121,7 +178,7 @@ def fit_prompt_to_token_budget(
         cand_q = tokenizer.decode(cand_ids, skip_special_tokens=True)
         if mid < len(q_ids):
             cand_q = cand_q.rstrip() + " …"
-        p = build_renderer_prompt(cand_q, cur_sources)
+        p = build_prompt_for_mode(cand_q, cur_sources, mode=mode)
         if toklen(p) <= max_prompt_tokens:
             best_q = cand_q
             lo = mid + 1
