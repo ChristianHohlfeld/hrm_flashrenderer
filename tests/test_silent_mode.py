@@ -17,7 +17,7 @@ class TestSilentMode(unittest.TestCase):
         ]
         p = build_renderer_prompt(question, sources)
 
-        self.assertIn("You are DeepSeek, a helpful, truthful, and direct AI assistant.", p)
+        self.assertIn("You are DeepSeek, a helpful, truthful and direct AI assistant.", p)
         self.assertIn(question, p)
         self.assertNotIn("0001#s0001", p)
         self.assertNotIn("0001#s0002", p)

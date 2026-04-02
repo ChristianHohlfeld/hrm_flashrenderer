@@ -17,8 +17,13 @@ set -euo pipefail
 #   TOPOLOGY_MODE             default: max_model_fast
 #   ROUTER_URL=<url>          default: http://127.0.0.1:8090
 #   ROUTER_MODE               default: mixed (retrieval|mixed|deepseek_only)
+#   RUN_MODE_MATRIX=1|0       default: 1 (1 = test mixed+retrieval+deepseek_only)
+#   E2E_DETERMINISM_RUNS=<n>  default: 3 (same prompt repeated n times per mode)
 #   ROUTER_ROUTE_HINT         default: balanced
 #   ROUTER_MAX_NEW_TOKENS     default: 256
+#   PROMPT_MIXED              default: [final_prompt arg]
+#   PROMPT_RETRIEVAL          default: retrieval-specific prompt
+#   PROMPT_DEEPSEEK_ONLY      default: deepseek-only prompt
 #   AUTO_STOP=1|0             default: 0
 #   ALLOW_EMPTY_SOURCES=1|0   default: 0 (0 = require non-empty sources => real pipeline)
 #   PREFLIGHT_SCRIPT          default: scripts/prod_preflight.sh
@@ -43,17 +48,33 @@ EXPECTED_GPUS="${EXPECTED_GPUS:-4}"
 TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8090}"
 ROUTER_MODE="${ROUTER_MODE:-mixed}"
+RUN_MODE_MATRIX="${RUN_MODE_MATRIX:-1}"
+E2E_DETERMINISM_RUNS="${E2E_DETERMINISM_RUNS:-3}"
 ROUTER_ROUTE_HINT="${ROUTER_ROUTE_HINT:-balanced}"
 ROUTER_MAX_NEW_TOKENS="${ROUTER_MAX_NEW_TOKENS:-256}"
 AUTO_STOP="${AUTO_STOP:-0}"
 ALLOW_EMPTY_SOURCES="${ALLOW_EMPTY_SOURCES:-0}"
-case "$ROUTER_MODE" in
-  retrieval|mixed|deepseek_only) ;;
-  *)
-    echo "ERR: unsupported ROUTER_MODE=$ROUTER_MODE (supported: retrieval, mixed, deepseek_only)" >&2
-    exit 2
-    ;;
-esac
+PROMPT_MIXED="${PROMPT_MIXED:-$FINAL_PROMPT}"
+PROMPT_RETRIEVAL="${PROMPT_RETRIEVAL:-Nenne die wichtigste Aussage und gib mindestens eine Quellen-ID in eckigen Klammern an.}"
+PROMPT_DEEPSEEK_ONLY="${PROMPT_DEEPSEEK_ONLY:-Erkläre in zwei Sätzen den Unterschied zwischen Retrieval und reinem LLM-Wissen.}"
+
+if [[ "$RUN_MODE_MATRIX" != "0" && "$RUN_MODE_MATRIX" != "1" ]]; then
+  echo "ERR: RUN_MODE_MATRIX must be 0 or 1 (got: $RUN_MODE_MATRIX)" >&2
+  exit 2
+fi
+if [[ -z "${E2E_DETERMINISM_RUNS:-}" || "$E2E_DETERMINISM_RUNS" -lt 1 ]]; then
+  echo "ERR: E2E_DETERMINISM_RUNS must be >= 1 (got: $E2E_DETERMINISM_RUNS)" >&2
+  exit 2
+fi
+if [[ "$RUN_MODE_MATRIX" == "0" ]]; then
+  case "$ROUTER_MODE" in
+    retrieval|mixed|deepseek_only) ;;
+    *)
+      echo "ERR: unsupported ROUTER_MODE=$ROUTER_MODE (supported: retrieval, mixed, deepseek_only)" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -157,63 +178,176 @@ check_backend_deepseek "solo_22gb" "$HEALTH_URL_SOLO_22GB"
 check_backend_deepseek "nvlink_pair" "$HEALTH_URL_NVLINK_PAIR"
 check_backend_deepseek "solo_3080" "$HEALTH_URL_SOLO_3080"
 
-echo "[5/5] final prompt through full router stack"
-payload="$(
-  FINAL_PROMPT="$FINAL_PROMPT" ROUTER_MODE="$ROUTER_MODE" ROUTER_ROUTE_HINT="$ROUTER_ROUTE_HINT" ROUTER_MAX_NEW_TOKENS="$ROUTER_MAX_NEW_TOKENS" \
-  python3 - <<'PY'
-import json, os
-print(json.dumps({
-    "prompt": os.environ["FINAL_PROMPT"],
-    "mode": os.environ["ROUTER_MODE"],
-    "route_hint": os.environ["ROUTER_ROUTE_HINT"],
-    "max_new_tokens": int(os.environ["ROUTER_MAX_NEW_TOKENS"]),
-    "allow_failover": True,
-}))
-PY
-)"
+echo "[5/5] mode verification + determinism checks"
+ROUTER_URL="$ROUTER_URL" \
+ROUTER_MODE="$ROUTER_MODE" \
+RUN_MODE_MATRIX="$RUN_MODE_MATRIX" \
+E2E_DETERMINISM_RUNS="$E2E_DETERMINISM_RUNS" \
+ROUTER_ROUTE_HINT="$ROUTER_ROUTE_HINT" \
+ROUTER_MAX_NEW_TOKENS="$ROUTER_MAX_NEW_TOKENS" \
+ALLOW_EMPTY_SOURCES="$ALLOW_EMPTY_SOURCES" \
+PROMPT_MIXED="$PROMPT_MIXED" \
+PROMPT_RETRIEVAL="$PROMPT_RETRIEVAL" \
+PROMPT_DEEPSEEK_ONLY="$PROMPT_DEEPSEEK_ONLY" \
+python3 - <<'PY'
+import hashlib
+import json
+import os
+import re
+import urllib.request
 
-resp="$(curl -fsS -X POST "$ROUTER_URL/v1/generate" -H 'Content-Type: application/json' -d "$payload")"
-RESP_JSON="$resp" python3 - <<'PY'
-import json, os
-d = json.loads(os.environ["RESP_JSON"])
-if not bool(d.get("ok", False)):
-    raise SystemExit("router response ok=false")
-
-txt = str(d.get("text", "")).strip()
-if not txt:
-    raise SystemExit("empty response text")
-
-sources = d.get("sources", None)
-source_count = d.get("source_count", None)
+router_url = os.environ["ROUTER_URL"].rstrip("/")
+route_hint = os.environ["ROUTER_ROUTE_HINT"]
+max_new_tokens = int(os.environ["ROUTER_MAX_NEW_TOKENS"])
 allow_empty = os.environ.get("ALLOW_EMPTY_SOURCES", "0") == "1"
-router_mode = os.environ.get("ROUTER_MODE", "mixed")
-if router_mode == "deepseek_only":
-    allow_empty = True
-if not allow_empty:
-    if isinstance(source_count, int):
-        if source_count <= 0:
-            raise SystemExit(
-                "source_count is 0 -> this likely hit retrieval fallback instead of full retrieval+deepseek inference. "
-                "Use a prompt that matches your HRM index or set ALLOW_EMPTY_SOURCES=1 if intentional."
-            )
-    elif not isinstance(sources, list) or len(sources) == 0:
-        raise SystemExit(
-            "sources are empty -> this likely hit retrieval fallback instead of full retrieval+deepseek inference. "
-            "Use a prompt that matches your HRM index or set ALLOW_EMPTY_SOURCES=1 if intentional."
-        )
+runs = int(os.environ.get("E2E_DETERMINISM_RUNS", "3"))
+run_matrix = os.environ.get("RUN_MODE_MATRIX", "1") == "1"
+single_mode = os.environ.get("ROUTER_MODE", "mixed")
 
-route = d.get("route", {}) if isinstance(d.get("route"), dict) else {}
-selected = route.get("selected", "?")
-prompt_tokens = route.get("prompt_tokens", "?")
-lat_ms = route.get("latency_ms", "?")
-print("[ok] final prompt succeeded")
-print(f"[route] selected={selected} prompt_tokens={prompt_tokens} latency_ms={lat_ms}")
-print("[text]")
-print(txt)
+if run_matrix:
+    modes = ["mixed", "retrieval", "deepseek_only"]
+else:
+    modes = [single_mode]
+
+prompts = {
+    "mixed": os.environ["PROMPT_MIXED"],
+    "retrieval": os.environ["PROMPT_RETRIEVAL"],
+    "deepseek_only": os.environ["PROMPT_DEEPSEEK_ONLY"],
+}
+
+banned_mixed = [
+    "according to the documents",
+    "retrieved information",
+    "laut den quellen",
+    "basierend auf den snippets",
+    "aus den bereitgestellten texten",
+    "according to the sources",
+]
+
+retrieval_ref_re = re.compile(r"\[s\d{4}\]", re.IGNORECASE)
+
+def post_json(url: str, payload: dict) -> dict:
+    raw = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=raw,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=240) as r:
+        body = r.read()
+    out = json.loads(body.decode("utf-8"))
+    if not isinstance(out, dict):
+        raise SystemExit("invalid router response shape")
+    return out
+
+def source_count_of(resp: dict) -> int:
+    sc = resp.get("source_count")
+    if isinstance(sc, int):
+        return sc
+    src = resp.get("sources")
+    if isinstance(src, list):
+        return len(src)
+    return 0
+
+for mode in modes:
+    prompt = prompts[mode]
+    print(f"[mode] {mode} (runs={runs})")
+    baseline_hash = None
+    baseline_canon = None
+    for i in range(1, runs + 1):
+        payload = {
+            "prompt": prompt,
+            "mode": mode,
+            "route_hint": route_hint,
+            "max_new_tokens": max_new_tokens,
+            "allow_failover": True,
+        }
+        resp = post_json(f"{router_url}/v1/generate", payload)
+        if not bool(resp.get("ok", False)):
+            raise SystemExit(f"{mode} run {i}: router response ok=false")
+        text = str(resp.get("text", "")).strip()
+        if not text:
+            raise SystemExit(f"{mode} run {i}: empty response text")
+        sc = source_count_of(resp)
+        lower = text.lower()
+
+        if mode == "mixed":
+            if not allow_empty and sc <= 0:
+                raise SystemExit(
+                    f"{mode} run {i}: source_count is 0 -> expected retrieval+inference path"
+                )
+            if any(p in lower for p in banned_mixed):
+                raise SystemExit(
+                    f"{mode} run {i}: mixed output leaked retrieval phrasing"
+                )
+            if "sources" in lower:
+                raise SystemExit(
+                    f"{mode} run {i}: mixed output mentioned sources"
+                )
+            if isinstance(resp.get("sources"), list) and len(resp["sources"]) > 0:
+                raise SystemExit(
+                    f"{mode} run {i}: mixed response exposed sources by default"
+                )
+        elif mode == "retrieval":
+            if not allow_empty and sc <= 0:
+                raise SystemExit(
+                    f"{mode} run {i}: source_count is 0 -> retrieval mode must use sources"
+                )
+            if not allow_empty:
+                src = resp.get("sources")
+                if not isinstance(src, list) or len(src) == 0:
+                    raise SystemExit(
+                        f"{mode} run {i}: retrieval mode should expose sources by default"
+                    )
+            if not (
+                retrieval_ref_re.search(text)
+                or "quelle" in lower
+                or "source" in lower
+                or "according to" in lower
+            ):
+                raise SystemExit(
+                    f"{mode} run {i}: retrieval output did not reference sources"
+                )
+        elif mode == "deepseek_only":
+            if sc != 0:
+                raise SystemExit(
+                    f"{mode} run {i}: deepseek_only must have source_count=0 (got {sc})"
+                )
+            src = resp.get("sources")
+            if isinstance(src, list) and len(src) > 0:
+                raise SystemExit(
+                    f"{mode} run {i}: deepseek_only must not return source payload"
+                )
+        else:
+            raise SystemExit(f"unsupported mode in validator: {mode}")
+
+        canon = json.dumps(
+            {"text": text, "source_count": sc},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        h = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+        if baseline_hash is None:
+            baseline_hash = h
+            baseline_canon = canon
+            route = resp.get("route") if isinstance(resp.get("route"), dict) else {}
+            selected = route.get("selected", "?")
+            prompt_tokens = route.get("prompt_tokens", "?")
+            lat_ms = route.get("latency_ms", "?")
+            print(f"[ok] {mode} run {i}: route={selected} prompt_tokens={prompt_tokens} latency_ms={lat_ms}")
+        elif h != baseline_hash:
+            raise SystemExit(
+                f"{mode}: determinism failure between runs. baseline={baseline_hash} current={h}"
+            )
+    print(f"[deterministic] {mode} hash={baseline_hash}")
+    text_preview = json.loads(baseline_canon)["text"]
+    print(f"[text:{mode}] {text_preview}")
 PY
 
 echo
-echo "E2E PASS: DeepSeek stack started and final router prompt returned."
+echo "E2E PASS: DeepSeek stack started and mode checks passed."
 if [[ "$AUTO_STOP" == "0" ]]; then
   echo "Stack is still running. Stop with: bash scripts/stop_native_stack.sh"
 fi

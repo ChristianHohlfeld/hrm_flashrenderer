@@ -22,8 +22,9 @@ This single command does:
 2. production preflight
 3. start native DeepSeek stack
 4. verify health on all services
-5. send final prompt through router (`/v1/generate`)
-6. fail hard if no real retrieval+inference happened
+5. run strict mode checks against router (`/v1/generate`) for `mixed`, `retrieval`, `deepseek_only`
+6. repeat each mode 3x with the same prompt and fail on non-deterministic output
+7. fail hard if mode behavior violates requirements (silent leakage, missing retrieval references, non-zero sources in deepseek_only)
 
 If it ends with `E2E PASS`, your pipeline is live.
 
@@ -118,6 +119,11 @@ Optional JSON flag:
 - `show_sources`: include `sources` array in HTTP response (off by default, ignored for `deepseek_only`).
 - default behavior: `retrieval` auto-enables source output; `mixed` keeps sources hidden unless explicitly requested.
 
+`scripts/prod_live_e2e.sh` performs strict mode verification by default:
+- `RUN_MODE_MATRIX=1` (default): tests all three modes with different prompts.
+- `E2E_DETERMINISM_RUNS=3` (default): repeats each mode 3x and fails on drift.
+- `RUN_MODE_MATRIX=0`: test a single mode selected by `ROUTER_MODE`.
+
 Example:
 
 ```json
@@ -139,6 +145,12 @@ curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d
 
 # deepseek_only (no HRM)
 curl -s http://127.0.0.1:8090/v1/generate -H 'Content-Type: application/json' -d '{"prompt":"Nur Modellwissen.","mode":"deepseek_only"}'
+```
+
+Single-mode E2E run (optional):
+
+```bash
+RUN_MODE_MATRIX=0 ROUTER_MODE=mixed bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz."
 ```
 
 The start scripts now pin runtime to this checkout by default (`python -m hrm_flash.cli`) to avoid stale global `hrm-flash` binaries.

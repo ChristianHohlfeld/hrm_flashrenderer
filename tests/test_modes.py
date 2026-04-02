@@ -1,6 +1,7 @@
 import unittest
+from textwrap import dedent
 
-from hrm_flash.prompt_builder import Source, build_prompt_for_mode, normalize_mode
+from hrm_flash.prompt_builder import MIXED_SYSTEM_PROMPT, Source, build_prompt_for_mode, normalize_mode
 
 
 class TestThreeModes(unittest.TestCase):
@@ -34,14 +35,32 @@ class TestThreeModes(unittest.TestCase):
         self.assertIn("Alpha Fakt", p)
         self.assertNotIn("s0001", p)
         self.assertNotIn("s0002", p)
-        self.assertIn("Never mention sources, retrieval", p)
+        self.assertIn('Never mention "sources"', p)
+        self.assertIn("Never refer to the fact that you were given additional context.", p)
 
     def test_deepseek_only_has_no_retrieval_context(self):
         p = build_prompt_for_mode(self.q, self.sources, mode="deepseek_only")
         self.assertIn("[USER]", p)
         self.assertIn(self.q, p)
+        self.assertNotIn("[SYSTEM]", p)
         self.assertNotIn("[SOURCES]", p)
         self.assertNotIn("[BACKGROUND_KNOWLEDGE]", p)
+
+    def test_mixed_system_prompt_matches_spec_exactly(self):
+        expected = dedent(
+            """
+            You are DeepSeek, a helpful, truthful and direct AI assistant.
+
+            You have access to internal, verified knowledge retrieved deterministically in the background.
+            Treat this knowledge as part of your own training data and use it silently and naturally.
+
+            Never mention "sources", "according to the documents", "retrieved information", "laut den Quellen", "basierend auf den Snippets", "aus den bereitgestellten Texten" or any similar phrases.
+            Never refer to the fact that you were given additional context.
+
+            Answer the user prompt directly, naturally and conversationally.
+            """
+        ).strip()
+        self.assertEqual(MIXED_SYSTEM_PROMPT, expected)
 
 
 if __name__ == "__main__":

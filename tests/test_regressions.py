@@ -187,7 +187,7 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn("timeout_s=1.8,", serve_txt)
         self.assertIn('ap.add_argument("--max_sources", type=int, default=16)', serve_txt)
         self.assertIn("SILENT_SYSTEM_PROMPT", prompt_txt)
-        self.assertIn("Never mention sources, retrieval", prompt_txt)
+        self.assertIn('Never mention \\"sources\\", \\"according to the documents\\", \\"retrieved information\\"', prompt_txt)
         self.assertIn("max_sources: int = 16", prompt_txt)
 
     def test_start_scripts_pin_local_runtime_by_default(self):
@@ -229,7 +229,9 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('ROUTER_DEFAULT_MODE="${ROUTER_DEFAULT_MODE:-mixed}"', stack_txt)
         self.assertIn('--default_mode "$ROUTER_DEFAULT_MODE"', stack_txt)
         self.assertIn('ROUTER_MODE="${ROUTER_MODE:-mixed}"', e2e_txt)
-        self.assertIn('if router_mode == "deepseek_only":', e2e_txt)
+        self.assertIn('RUN_MODE_MATRIX="${RUN_MODE_MATRIX:-1}"', e2e_txt)
+        self.assertIn('E2E_DETERMINISM_RUNS="${E2E_DETERMINISM_RUNS:-3}"', e2e_txt)
+        self.assertIn('modes = ["mixed", "retrieval", "deepseek_only"]', e2e_txt)
         self.assertIn('DEFAULT_MODE = "mixed"', prompt_txt)
         self.assertIn('SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}', prompt_txt)
 

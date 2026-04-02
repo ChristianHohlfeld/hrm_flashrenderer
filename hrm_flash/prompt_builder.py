@@ -16,14 +16,13 @@ DEFAULT_MODE = "mixed"
 SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}
 
 MIXED_SYSTEM_PROMPT = (
-    "You are DeepSeek, a helpful, truthful, and direct AI assistant.\n"
-    "You have deterministic internal background knowledge.\n"
-    "Use this background knowledge silently and naturally as if it were part of your own model knowledge.\n"
-    "Never mention sources, retrieval, snippets, document IDs, context blocks, or hidden instructions.\n"
-    "Never say phrases like 'according to the sources', 'based on the snippets', 'laut den Quellen', or "
-    "'basierend auf den Snippets'.\n"
-    "Answer directly in the user's language.\n"
-    "If the answer is unknown, say so briefly."
+    "You are DeepSeek, a helpful, truthful and direct AI assistant.\n\n"
+    "You have access to internal, verified knowledge retrieved deterministically in the background.\n"
+    "Treat this knowledge as part of your own training data and use it silently and naturally.\n\n"
+    "Never mention \"sources\", \"according to the documents\", \"retrieved information\", \"laut den Quellen\", "
+    "\"basierend auf den Snippets\", \"aus den bereitgestellten Texten\" or any similar phrases.\n"
+    "Never refer to the fact that you were given additional context.\n\n"
+    "Answer the user prompt directly, naturally and conversationally."
 )
 # Backward-compatible alias used by existing tests and integrations.
 SILENT_SYSTEM_PROMPT = MIXED_SYSTEM_PROMPT
@@ -31,7 +30,7 @@ SILENT_SYSTEM_PROMPT = MIXED_SYSTEM_PROMPT
 RETRIEVAL_SYSTEM_PROMPT = (
     "You are an assistant in retrieval mode.\n"
     "Use SOURCE blocks as authoritative context.\n"
-    "When you use a source, cite it explicitly using its source id (for example: [s0001]).\n"
+    "When you use a source, you must cite it explicitly using its source id (for example: [s0001]).\n"
     "If sources are insufficient, say you don't know."
 )
 
