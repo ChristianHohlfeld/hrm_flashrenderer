@@ -19,6 +19,12 @@ set -euo pipefail
 #   ROUTER_MAX_NEW_TOKENS     default: 256
 #   AUTO_STOP=1|0             default: 0
 #   ALLOW_EMPTY_SOURCES=1|0   default: 0 (0 = require non-empty sources => real pipeline)
+#   PREFLIGHT_SCRIPT          default: scripts/prod_preflight.sh
+#   START_STACK_SCRIPT        default: scripts/start_native_stack.sh
+#   STOP_STACK_SCRIPT         default: scripts/stop_native_stack.sh
+#   HEALTH_URL_SOLO_22GB      default: http://127.0.0.1:8081/v1/health
+#   HEALTH_URL_NVLINK_PAIR    default: http://127.0.0.1:8082/v1/health
+#   HEALTH_URL_SOLO_3080      default: http://127.0.0.1:8083/v1/health
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <hrm_model_dir> [final_prompt]" >&2
@@ -39,12 +45,18 @@ ALLOW_EMPTY_SOURCES="${ALLOW_EMPTY_SOURCES:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/.run/services}"
+PREFLIGHT_SCRIPT="${PREFLIGHT_SCRIPT:-$SCRIPT_DIR/prod_preflight.sh}"
+START_STACK_SCRIPT="${START_STACK_SCRIPT:-$SCRIPT_DIR/start_native_stack.sh}"
+STOP_STACK_SCRIPT="${STOP_STACK_SCRIPT:-$SCRIPT_DIR/stop_native_stack.sh}"
+HEALTH_URL_SOLO_22GB="${HEALTH_URL_SOLO_22GB:-http://127.0.0.1:8081/v1/health}"
+HEALTH_URL_NVLINK_PAIR="${HEALTH_URL_NVLINK_PAIR:-http://127.0.0.1:8082/v1/health}"
+HEALTH_URL_SOLO_3080="${HEALTH_URL_SOLO_3080:-http://127.0.0.1:8083/v1/health}"
 
 STACK_STARTED=0
 cleanup() {
   if [[ "$AUTO_STOP" == "1" && "$STACK_STARTED" == "1" ]]; then
     echo "[cleanup] stopping native stack..."
-    bash "$SCRIPT_DIR/stop_native_stack.sh" || true
+    bash "$STOP_STACK_SCRIPT" || true
   fi
 }
 trap cleanup EXIT
@@ -92,6 +104,9 @@ cd "$ROOT_DIR"
 require_cmd bash
 require_cmd curl
 require_cmd python3
+[[ -f "$PREFLIGHT_SCRIPT" ]] || { echo "ERR: missing preflight script: $PREFLIGHT_SCRIPT" >&2; exit 1; }
+[[ -f "$START_STACK_SCRIPT" ]] || { echo "ERR: missing start script: $START_STACK_SCRIPT" >&2; exit 1; }
+[[ -f "$STOP_STACK_SCRIPT" ]] || { echo "ERR: missing stop script: $STOP_STACK_SCRIPT" >&2; exit 1; }
 
 echo "[1/5] bootstrap (RUN_BOOTSTRAP=$RUN_BOOTSTRAP)"
 if [[ "$RUN_BOOTSTRAP" == "1" ]]; then
@@ -103,23 +118,23 @@ else
 fi
 
 echo "[2/5] production preflight"
-bash "$SCRIPT_DIR/prod_preflight.sh" "$HRM_MODEL" "$EXPECTED_GPUS"
+bash "$PREFLIGHT_SCRIPT" "$HRM_MODEL" "$EXPECTED_GPUS"
 
 echo "[3/5] start native stack"
 export BACKEND=deepseek_int8
 export PREPARE_MODELS=1
-bash "$SCRIPT_DIR/start_native_stack.sh" "$HRM_MODEL" auto
+bash "$START_STACK_SCRIPT" "$HRM_MODEL" auto
 STACK_STARTED=1
 
 echo "[4/5] verify service health"
-health_wait_ok "http://127.0.0.1:8081/v1/health" 180 2 || { echo "ERR: solo_22gb did not become healthy" >&2; exit 1; }
-health_wait_ok "http://127.0.0.1:8082/v1/health" 180 2 || { echo "ERR: nvlink_pair did not become healthy" >&2; exit 1; }
-health_wait_ok "http://127.0.0.1:8083/v1/health" 180 2 || { echo "ERR: solo_3080 did not become healthy" >&2; exit 1; }
+health_wait_ok "$HEALTH_URL_SOLO_22GB" 180 2 || { echo "ERR: solo_22gb did not become healthy" >&2; exit 1; }
+health_wait_ok "$HEALTH_URL_NVLINK_PAIR" 180 2 || { echo "ERR: nvlink_pair did not become healthy" >&2; exit 1; }
+health_wait_ok "$HEALTH_URL_SOLO_3080" 180 2 || { echo "ERR: solo_3080 did not become healthy" >&2; exit 1; }
 health_wait_ok "$ROUTER_URL/v1/health" 180 2 || { echo "ERR: router did not become healthy" >&2; exit 1; }
 
-check_backend_deepseek "solo_22gb" "http://127.0.0.1:8081/v1/health"
-check_backend_deepseek "nvlink_pair" "http://127.0.0.1:8082/v1/health"
-check_backend_deepseek "solo_3080" "http://127.0.0.1:8083/v1/health"
+check_backend_deepseek "solo_22gb" "$HEALTH_URL_SOLO_22GB"
+check_backend_deepseek "nvlink_pair" "$HEALTH_URL_NVLINK_PAIR"
+check_backend_deepseek "solo_3080" "$HEALTH_URL_SOLO_3080"
 
 echo "[5/5] final prompt through full router stack"
 payload="$(
@@ -136,9 +151,9 @@ PY
 )"
 
 resp="$(curl -fsS -X POST "$ROUTER_URL/v1/generate" -H 'Content-Type: application/json' -d "$payload")"
-printf '%s' "$resp" | python3 - <<'PY'
-import json, os, sys
-d = json.load(sys.stdin)
+RESP_JSON="$resp" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["RESP_JSON"])
 if not bool(d.get("ok", False)):
     raise SystemExit("router response ok=false")
 

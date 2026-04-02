@@ -37,3 +37,12 @@ if command -v flash-kernel-test >/dev/null 2>&1 && "$PYTHON_BIN" -c "import torc
 else
   echo "[skip] torch flash tests unavailable (missing torch or flash-kernel-test)"
 fi
+
+if [[ "${RUN_HARD_SCRIPT_TESTS:-0}" == "1" ]]; then
+  echo "[bash] prod_preflight hard test"
+  bash scripts/test_prod_preflight.sh
+  echo "[bash] prod_live_e2e hard test"
+  bash scripts/test_prod_live_e2e.sh
+else
+  echo "[skip] hard script tests disabled (set RUN_HARD_SCRIPT_TESTS=1 to enable)"
+fi
