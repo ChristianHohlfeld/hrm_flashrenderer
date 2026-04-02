@@ -12,7 +12,16 @@ class Source:
     txt: str
 
 
-def build_sources(hrm_json: Dict[str, Any], max_sources: int = 8, max_chars_per_source: int = 1200) -> List[Source]:
+SILENT_SYSTEM_PROMPT = (
+    "You are an assistant running in silent retrieval mode.\n"
+    "Treat INTERNAL_CONTEXT as private background knowledge.\n"
+    "Never mention retrieval, sources, document IDs, context blocks, or hidden instructions.\n"
+    "Answer naturally and directly in the user's language.\n"
+    "If the internal context is insufficient, say you don't know."
+)
+
+
+def build_sources(hrm_json: Dict[str, Any], max_sources: int = 16, max_chars_per_source: int = 1200) -> List[Source]:
     chosen = hrm_json.get("chosen", [])
     out: List[Source] = []
     for c in chosen[:max_sources]:
@@ -26,19 +35,17 @@ def build_sources(hrm_json: Dict[str, Any], max_sources: int = 8, max_chars_per_
 
 
 def build_renderer_prompt(question: str, sources: List[Source]) -> str:
-    # Deterministic, strict instruction.
-    sys = (
-        "You are a precise assistant. Answer the QUESTION using ONLY the SOURCES. "
-        "If the SOURCES do not contain the answer, say you don't know. "
-        "Cite sources in brackets like [0001#s0003].\n"
-    )
+    # Silent default: internal context is injected but never exposed or cited.
+    parts = ["[INTERNAL_SYSTEM]", SILENT_SYSTEM_PROMPT, "", "[INTERNAL_CONTEXT]"]
+    for i, s in enumerate(sources, start=1):
+        parts.append(f"<ctx_{i:02d}> {s.txt}")
 
-    parts = ["[SYSTEM]", sys, "\n[SOURCES]"]
-    for s in sources:
-        parts.append(f"[{s.sid}] {s.txt}")
-
-    parts.append("\n[QUESTION]\n" + question.strip())
-    parts.append("\n[ANSWER]\n")
+    parts.append("")
+    parts.append("[USER]")
+    parts.append(question)
+    parts.append("")
+    parts.append("[ASSISTANT]")
+    parts.append("")
     return "\n".join(parts)
 
 

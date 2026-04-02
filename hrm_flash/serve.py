@@ -38,10 +38,11 @@ class _State:
         self.prefill_chunk_size: int = 1024
         self.max_new_tokens: int = 256
         self.local_files_only: bool = True
-        self.max_sources: int = 8
+        self.max_sources: int = 16
         self.max_chars_per_source: int = 1200
         self.reserve_prompt_tokens: int = 16
         self.disable_token_budget: bool = False
+        self.expose_sources: bool = False
         self.sem: asyncio.Semaphore | None = None
         self.backend: str = "deepseek_int8"
         self.deepseek_engine = None
@@ -57,11 +58,12 @@ def _build_prompt(prompt: str) -> tuple[str, list[dict[str, Any]]]:
         hrm_bin=STATE.hrm_bin,
         model_dir=STATE.hrm_model,
         prompt=prompt,
-        top_k=8,
+        top_k=16,
         top_m=400,
-        k=8,
+        k=16,
         prefer_api=True,
         repo_root=STATE.repo_root,
+        timeout_s=1.8,
     )
 
     sources = build_sources(r.raw, max_sources=STATE.max_sources, max_chars_per_source=STATE.max_chars_per_source)
@@ -90,7 +92,7 @@ def _build_prompt(prompt: str) -> tuple[str, list[dict[str, Any]]]:
 def main():
     FastAPI, HTTPException, JSONResponse, BaseModel = _require_fastapi()
 
-    ap = argparse.ArgumentParser(prog="hrm-flash-serve", description="HRM FlashRenderer HTTP service (HRM retrieval + persistent FlashAttention TP daemon).")
+    ap = argparse.ArgumentParser(prog="hrm-flash-serve", description="HRM FlashRenderer HTTP service (HRM retrieval + native DeepSeek INT8 inference).")
     ap.add_argument("--hrm_model", required=True)
     ap.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID")
     ap.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
@@ -102,10 +104,11 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--local_files_only", action="store_true")
 
-    ap.add_argument("--max_sources", type=int, default=8)
+    ap.add_argument("--max_sources", type=int, default=16)
     ap.add_argument("--max_chars_per_source", type=int, default=1200)
     ap.add_argument("--reserve_prompt_tokens", type=int, default=16)
     ap.add_argument("--disable_token_budget", action="store_true")
+    ap.add_argument("--expose_sources", action="store_true", help="Debug only: include source texts in HTTP response")
 
     ap.add_argument("--hrm_bin", default=None)
     ap.add_argument("--max_concurrent", type=int, default=1)
@@ -133,6 +136,7 @@ def main():
     STATE.max_chars_per_source = int(args.max_chars_per_source)
     STATE.reserve_prompt_tokens = int(args.reserve_prompt_tokens)
     STATE.disable_token_budget = bool(args.disable_token_budget)
+    STATE.expose_sources = bool(args.expose_sources)
     STATE.sem = asyncio.Semaphore(max(1, int(args.max_concurrent)))
     STATE.native_request_timeout_s = float(args.native_request_timeout_s)
 
@@ -202,7 +206,10 @@ def main():
         async with STATE.sem:
             prompt_text, sources = _build_prompt(req.prompt)
             if not prompt_text:
-                return JSONResponse({"ok": True, "text": "I don't know.", "sources": []})
+                payload = {"ok": True, "text": "I don't know.", "source_count": 0}
+                if STATE.expose_sources:
+                    payload["sources"] = []
+                return JSONResponse(payload)
             max_new = int(req.max_new_tokens) if req.max_new_tokens is not None else STATE.max_new_tokens
             if STATE.deepseek_engine is None:
                 raise HTTPException(status_code=500, detail="DeepSeek engine not initialized")
@@ -217,7 +224,10 @@ def main():
                 )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
-            return JSONResponse({"ok": True, "text": text, "sources": sources})
+            payload = {"ok": True, "text": text, "source_count": len(sources)}
+            if STATE.expose_sources:
+                payload["sources"] = [{"sid": s.sid, "txt": s.txt} for s in sources]
+            return JSONResponse(payload)
 
     @app.on_event("shutdown")
     def _shutdown():

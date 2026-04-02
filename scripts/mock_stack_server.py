@@ -54,7 +54,10 @@ def _handler_for(name: str, empty_sources: bool):
                 return
 
             if name != "router":
-                self._write_json(200, {"ok": True, "text": "backend-ok", "sources": [{"sid": "b#1", "txt": "ok"}]})
+                self._write_json(
+                    200,
+                    {"ok": True, "text": "backend-ok", "source_count": (0 if empty_sources else 1)},
+                )
                 return
 
             prompt = str(req.get("prompt", "")).strip()
@@ -69,6 +72,7 @@ def _handler_for(name: str, empty_sources: bool):
                     "ok": True,
                     "text": "Mock DeepSeek answer.",
                     "sources": sources,
+                    "source_count": len(sources),
                     "route": {
                         "selected": "nvlink_pair",
                         "prompt_tokens": 42,

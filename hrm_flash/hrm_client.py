@@ -40,13 +40,16 @@ def run_hrm_query(
     hrm_bin: Path | None,
     model_dir: Path,
     prompt: str,
-    top_k: int = 8,
+    top_k: int = 16,
     top_m: int = 400,
-    k: int = 8,
+    k: int = 16,
     prefer_api: bool = True,
     repo_root: Path | None = None,
+    timeout_s: float | None = 1.8,
 ) -> HRMQueryResult:
-    if prefer_api:
+    enforce_timeout = timeout_s is not None and float(timeout_s) > 0.0
+    # For strict latency budgets, use subprocess path where timeout is enforceable.
+    if prefer_api and not enforce_timeout:
         r = run_hrm_query_via_api(repo_root=repo_root, model_dir=model_dir, prompt=prompt, top_k=top_k, top_m=top_m, k=k)
         if r is not None:
             return r
@@ -73,7 +76,19 @@ def run_hrm_query(
         "--prompt-stdin",
     ]
 
-    p = subprocess.run(cmd, input=prompt.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        p = subprocess.run(
+            cmd,
+            input=prompt.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=(float(timeout_s) if enforce_timeout else None),
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"HRM query timed out after {float(timeout_s):.3f}s "
+            f"(prompt_bytes={len(prompt.encode('utf-8'))}, top_k={int(top_k)}, k={int(k)}, top_m={int(top_m)})"
+        ) from e
     if p.returncode != 0:
         raise RuntimeError(f"HRM query failed (code {p.returncode}):\n{p.stderr.decode('utf-8', errors='replace')}")
 

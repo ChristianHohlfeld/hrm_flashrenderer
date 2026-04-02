@@ -14,7 +14,7 @@ from hrm_flash.utils import (
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="hrm-flash", description="HRM-FlashRenderer v5.1.0 (HRM retrieval + persistent FlashAttention TP renderer)")
+    ap = argparse.ArgumentParser(prog="hrm-flash", description="HRM-FlashRenderer v5.1.0 (HRM retrieval + native DeepSeek INT8 inference)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("daemon", help="Start persistent TP FlashAttention daemon (loads renderer once)")
@@ -29,7 +29,7 @@ def main():
     d.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"],
                    help="Device to run on. Use 'cpu' for CPU-only mode (no CUDA required).")
 
-    s = sub.add_parser("serve", help="Start HTTP service (HRM retrieval + persistent TP daemon)")
+    s = sub.add_parser("serve", help="Start HTTP service (HRM retrieval + native DeepSeek INT8 engine)")
     s.add_argument("--hrm_model", required=True)
     s.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID")
     s.add_argument("--world", type=int, choices=[1, 2, 3, 4], required=True)
@@ -39,10 +39,11 @@ def main():
     s.add_argument("--prefill_chunk_size", type=int, default=1024)
     s.add_argument("--max_new_tokens", type=int, default=256)
     s.add_argument("--local_files_only", action="store_true")
-    s.add_argument("--max_sources", type=int, default=8)
+    s.add_argument("--max_sources", type=int, default=16)
     s.add_argument("--max_chars_per_source", type=int, default=1200)
     s.add_argument("--reserve_prompt_tokens", type=int, default=16)
     s.add_argument("--disable_token_budget", action="store_true")
+    s.add_argument("--expose_sources", action="store_true", help="Debug only: include source texts in HTTP response")
     s.add_argument("--hrm_bin", default=None)
     s.add_argument("--max_concurrent", type=int, default=1)
     s.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
@@ -71,7 +72,7 @@ def main():
     rt.add_argument("--local_files_only", action="store_true")
     rt.add_argument("--disable_tokenizer", action="store_true")
 
-    g = sub.add_parser("generate", help="Retrieve with HRM, then render with FlashAttention TP engine")
+    g = sub.add_parser("generate", help="Retrieve with HRM, then answer with native DeepSeek INT8 engine")
     g.add_argument("--hrm_model", required=True, help="HRM model dir (router_index.bin + index.sqlite)")
     g.add_argument("--llm_model", required=True, help="Local HF safetensors model dir or HF repo ID (renderer)")
     g.add_argument("--prompt", required=True, help="User question")
@@ -80,11 +81,11 @@ def main():
 
     g.add_argument("--world", type=int, choices=[1, 2, 3, 4], default=None, help="Tensor parallel world size")
 
-    g.add_argument("--top_k", type=int, default=8)
+    g.add_argument("--top_k", type=int, default=16)
     g.add_argument("--top_m", type=int, default=400)
-    g.add_argument("--k", type=int, default=8)
+    g.add_argument("--k", type=int, default=16)
 
-    g.add_argument("--max_sources", type=int, default=8)
+    g.add_argument("--max_sources", type=int, default=16)
     g.add_argument("--max_chars_per_source", type=int, default=1200)
 
     g.add_argument("--reserve_prompt_tokens", type=int, default=16, help="Safety margin for prompt budget")
@@ -144,6 +145,8 @@ def main():
             "--native_startup_timeout_s", str(args.native_startup_timeout_s),
             "--native_request_timeout_s", str(args.native_request_timeout_s),
         ] + (["--local_files_only"] if args.local_files_only else []) + (["--disable_token_budget"] if args.disable_token_budget else []) + (["--hrm_bin", args.hrm_bin] if args.hrm_bin else [])
+        if args.expose_sources:
+            sys.argv += ["--expose_sources"]
         if args.model_bin:
             sys.argv += ["--model_bin", args.model_bin]
         if args.tokenizer_model:
@@ -217,6 +220,7 @@ def main():
             k=args.k,
             prefer_api=True,
             repo_root=repo_root,
+            timeout_s=1.8,
         )
         sources = build_sources(r.raw, max_sources=args.max_sources, max_chars_per_source=args.max_chars_per_source)
 

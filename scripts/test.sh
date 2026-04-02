@@ -24,6 +24,8 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 echo "[python] regression tests"
 "$PYTHON_BIN" -m unittest tests.test_regressions
+echo "[python] silent mode tests"
+"$PYTHON_BIN" -m unittest tests.test_silent_mode
 echo "[python] router logic tests"
 "$PYTHON_BIN" -m unittest tests.test_router_logic
 echo "[python] hrm_api test"

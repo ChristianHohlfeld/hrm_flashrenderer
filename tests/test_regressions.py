@@ -173,6 +173,23 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('TRIPLE_DEVICES="$GPU_22GB,$GPU_NVLINK_PAIR"', topo_txt)
         self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', e2e_txt)
 
+    def test_silent_mode_defaults_are_enabled(self):
+        cli_txt = _read_text(REPO_ROOT / "hrm_flash" / "cli.py")
+        serve_txt = _read_text(REPO_ROOT / "hrm_flash" / "serve.py")
+        prompt_txt = _read_text(REPO_ROOT / "hrm_flash" / "prompt_builder.py")
+
+        self.assertIn('g.add_argument("--top_k", type=int, default=16)', cli_txt)
+        self.assertIn('g.add_argument("--k", type=int, default=16)', cli_txt)
+        self.assertIn('g.add_argument("--max_sources", type=int, default=16)', cli_txt)
+        self.assertIn('s.add_argument("--max_sources", type=int, default=16)', cli_txt)
+        self.assertIn("top_k=16,", serve_txt)
+        self.assertIn("k=16,", serve_txt)
+        self.assertIn("timeout_s=1.8,", serve_txt)
+        self.assertIn('ap.add_argument("--max_sources", type=int, default=16)', serve_txt)
+        self.assertIn("SILENT_SYSTEM_PROMPT", prompt_txt)
+        self.assertIn("Never mention retrieval, sources", prompt_txt)
+        self.assertIn("max_sources: int = 16", prompt_txt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,7 +35,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 HRM_MODEL="$1"
-FINAL_PROMPT="${2:-Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis.}"
+FINAL_PROMPT="${2:-Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.}"
 
 RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-1}"
 EXPECTED_GPUS="${EXPECTED_GPUS:-4}"
@@ -173,13 +173,21 @@ txt = str(d.get("text", "")).strip()
 if not txt:
     raise SystemExit("empty response text")
 
-sources = d.get("sources", [])
+sources = d.get("sources", None)
+source_count = d.get("source_count", None)
 allow_empty = os.environ.get("ALLOW_EMPTY_SOURCES", "0") == "1"
-if not allow_empty and (not isinstance(sources, list) or len(sources) == 0):
-    raise SystemExit(
-        "sources are empty -> this likely hit retrieval fallback instead of full retrieval+deepseek inference. "
-        "Use a prompt that matches your HRM index or set ALLOW_EMPTY_SOURCES=1 if intentional."
-    )
+if not allow_empty:
+    if isinstance(source_count, int):
+        if source_count <= 0:
+            raise SystemExit(
+                "source_count is 0 -> this likely hit retrieval fallback instead of full retrieval+deepseek inference. "
+                "Use a prompt that matches your HRM index or set ALLOW_EMPTY_SOURCES=1 if intentional."
+            )
+    elif not isinstance(sources, list) or len(sources) == 0:
+        raise SystemExit(
+            "sources are empty -> this likely hit retrieval fallback instead of full retrieval+deepseek inference. "
+            "Use a prompt that matches your HRM index or set ALLOW_EMPTY_SOURCES=1 if intentional."
+        )
 
 route = d.get("route", {}) if isinstance(d.get("route"), dict) else {}
 selected = route.get("selected", "?")

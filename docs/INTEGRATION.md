@@ -10,7 +10,7 @@ This repository is production-focused on:
 From repo root:
 
 ```bash
-bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz mit Quellen."
+bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz und präzise."
 ```
 
 This validates build, dependencies, GPU topology, backend health, and a final end-to-end prompt.

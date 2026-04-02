@@ -14,7 +14,7 @@ If your server has:
 run exactly this from repo root:
 
 ```bash
-bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis."
+bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis."
 ```
 
 This single command does:
@@ -45,7 +45,7 @@ bash scripts/make_model.sh input.txt ./model_index 200
 Skip reinstall/rebuild:
 
 ```bash
-RUN_BOOTSTRAP=0 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis."
+RUN_BOOTSTRAP=0 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis."
 ```
 
 ## Keep Running / Stop
@@ -78,7 +78,7 @@ Final prompt call:
 ```bash
 curl -s http://127.0.0.1:8090/v1/generate \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Wichtigster Fakt aus den Quellen 3) Route-Hinweis.","route_hint":"balanced","max_new_tokens":256}'
+  -d '{"prompt":"Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.","route_hint":"balanced","max_new_tokens":256}'
 ```
 
 ## Model + Hardware Alignment (Default)
@@ -100,6 +100,15 @@ If you explicitly want the old 3-lane split (14B/14B/7B), use:
 ```bash
 TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
 ```
+
+## Silent Mode (Default)
+
+Silent mode is always on in production mainline:
+- HRM retrieval runs automatically with deterministic settings (`top_k=16`, `k=16`, timeout budget `1.8s`).
+- Retrieved sources are injected as internal context.
+- The model is instructed to never cite or mention retrieval/sources.
+- User prompt is passed through unchanged.
+- HTTP responses return `text` (+ `source_count` for checks); raw source text is hidden by default.
 
 ## Dynamic GPU Mapping (No Static Order Assumptions)
 
