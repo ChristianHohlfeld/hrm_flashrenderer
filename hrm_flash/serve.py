@@ -201,7 +201,7 @@ def main():
         prompt: str
         max_new_tokens: Optional[int] = None
         mode: Optional[str] = None
-        show_sources: Optional[bool] = False
+        show_sources: Optional[bool] = None
 
     @app.get("/v1/health")
     async def health():
@@ -228,9 +228,10 @@ def main():
             raise HTTPException(status_code=400, detail=str(e))
         async with STATE.sem:
             prompt_text, sources, mode = _build_prompt(req.prompt, mode=mode)
+            show_sources = bool(req.show_sources) if req.show_sources is not None else (mode == "retrieval")
             if not prompt_text:
                 payload = {"ok": True, "text": "I don't know.", "source_count": 0, "mode": mode}
-                if bool(req.show_sources) or STATE.expose_sources:
+                if show_sources or STATE.expose_sources:
                     payload["sources"] = []
                 return JSONResponse(payload)
             max_new = int(req.max_new_tokens) if req.max_new_tokens is not None else STATE.max_new_tokens
@@ -248,7 +249,7 @@ def main():
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
             payload = {"ok": True, "text": text, "source_count": len(sources), "mode": mode}
-            if (bool(req.show_sources) or STATE.expose_sources) and mode != "deepseek_only":
+            if (show_sources or STATE.expose_sources) and mode != "deepseek_only":
                 payload["sources"] = [{"sid": s.sid, "txt": s.txt} for s in sources]
             return JSONResponse(payload)
 

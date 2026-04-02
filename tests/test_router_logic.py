@@ -42,6 +42,17 @@ class TestRouterMaxModelMode(unittest.TestCase):
         )
         self.assertEqual(selected, "solo_22gb")
 
+    def test_mode_resolution_uses_router_default(self):
+        self.assertEqual(router._resolve_mode(None, default_mode="mixed"), "mixed")
+        self.assertEqual(router._resolve_mode(None, default_mode="deepseek_only"), "deepseek_only")
+
+    def test_mode_resolution_accepts_explicit_mode(self):
+        self.assertEqual(router._resolve_mode("retrieval", default_mode="mixed"), "retrieval")
+
+    def test_mode_resolution_rejects_invalid(self):
+        with self.assertRaises(ValueError):
+            router._resolve_mode("broken_mode", default_mode="mixed")
+
 
 if __name__ == "__main__":
     unittest.main()

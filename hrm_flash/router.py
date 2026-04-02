@@ -13,6 +13,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from hrm_flash.prompt_builder import SUPPORTED_MODES, normalize_mode
 
 def _require_fastapi():
     try:
@@ -49,6 +50,7 @@ class _RouterState:
         self.sem: asyncio.Semaphore | None = None
         self.tokenizer: Any = None
         self.tokenizer_name: str | None = None
+        self.default_mode: str = "mixed"
 
 
 STATE = _RouterState()
@@ -206,6 +208,12 @@ def _check_backend_health(backend: Backend, timeout_s: float) -> Dict[str, Any]:
         return {"ok": False, "error": str(e), "url": backend.base_url}
 
 
+def _resolve_mode(mode: Optional[str], default_mode: str) -> str:
+    if mode is None:
+        return normalize_mode(default_mode)
+    return normalize_mode(mode)
+
+
 def main():
     FastAPI, HTTPException, JSONResponse, BaseModel = _require_fastapi()
 
@@ -227,6 +235,7 @@ def main():
     ap.add_argument("--chars_per_token", type=float, default=4.0)
     ap.add_argument("--local_files_only", action="store_true")
     ap.add_argument("--disable_tokenizer", action="store_true")
+    ap.add_argument("--default_mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")
     args = ap.parse_args()
 
     STATE.backends = {
@@ -244,6 +253,7 @@ def main():
     STATE.chars_per_token = max(1.0, float(args.chars_per_token))
     STATE.max_concurrent = max(1, int(args.max_concurrent))
     STATE.sem = asyncio.Semaphore(STATE.max_concurrent)
+    STATE.default_mode = normalize_mode(str(args.default_mode))
 
     if not bool(args.disable_tokenizer) and args.tokenizer_model:
         try:
@@ -268,7 +278,7 @@ def main():
         prompt: str
         max_new_tokens: Optional[int] = None
         mode: Optional[str] = None
-        show_sources: Optional[bool] = False
+        show_sources: Optional[bool] = None
         route_hint: Optional[str] = None
         prefer_backend: Optional[str] = None
         allow_failover: bool = True
@@ -293,6 +303,8 @@ def main():
                 "collapsed_max_model_mode": _collapsed_max_model_mode(),
                 "request_timeout_s": STATE.request_timeout_s,
                 "max_concurrent": STATE.max_concurrent,
+                "default_mode": STATE.default_mode,
+                "supported_modes": sorted(SUPPORTED_MODES),
                 "thresholds": {
                     "short_prompt_tokens": STATE.short_prompt_tokens,
                     "medium_prompt_tokens": STATE.medium_prompt_tokens,
@@ -308,6 +320,10 @@ def main():
     async def generate(req: GenerateReq):
         if not req.prompt or not req.prompt.strip():
             raise HTTPException(status_code=400, detail="prompt required")
+        try:
+            mode = _resolve_mode(req.mode, default_mode=STATE.default_mode)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         assert STATE.sem is not None
         async with STATE.sem:
             requested_max_new_tokens = int(req.max_new_tokens) if req.max_new_tokens is not None else 256
@@ -324,14 +340,15 @@ def main():
 
             attempted: list[str] = []
             errors: list[str] = []
+            show_sources = bool(req.show_sources) if req.show_sources is not None else (mode == "retrieval")
             for backend_name in candidates:
                 backend = STATE.backends[backend_name]
                 backend_max_new_tokens = min(requested_max_new_tokens, _max_new_limit_for_backend(backend_name))
                 payload = {
                     "prompt": req.prompt,
                     "max_new_tokens": int(backend_max_new_tokens),
-                    "mode": req.mode,
-                    "show_sources": bool(req.show_sources),
+                    "mode": mode,
+                    "show_sources": show_sources,
                 }
                 attempted.append(backend_name)
                 try:

@@ -43,6 +43,12 @@ Generation modes (same endpoint):
 - `retrieval`: explicit source/citation mode
 - `deepseek_only`: no HRM
 
+Router startup default for mode:
+
+```bash
+ROUTER_DEFAULT_MODE=mixed bash scripts/start_native_stack.sh ./model_index auto
+```
+
 ## Routing Controls
 
 Optional request fields for `/v1/generate`:

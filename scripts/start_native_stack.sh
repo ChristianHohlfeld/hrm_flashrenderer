@@ -22,6 +22,7 @@ set -euo pipefail
 #   ROUTER_SHORT_MAX_NEW_TOKENS, ROUTER_MEDIUM_MAX_NEW_TOKENS, ROUTER_LONG_MAX_NEW_TOKENS
 #   ROUTER_REQUEST_TIMEOUT_S, ROUTER_HEALTH_TIMEOUT_S
 #   ROUTER_TOKENIZER_MODEL
+#   ROUTER_DEFAULT_MODE (default: mixed; retrieval|mixed|deepseek_only)
 #   ROUTER_LOCAL_FILES_ONLY (default: LOCAL_FILES_ONLY or 1)
 #   ROUTER_DISABLE_TOKENIZER (1 disables tokenizer-based routing)
 #   PREPARE_MODELS (default: 1 for deepseek_int8 backend)
@@ -151,7 +152,16 @@ ROUTER_HEALTH_TIMEOUT_S="${ROUTER_HEALTH_TIMEOUT_S:-1.5}"
 ROUTER_CHARS_PER_TOKEN="${ROUTER_CHARS_PER_TOKEN:-4.0}"
 ROUTER_DISABLE_TOKENIZER="${ROUTER_DISABLE_TOKENIZER:-0}"
 ROUTER_TOKENIZER_MODEL="${ROUTER_TOKENIZER_MODEL:-$LLM_MODEL_SOLO_22GB}"
+ROUTER_DEFAULT_MODE="${ROUTER_DEFAULT_MODE:-mixed}"
 ROUTER_LOCAL_FILES_ONLY="${ROUTER_LOCAL_FILES_ONLY:-${LOCAL_FILES_ONLY:-1}}"
+case "$ROUTER_DEFAULT_MODE" in
+  retrieval|mixed|deepseek_only) ;;
+  *)
+    echo "ERR: unsupported ROUTER_DEFAULT_MODE=$ROUTER_DEFAULT_MODE (supported: retrieval, mixed, deepseek_only)." >&2
+    exit 2
+    ;;
+esac
+echo "[stack] router default_mode=$ROUTER_DEFAULT_MODE"
 
 health_ok() {
   local url="$1"
@@ -232,6 +242,7 @@ router_flags=(
   --health_timeout_s "$ROUTER_HEALTH_TIMEOUT_S"
   --max_concurrent "$ROUTER_MAX_CONCURRENT"
   --chars_per_token "$ROUTER_CHARS_PER_TOKEN"
+  --default_mode "$ROUTER_DEFAULT_MODE"
 )
 
 if [[ -n "${ROUTER_TOKENIZER_MODEL:-}" ]]; then

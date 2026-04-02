@@ -72,6 +72,7 @@ def main():
     rt.add_argument("--chars_per_token", type=float, default=4.0, help="Fallback token estimate when tokenizer is unavailable")
     rt.add_argument("--local_files_only", action="store_true")
     rt.add_argument("--disable_tokenizer", action="store_true")
+    rt.add_argument("--default_mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")
 
     g = sub.add_parser("generate", help="Retrieve with HRM, then answer with native DeepSeek INT8/INT4 engine")
     g.add_argument("--hrm_model", required=True, help="HRM model dir (router_index.bin + index.sqlite)")
@@ -177,6 +178,7 @@ def main():
             "--health_timeout_s", str(args.health_timeout_s),
             "--max_concurrent", str(args.max_concurrent),
             "--chars_per_token", str(args.chars_per_token),
+            "--default_mode", str(args.default_mode),
         ] + (["--tokenizer_model", args.tokenizer_model] if args.tokenizer_model else []) + (["--local_files_only"] if args.local_files_only else []) + (["--disable_tokenizer"] if args.disable_tokenizer else [])
         rmain()
         return
