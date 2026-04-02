@@ -107,7 +107,7 @@ TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
 `POST /v1/generate` supports three modes via JSON field `mode`:
 - `mixed` (default): HRM runs deterministically in background (`top_k=16`, `k=16`, `1.8s`), sources are internal/hidden, and the silent system prompt explicitly forbids source/retrieval mentions.
 - `retrieval`: HRM sources are explicit in prompt context and model is instructed to cite source ids.
-- `deepseek_only`: no HRM query, no source injection, pure model response path.
+- `deepseek_only`: no HRM query, no source injection, pure model response path (raw user prompt, no system/retrieval context).
 
 Router default mode can be pinned at startup:
 
@@ -118,6 +118,7 @@ ROUTER_DEFAULT_MODE=mixed bash scripts/start_native_stack.sh ./model_index auto
 Optional JSON flag:
 - `show_sources`: include `sources` array in HTTP response (off by default, ignored for `deepseek_only`).
 - default behavior: `retrieval` auto-enables source output; `mixed` keeps sources hidden unless explicitly requested.
+- `hrm_active` in response: `true` for `mixed`/`retrieval`, `false` for `deepseek_only`.
 
 `scripts/prod_live_e2e.sh` performs strict mode verification by default:
 - `RUN_MODE_MATRIX=1` (default): tests all three modes with different prompts.

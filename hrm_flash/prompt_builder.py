@@ -90,7 +90,8 @@ def build_retrieval_prompt(question: str, sources: List[Source]) -> str:
 
 
 def build_deepseek_only_prompt(question: str) -> str:
-    return "\n".join(["[USER]", question, "", "[ASSISTANT]", ""])
+    # Pure LLM path: no retrieval/system/context scaffolding, user prompt only.
+    return str(question)
 
 
 def build_prompt_for_mode(question: str, sources: List[Source], mode: str | None) -> str:

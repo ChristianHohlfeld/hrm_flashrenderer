@@ -56,7 +56,7 @@ AUTO_STOP="${AUTO_STOP:-0}"
 ALLOW_EMPTY_SOURCES="${ALLOW_EMPTY_SOURCES:-0}"
 PROMPT_MIXED="${PROMPT_MIXED:-$FINAL_PROMPT}"
 PROMPT_RETRIEVAL="${PROMPT_RETRIEVAL:-Nenne die wichtigste Aussage und gib mindestens eine Quellen-ID in eckigen Klammern an.}"
-PROMPT_DEEPSEEK_ONLY="${PROMPT_DEEPSEEK_ONLY:-Erkläre in zwei Sätzen den Unterschied zwischen Retrieval und reinem LLM-Wissen.}"
+PROMPT_DEEPSEEK_ONLY="${PROMPT_DEEPSEEK_ONLY:-Explain in two short sentences the difference between retrieval and pure model knowledge.}"
 
 if [[ "$RUN_MODE_MATRIX" != "0" && "$RUN_MODE_MATRIX" != "1" ]]; then
   echo "ERR: RUN_MODE_MATRIX must be 0 or 1 (got: $RUN_MODE_MATRIX)" >&2
@@ -270,6 +270,7 @@ for mode in modes:
         if not text:
             raise SystemExit(f"{mode} run {i}: empty response text")
         sc = source_count_of(resp)
+        hrm_active = resp.get("hrm_active", None)
         lower = text.lower()
 
         if mode == "mixed":
@@ -288,6 +289,10 @@ for mode in modes:
             if isinstance(resp.get("sources"), list) and len(resp["sources"]) > 0:
                 raise SystemExit(
                     f"{mode} run {i}: mixed response exposed sources by default"
+                )
+            if hrm_active is not True:
+                raise SystemExit(
+                    f"{mode} run {i}: mixed must return hrm_active=true"
                 )
         elif mode == "retrieval":
             if not allow_empty and sc <= 0:
@@ -309,10 +314,18 @@ for mode in modes:
                 raise SystemExit(
                     f"{mode} run {i}: retrieval output did not reference sources"
                 )
+            if hrm_active is not True:
+                raise SystemExit(
+                    f"{mode} run {i}: retrieval must return hrm_active=true"
+                )
         elif mode == "deepseek_only":
             if sc != 0:
                 raise SystemExit(
                     f"{mode} run {i}: deepseek_only must have source_count=0 (got {sc})"
+                )
+            if hrm_active is not False:
+                raise SystemExit(
+                    f"{mode} run {i}: deepseek_only must return hrm_active=false"
                 )
             src = resp.get("sources")
             if isinstance(src, list) and len(src) > 0:

@@ -40,8 +40,7 @@ class TestThreeModes(unittest.TestCase):
 
     def test_deepseek_only_has_no_retrieval_context(self):
         p = build_prompt_for_mode(self.q, self.sources, mode="deepseek_only")
-        self.assertIn("[USER]", p)
-        self.assertIn(self.q, p)
+        self.assertEqual(p, self.q)
         self.assertNotIn("[SYSTEM]", p)
         self.assertNotIn("[SOURCES]", p)
         self.assertNotIn("[BACKGROUND_KNOWLEDGE]", p)

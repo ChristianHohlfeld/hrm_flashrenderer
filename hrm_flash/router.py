@@ -214,6 +214,15 @@ def _resolve_mode(mode: Optional[str], default_mode: str) -> str:
     return normalize_mode(mode)
 
 
+def _resolve_show_sources(show_sources: Optional[bool], mode: str) -> bool:
+    # deepseek_only must never return retrieval sources.
+    if mode == "deepseek_only":
+        return False
+    if show_sources is None:
+        return mode == "retrieval"
+    return bool(show_sources)
+
+
 def main():
     FastAPI, HTTPException, JSONResponse, BaseModel = _require_fastapi()
 
@@ -340,7 +349,7 @@ def main():
 
             attempted: list[str] = []
             errors: list[str] = []
-            show_sources = bool(req.show_sources) if req.show_sources is not None else (mode == "retrieval")
+            show_sources = _resolve_show_sources(req.show_sources, mode)
             for backend_name in candidates:
                 backend = STATE.backends[backend_name]
                 backend_max_new_tokens = min(requested_max_new_tokens, _max_new_limit_for_backend(backend_name))

@@ -53,6 +53,13 @@ class TestRouterMaxModelMode(unittest.TestCase):
         with self.assertRaises(ValueError):
             router._resolve_mode("broken_mode", default_mode="mixed")
 
+    def test_show_sources_resolution_for_modes(self):
+        self.assertTrue(router._resolve_show_sources(None, "retrieval"))
+        self.assertFalse(router._resolve_show_sources(None, "mixed"))
+        self.assertFalse(router._resolve_show_sources(None, "deepseek_only"))
+        self.assertFalse(router._resolve_show_sources(True, "deepseek_only"))
+        self.assertTrue(router._resolve_show_sources(True, "retrieval"))
+
 
 if __name__ == "__main__":
     unittest.main()

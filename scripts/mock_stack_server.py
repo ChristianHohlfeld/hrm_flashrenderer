@@ -84,6 +84,7 @@ def _handler_for(name: str, empty_sources: bool):
                 "text": text,
                 "source_count": len(sources),
                 "mode": mode,
+                "hrm_active": (mode != "deepseek_only"),
                 "route": {
                     "selected": "nvlink_pair",
                     "prompt_tokens": 42,

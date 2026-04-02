@@ -33,10 +33,11 @@ class TestServeModes(unittest.TestCase):
             raise AssertionError("run_hrm_query must not be called in deepseek_only mode")
 
         serve.run_hrm_query = _boom
-        p, sources, mode = serve._build_prompt("Hi", mode="deepseek_only")
+        p, sources, mode, hrm_active = serve._build_prompt("Hi", mode="deepseek_only")
         self.assertEqual(mode, "deepseek_only")
+        self.assertFalse(hrm_active)
         self.assertEqual(sources, [])
-        self.assertIn("[USER]", p)
+        self.assertEqual(p, "Hi")
         self.assertNotIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertNotIn("[SOURCES]", p)
 
@@ -45,8 +46,9 @@ class TestServeModes(unittest.TestCase):
             return _FakeHRMResult({"chosen": [{"sid": "s0001", "txt": "Alpha fact"}]})
 
         serve.run_hrm_query = _ok
-        p, sources, mode = serve._build_prompt("Frage", mode="mixed")
+        p, sources, mode, hrm_active = serve._build_prompt("Frage", mode="mixed")
         self.assertEqual(mode, "mixed")
+        self.assertTrue(hrm_active)
         self.assertEqual(len(sources), 1)
         self.assertIn("[BACKGROUND_KNOWLEDGE]", p)
         self.assertIn("Alpha fact", p)
@@ -57,8 +59,9 @@ class TestServeModes(unittest.TestCase):
             return _FakeHRMResult({"chosen": [{"sid": "s0001", "txt": "Alpha fact"}]})
 
         serve.run_hrm_query = _ok
-        p, sources, mode = serve._build_prompt("Frage", mode="retrieval")
+        p, sources, mode, hrm_active = serve._build_prompt("Frage", mode="retrieval")
         self.assertEqual(mode, "retrieval")
+        self.assertTrue(hrm_active)
         self.assertEqual(len(sources), 1)
         self.assertIn("[SOURCES]", p)
         self.assertIn("[s0001] Alpha fact", p)
@@ -70,8 +73,8 @@ class TestServeModes(unittest.TestCase):
         serve.run_hrm_query = _ok
         serve.STATE.disable_token_budget = False
         serve.STATE.tokenizer_source = None
-        p, sources, mode = serve._build_prompt("Frage", mode="mixed")
-        self.assertEqual((p, sources, mode), ("", [], "mixed"))
+        p, sources, mode, hrm_active = serve._build_prompt("Frage", mode="mixed")
+        self.assertEqual((p, sources, mode, hrm_active), ("", [], "mixed", True))
 
     def test_missing_tokenizer_source_never_imports_transformers(self):
         def _ok(*_a, **_kw):
@@ -91,8 +94,8 @@ class TestServeModes(unittest.TestCase):
             return real_import(name, globals, locals, fromlist, level)
 
         with patch("builtins.__import__", side_effect=_guarded_import):
-            p, sources, mode = serve._build_prompt("Frage", mode="mixed")
-            self.assertEqual((p, sources, mode), ("", [], "mixed"))
+            p, sources, mode, hrm_active = serve._build_prompt("Frage", mode="mixed")
+            self.assertEqual((p, sources, mode, hrm_active), ("", [], "mixed", True))
 
 
 if __name__ == "__main__":
