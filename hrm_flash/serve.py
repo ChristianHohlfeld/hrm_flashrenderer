@@ -83,10 +83,10 @@ def _build_prompt(prompt: str, mode: str) -> tuple[str, list[Any], str]:
     sources_for_prompt = sources
 
     if not STATE.disable_token_budget:
-        from transformers import AutoTokenizer
         tok_src = STATE.tokenizer_source
         if not tok_src:
             return "", [], resolved_mode
+        from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(str(tok_src), local_files_only=bool(STATE.local_files_only))
         max_prompt_tokens = int(STATE.max_seq_len) - int(STATE.max_new_tokens) - int(STATE.reserve_prompt_tokens)
         q_fit, s_fit = fit_prompt_to_token_budget(
