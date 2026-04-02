@@ -133,7 +133,7 @@ if [[ "$code_empty" -eq 0 ]]; then
   echo "ERR: prod_live_e2e unexpectedly succeeded with empty sources" >&2
   exit 1
 fi
-printf '%s' "$out_empty" | grep -Eq "sources are empty|source_count is 0"
+printf '%s' "$out_empty" | grep -Eq "sources are empty|source_count is 0|determinism-test: expected non-empty mixed sources"
 
 echo "[test] prod_live_e2e can allow empty sources when explicitly enabled"
 run_e2e 1 "Leere Quellen mit Allow." "mixed" "0"

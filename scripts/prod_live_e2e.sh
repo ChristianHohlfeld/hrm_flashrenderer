@@ -186,6 +186,7 @@ E2E_DETERMINISM_RUNS="$E2E_DETERMINISM_RUNS" \
 ROUTER_ROUTE_HINT="$ROUTER_ROUTE_HINT" \
 ROUTER_MAX_NEW_TOKENS="$ROUTER_MAX_NEW_TOKENS" \
 ALLOW_EMPTY_SOURCES="$ALLOW_EMPTY_SOURCES" \
+LOG_DIR="$LOG_DIR" \
 PROMPT_MIXED="$PROMPT_MIXED" \
 PROMPT_RETRIEVAL="$PROMPT_RETRIEVAL" \
 PROMPT_DEEPSEEK_ONLY="$PROMPT_DEEPSEEK_ONLY" \
@@ -194,7 +195,9 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.request
+from pathlib import Path
 
 router_url = os.environ["ROUTER_URL"].rstrip("/")
 route_hint = os.environ["ROUTER_ROUTE_HINT"]
@@ -219,8 +222,12 @@ banned_mixed = [
     "according to the documents",
     "retrieved information",
     "laut den quellen",
+    "aus den snippets",
+    "basierend auf",
     "basierend auf den snippets",
     "aus den bereitgestellten texten",
+    "based on the snippets",
+    "based on",
     "according to the sources",
 ]
 
@@ -249,6 +256,125 @@ def source_count_of(resp: dict) -> int:
     if isinstance(src, list):
         return len(src)
     return 0
+
+def send_request(*, mode: str | None, prompt: str, show_sources: bool | None, max_new_tokens: int) -> tuple[dict, float]:
+    payload = {
+        "prompt": prompt,
+        "route_hint": route_hint,
+        "max_new_tokens": max_new_tokens,
+        "allow_failover": True,
+    }
+    if mode is not None:
+        payload["mode"] = mode
+    if show_sources is not None:
+        payload["show_sources"] = bool(show_sources)
+    t0 = time.perf_counter()
+    resp = post_json(f"{router_url}/v1/generate", payload)
+    dt = time.perf_counter() - t0
+    return resp, dt
+
+def assert_quick(name: str, dt: float, limit_s: float = 3.0) -> None:
+    if dt > limit_s:
+        raise SystemExit(f"{name}: exceeded {limit_s:.1f}s ({dt:.3f}s)")
+
+quick_max_new_tokens = min(max_new_tokens, 32)
+
+print("[fp] 1) mixed-silent-test")
+mixed_resp, mixed_dt = send_request(
+    mode="mixed",
+    prompt=prompts["mixed"],
+    show_sources=False,
+    max_new_tokens=quick_max_new_tokens,
+)
+assert_quick("mixed-silent-test", mixed_dt)
+mixed_text = str(mixed_resp.get("text", "")).strip()
+if not mixed_text:
+    raise SystemExit("mixed-silent-test: empty response")
+mixed_lower = mixed_text.lower()
+for bad in ("quellen", "snippets", "laut den", "basierend auf"):
+    if bad in mixed_lower:
+        raise SystemExit(f"mixed-silent-test: forbidden phrase found: '{bad}'")
+
+print("[fp] 2) deepseek_only-no-hrm-test")
+deepseek_resp, deepseek_dt = send_request(
+    mode="deepseek_only",
+    prompt=prompts["deepseek_only"],
+    show_sources=True,
+    max_new_tokens=quick_max_new_tokens,
+)
+assert_quick("deepseek_only-no-hrm-test", deepseek_dt)
+if source_count_of(deepseek_resp) != 0:
+    raise SystemExit("deepseek_only-no-hrm-test: expected source_count=0")
+if deepseek_resp.get("hrm_active", None) is not False:
+    raise SystemExit("deepseek_only-no-hrm-test: expected hrm_active=false")
+router_log = Path(os.environ.get("LOG_DIR", "")) / "router.log"
+if router_log.is_file():
+    router_log_txt = router_log.read_text(encoding="utf-8", errors="replace").lower()
+    if ("hrm disabled" not in router_log_txt) and ("no retrieval" not in router_log_txt):
+        raise SystemExit("deepseek_only-no-hrm-test: router log missing 'HRM disabled'/'no retrieval' marker")
+
+print("[fp] 3) determinism-test (mixed sources)")
+mixed_sources_hash = None
+for i in range(1, 4):
+    det_resp, det_dt = send_request(
+        mode="mixed",
+        prompt=prompts["mixed"],
+        show_sources=True,
+        max_new_tokens=quick_max_new_tokens,
+    )
+    assert_quick(f"determinism-test run {i}", det_dt)
+    sc = source_count_of(det_resp)
+    if not allow_empty and sc <= 0:
+        raise SystemExit("determinism-test: expected non-empty mixed sources")
+    sources = det_resp.get("sources")
+    if not isinstance(sources, list):
+        sources = []
+    src_fingerprint = hashlib.sha256(
+        json.dumps(sources, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if mixed_sources_hash is None:
+        mixed_sources_hash = src_fingerprint
+    elif src_fingerprint != mixed_sources_hash:
+        raise SystemExit(
+            f"determinism-test: mixed sources changed (baseline={mixed_sources_hash}, got={src_fingerprint})"
+        )
+
+print("[fp] 4) retrieval-reference-test")
+retrieval_resp, retrieval_dt = send_request(
+    mode="retrieval",
+    prompt=prompts["retrieval"],
+    show_sources=True,
+    max_new_tokens=quick_max_new_tokens,
+)
+assert_quick("retrieval-reference-test", retrieval_dt)
+retrieval_text = str(retrieval_resp.get("text", "")).strip()
+if not retrieval_text:
+    raise SystemExit("retrieval-reference-test: empty response")
+retrieval_lower = retrieval_text.lower()
+if not (
+    "laut den quellen" in retrieval_lower
+    or "laut den" in retrieval_lower
+    or "according to" in retrieval_lower
+    or "quelle" in retrieval_lower
+    or "source" in retrieval_lower
+    or retrieval_ref_re.search(retrieval_text)
+):
+    raise SystemExit("retrieval-reference-test: no source reference phrase found")
+
+print("[fp] 5) default-mode-test")
+default_resp, default_dt = send_request(
+    mode=None,
+    prompt=prompts["mixed"],
+    show_sources=False,
+    max_new_tokens=quick_max_new_tokens,
+)
+assert_quick("default-mode-test", default_dt)
+if str(default_resp.get("mode", "")).strip().lower() != "mixed":
+    raise SystemExit("default-mode-test: default mode is not mixed")
+default_text = str(default_resp.get("text", "")).strip().lower()
+for bad in ("quellen", "snippets", "laut den", "basierend auf"):
+    if bad in default_text:
+        raise SystemExit(f"default-mode-test: forbidden phrase found: '{bad}'")
 
 for mode in modes:
     prompt = prompts[mode]

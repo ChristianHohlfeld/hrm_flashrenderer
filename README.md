@@ -109,6 +109,8 @@ TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
 - `retrieval`: HRM sources are explicit in prompt context and model is instructed to cite source ids.
 - `deepseek_only`: no HRM query, no source injection, pure model response path (raw user prompt, no system/retrieval context).
 
+Default behavior is `mixed`, and silent mode is enforced: normal answers must not contain phrases like `laut den Quellen`, `aus den Snippets`, or `basierend auf ...`.
+
 Router default mode can be pinned at startup:
 
 ```bash
