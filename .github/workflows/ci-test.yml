@@ -28,3 +28,56 @@ jobs:
       - name: Run Repository Tests
         run: |
           bash scripts/test.sh
+
+  fresh-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Native Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake libsqlite3-dev
+
+      - name: Bootstrap Fresh Ubuntu Install (No-Torch Mainline)
+        run: |
+          PROFILE=deepseek_int8 bash scripts/bootstrap.sh
+
+      - name: Validate Python Dependency Health
+        run: |
+          python -m pip check
+          python - <<'PY'
+          import importlib
+          mods = [
+              "numpy",
+              "huggingface_hub",
+              "transformers",
+              "safetensors",
+              "fastapi",
+              "uvicorn",
+              "pydantic",
+              "hrm_flash",
+          ]
+          for m in mods:
+              importlib.import_module(m)
+          print("imports-ok")
+          PY
+
+      - name: Validate Core CLI Entrypoints
+        run: |
+          python -m hrm_flash.cli --help >/dev/null
+          python -m hrm_flash.cli serve --help >/dev/null
+          python -m hrm_flash.cli router --help >/dev/null
+          python -m hrm_flash.cli generate --help >/dev/null
+
+      - name: Run Post-Install Regression Smoke Checks
+        run: |
+          python -m unittest tests.test_regressions -v
+          bash scripts/test_topology_detection.sh
