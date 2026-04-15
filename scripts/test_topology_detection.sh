@@ -6,9 +6,29 @@ TMP_DIR="$ROOT_DIR/.run/test_topology_detection.$$"
 FAKE_BIN="$TMP_DIR/bin"
 MODEL_DIR="$TMP_DIR/model"
 LOG_DIR="$TMP_DIR/logs"
+HW_FILE="$TMP_DIR/hw_selection.env"
+HW_FILE_FALLBACK="$TMP_DIR/hw_selection_fallback.env"
 
 mkdir -p "$FAKE_BIN" "$MODEL_DIR" "$LOG_DIR"
 touch "$MODEL_DIR/router_index.bin" "$MODEL_DIR/index.sqlite"
+cat > "$HW_FILE" <<'EOF'
+HW_POOL_VERSION=1
+HW_CPU_PLATFORM="xeon_e5-2680_v4_256gb_ddr4"
+HW_GPU_2080TI_11GB_COUNT=2
+HW_GPU_2080TI_22GB_COUNT=1
+HW_GPU_3080TI_10GB_COUNT=1
+HW_REQUIRE_NVLINK_11GB_PAIR=1
+HW_MODEL_QUANT="q8"
+EOF
+cat > "$HW_FILE_FALLBACK" <<'EOF'
+HW_POOL_VERSION=1
+HW_CPU_PLATFORM="xeon_e5-2680_v4_256gb_ddr4"
+HW_GPU_2080TI_11GB_COUNT=2
+HW_GPU_2080TI_22GB_COUNT=1
+HW_GPU_3080TI_10GB_COUNT=1
+HW_REQUIRE_NVLINK_11GB_PAIR=0
+HW_MODEL_QUANT="q8"
+EOF
 
 cleanup_all() {
   cleanup_pids || true
@@ -77,7 +97,7 @@ run_and_capture() {
   local extra_env="$1"
   set +e
   # shellcheck disable=SC2086
-  out=$(env PATH="$FAKE_BIN:$PATH" HRM_FLASH_BIN="$FAKE_BIN/hrm-flash" LOG_DIR="$LOG_DIR" STARTUP_WAIT_TIMEOUT_S=1 STARTUP_POLL_INTERVAL_S=1 $extra_env \
+  out=$(env PATH="$FAKE_BIN:$PATH" HRM_FLASH_BIN="$FAKE_BIN/hrm-flash" HW_SELECTION_FILE="$HW_FILE" LOG_DIR="$LOG_DIR" STARTUP_WAIT_TIMEOUT_S=1 STARTUP_POLL_INTERVAL_S=1 $extra_env \
     bash "$ROOT_DIR/scripts/start_native_topology.sh" "$MODEL_DIR" auto 2>&1)
   code=$?
   set -e
@@ -94,7 +114,7 @@ output_mismatch="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 GPU_NVLINK_PAIR=0,1" |
 cleanup_pids
 echo "$output_mismatch" | grep -q "mismatches detected NVLink pair=1,2"
 
-output_no_nvlink="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 FAKE_NO_NVLINK=1" || true)"
+output_no_nvlink="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 FAKE_NO_NVLINK=1 HW_SELECTION_FILE=$HW_FILE_FALLBACK" || true)"
 cleanup_pids
 echo "$output_no_nvlink" | grep -q "\[warn\] no NVLink pair detected; using PCIe pair fallback: 1,2"
 echo "$output_no_nvlink" | grep -q "\[gpu-map\] profile=auto gpu_count=4 detected pair=1,2 link=PCIE nvlink_detected=0 solo_22gb=0 solo_3080=3 strict=1"
@@ -105,6 +125,6 @@ echo "$output_require_nvlink" | grep -q "ERR: no NVLink pair detected, but REQUI
 
 output_profile_c_no_nvlink="$(run_and_capture "STRICT_GPU_TOPOLOGY=1 HW_BASE_PROFILE=C FAKE_NO_NVLINK=1" || true)"
 cleanup_pids
-echo "$output_profile_c_no_nvlink" | grep -q "HW profile C requires NVLink between the two 11GB cards"
+echo "$output_profile_c_no_nvlink" | grep -q "conflicts with selected hardware pool"
 
 echo "[ok] topology detection + strict validation + PCIe fallback"

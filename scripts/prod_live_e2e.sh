@@ -13,8 +13,8 @@ set -euo pipefail
 #
 # Environment knobs:
 #   RUN_BOOTSTRAP=1|0         default: 1
-#   EXPECTED_GPUS=<int>       default: 3
-#   TOPOLOGY_MODE             default: max_model_fast
+#   EXPECTED_GPUS=<int>       default: selected hardware pool size
+#   TOPOLOGY_MODE             default: selected hardware derived topology
 #   ROUTER_URL=<url>          default: http://127.0.0.1:8090
 #   ROUTER_MODE               default: mixed (retrieval|mixed|deepseek_only)
 #   RUN_MODE_MATRIX=1|0       default: 1 (1 = test mixed+retrieval+deepseek_only)
@@ -43,10 +43,23 @@ fi
 
 HRM_MODEL="$1"
 FINAL_PROMPT="${2:-Bitte antworte auf Deutsch in 3 kurzen Bulletpoints: 1) Stack-Status 2) Kernaussage 3) Route-Hinweis.}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+HW_LIB="$ROOT_DIR/scripts/hw_profile_lib.sh"
+
+if [[ ! -f "$HW_LIB" ]]; then
+  echo "ERR: missing hardware profile helper: $HW_LIB" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$HW_LIB"
+load_hw_selection_or_die
+derive_hw_runtime_flags
+print_hw_selection_summary
 
 RUN_BOOTSTRAP="${RUN_BOOTSTRAP:-1}"
-EXPECTED_GPUS="${EXPECTED_GPUS:-3}"
-TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
+EXPECTED_GPUS="${EXPECTED_GPUS:-$HW_GPU_TOTAL}"
+TOPOLOGY_MODE="${TOPOLOGY_MODE:-$HW_DERIVED_TOPOLOGY_MODE}"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:8090}"
 ROUTER_MODE="${ROUTER_MODE:-mixed}"
 RUN_MODE_MATRIX="${RUN_MODE_MATRIX:-1}"
@@ -78,7 +91,7 @@ if [[ "$RUN_MODE_MATRIX" == "0" ]]; then
   esac
 fi
 if [[ "$EXPECT_SOLO_3080" == "auto" ]]; then
-  EXPECT_SOLO_3080="${ENABLE_SOLO_3080:-0}"
+  EXPECT_SOLO_3080="$HW_DERIVED_ENABLE_SOLO_3080"
 fi
 case "$EXPECT_SOLO_3080" in
   0|1) ;;
@@ -88,14 +101,12 @@ case "$EXPECT_SOLO_3080" in
     ;;
 esac
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/.run/services}"
 PREFLIGHT_SCRIPT="${PREFLIGHT_SCRIPT:-$SCRIPT_DIR/prod_preflight.sh}"
 START_STACK_SCRIPT="${START_STACK_SCRIPT:-$SCRIPT_DIR/start_native_stack.sh}"
 STOP_STACK_SCRIPT="${STOP_STACK_SCRIPT:-$SCRIPT_DIR/stop_native_stack.sh}"
 PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
-if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
+if [[ "$TOPOLOGY_MODE" == "max_model_fast" || "$TOPOLOGY_MODE" == "single_lane" ]]; then
   PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-$PORT_SOLO_22GB}"
 else
   PORT_NVLINK_PAIR="${PORT_NVLINK_PAIR:-8082}"

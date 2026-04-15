@@ -16,15 +16,39 @@
 
 set -euo pipefail
 
-WORKDIR="${WORKDIR:-$PWD}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+HW_LIB="$ROOT_DIR/scripts/hw_profile_lib.sh"
+
+if [[ ! -f "$HW_LIB" ]]; then
+  echo "ERR: missing hardware profile helper: $HW_LIB" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$HW_LIB"
+load_hw_selection_or_die
+derive_hw_runtime_flags
+
+WORKDIR="${WORKDIR:-$ROOT_DIR}"
 PYTHON="${PYTHON:-python3}"
 MODEL_REPO="${MODEL_REPO:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
-MODEL_BIN="${MODEL_BIN:-model_q8.bin}"
+MODEL_QUANT="${MODEL_QUANT:-$HW_DERIVED_MODEL_QUANT}"
+MODEL_BIN="${MODEL_BIN:-model_${MODEL_QUANT}.bin}"
 ENGINE_BIN="${ENGINE_BIN:-$WORKDIR/.run/bin/deepseek_engine}"
 SM="${SM:-75}"  # Backward-compatible single-arch override.
-CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-75,86}"  # Comma-separated list, e.g. "75,86"
+CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-$HW_DERIVED_CUDA_ARCH_LIST}"  # Comma-separated list, e.g. "75,86"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 SKIP_RUN="${SKIP_RUN:-0}"
+
+if [[ "$MODEL_QUANT" != "$HW_DERIVED_MODEL_QUANT" ]]; then
+  echo "ERR: MODEL_QUANT=$MODEL_QUANT conflicts with selected hardware pool ($HW_DERIVED_MODEL_QUANT)." >&2
+  exit 2
+fi
+if [[ "$CUDA_ARCH_LIST" != "$HW_DERIVED_CUDA_ARCH_LIST" ]]; then
+  echo "ERR: CUDA_ARCH_LIST=$CUDA_ARCH_LIST conflicts with selected hardware pool ($HW_DERIVED_CUDA_ARCH_LIST)." >&2
+  exit 2
+fi
+print_hw_selection_summary
 
 cd "$WORKDIR"
 

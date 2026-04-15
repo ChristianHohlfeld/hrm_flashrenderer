@@ -47,13 +47,9 @@ def ensure_deepseek_model(
     project_root: Path | None = None,
 ) -> tuple[Path, str]:
     model_quant = str(model_quant).strip().lower()
-    if model_quant not in {"q8", "q4"}:
-        raise RuntimeError(f"unsupported model_quant='{model_quant}' (supported: q8, q4)")
-    if model_quant == "q4":
+    if model_quant != "q8":
         raise RuntimeError(
-            "model_quant=q4 is not enabled in production runtime yet "
-            "(native q4 CUDA kernels are not finalized in mainline). "
-            "Use model_quant=q8 for now."
+            f"unsupported model_quant='{model_quant}' (supported: q8 only; native q4 is not enabled in production mainline)"
         )
 
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
@@ -105,29 +101,37 @@ def build_deepseek_engine_if_needed(
     model_quant: str = "q8",
     force_rebuild: bool = False,
 ) -> None:
+    build_sh = repo_root / "scripts" / "build_deepseek_native.sh"
     run_candidates = [
         repo_root / "scripts" / "deepseek_native_engine.sh",
         repo_root / "experiments" / "deepseek_int" / "run.sh",  # legacy fallback
     ]
-    run_sh = None
-    for c in run_candidates:
-        if c.is_file():
-            run_sh = c
-            break
-    if run_sh is None:
+    run_sh = next((c for c in run_candidates if c.is_file()), None)
+    if not build_sh.is_file() and run_sh is None:
         return
     engine_bin = repo_root / ".run" / "bin" / "deepseek_engine"
     if engine_bin.is_file() and not force_rebuild:
         return
 
     env = os.environ.copy()
+    env["MODEL_QUANT"] = str(model_quant).strip().lower()
+    env["ENGINE_BIN"] = str(engine_bin)
+    env["FORCE_REBUILD"] = "1" if force_rebuild else "0"
+    if build_sh.is_file():
+        # Preferred path: enforces mandatory HW selection and rebuild signature checks.
+        subprocess.run(
+            ["bash", str(build_sh), model_source, str(model_bin)],
+            cwd=str(repo_root),
+            env=env,
+            check=True,
+        )
+        return
+
+    # Legacy fallback (kept for compatibility with older layouts).
     env["WORKDIR"] = str(repo_root)
     env["MODEL_REPO"] = model_source
     env["MODEL_BIN"] = str(model_bin)
-    env["MODEL_QUANT"] = str(model_quant).strip().lower()
-    env["ENGINE_BIN"] = str(engine_bin)
     env["SKIP_RUN"] = "1"
-    env["FORCE_REBUILD"] = "1" if force_rebuild else "0"
     subprocess.run(
         ["bash", str(run_sh)],
         cwd=str(repo_root),

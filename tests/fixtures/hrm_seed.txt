@@ -1,0 +1,3 @@
+HRM integration seed corpus.
+This file is used to generate router_index.bin and index.sqlite for tests.
+DeepSeek-only, mixed and retrieval modes are supported.

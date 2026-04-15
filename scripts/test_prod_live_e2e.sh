@@ -5,8 +5,18 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${ROOT_DIR}/.run/test_prod_live_e2e.XXXXXX")"
 MODEL_DIR="$TMP_DIR/model"
 LOG_DIR="$TMP_DIR/logs"
+HW_FILE="$TMP_DIR/hw_selection.env"
 mkdir -p "$MODEL_DIR" "$LOG_DIR"
 touch "$MODEL_DIR/router_index.bin" "$MODEL_DIR/index.sqlite"
+cat > "$HW_FILE" <<'EOF'
+HW_POOL_VERSION=1
+HW_CPU_PLATFORM="xeon_e5-2680_v4_256gb_ddr4"
+HW_GPU_2080TI_11GB_COUNT=2
+HW_GPU_2080TI_22GB_COUNT=1
+HW_GPU_3080TI_10GB_COUNT=1
+HW_REQUIRE_NVLINK_11GB_PAIR=1
+HW_MODEL_QUANT="q8"
+EOF
 
 cleanup() {
   if [[ -n "${MOCK_PID:-}" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
@@ -90,6 +100,7 @@ run_e2e() {
   local mode="${3:-mixed}"
   local run_matrix="${4:-0}"
   RUN_BOOTSTRAP=0 \
+  HW_SELECTION_FILE="$HW_FILE" \
   EXPECTED_GPUS=4 \
   AUTO_STOP=1 \
   ALLOW_EMPTY_SOURCES="$allow_empty" \

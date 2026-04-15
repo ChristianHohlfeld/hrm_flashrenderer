@@ -8,7 +8,7 @@ Mainline scope is intentionally strict:
 - backend fixed to `deepseek_int8`
 - supported generation models fixed to:
   - `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
-  - `deepseek-ai/DeepSeek-R1-Distill-Llama-70B` (recommended with `MODEL_QUANT=q4`)
+  - `deepseek-ai/DeepSeek-R1-Distill-Llama-70B`
 
 ## Platform And Prerequisites
 
@@ -26,11 +26,80 @@ Required only when bootstrap/build is enabled:
 - `ctest`
 - C/C++ toolchain (`build-essential` on Ubuntu)
 
+SQLite note:
+- no `libsqlite3-dev` is required for this repo test/build path
+- `hrm_core` automatically falls back to runtime `libsqlite3.so.0` with a bundled compat header
+
 Python dependencies are kept lean:
 - `requirements.prod.txt`: `numpy`, `huggingface_hub`, `transformers`, `safetensors`
 - `requirements.server.txt`: `fastapi`, `uvicorn`, `pydantic`
 
+## Quick Start (3 Commands)
+
+If your machine is the default target (`1x22GB + 2x11GB NVLink`):
+
+```bash
+bash scripts/hw_select.sh
+bash scripts/start_native_stack.sh ./model_index auto
+curl -s http://127.0.0.1:8090/v1/health
+```
+
+If the health check returns `"ok": true`, the stack is ready.
+
+Stop:
+
+```bash
+bash scripts/stop_native_stack.sh
+```
+
+When hardware changes later:
+1. `bash scripts/stop_native_stack.sh`
+2. `bash scripts/hw_select.sh ...` (new pool)
+3. `bash scripts/start_native_stack.sh ./model_index auto`
+
 ## First-User Path (Recommended)
+
+## Mandatory Hardware Selection (Before Build/Start)
+
+Before running any native build/start script, you must select the active hardware pool once.
+Default (no args) is now:
+- `1x RTX 2080 Ti 22GB`
+- `2x RTX 2080 Ti 11GB`
+- `0x RTX 3080 Ti 10GB`
+- `require_nvlink_11gb_pair=1`
+
+```bash
+bash scripts/hw_select.sh
+```
+
+Explicit override example:
+
+```bash
+bash scripts/hw_select.sh \
+  --gpu-2080ti-11gb 2 \
+  --gpu-2080ti-22gb 1 \
+  --gpu-3080ti-10gb 0 \
+  --require-nvlink-11gb-pair 1 \
+  --model-quant q8
+```
+
+This writes `.hw_selection.env` and is now enforced by:
+- `scripts/build_deepseek_native.sh`
+- `scripts/start_native_topology.sh`
+- `scripts/start_native_stack.sh`
+- `scripts/prod_preflight.sh`
+- `scripts/prod_live_e2e.sh`
+- `scripts/deepseek_native_engine.sh`
+
+When GPUs change later:
+1. `bash scripts/stop_native_stack.sh`
+2. re-run `scripts/hw_select.sh` with the new counts
+3. run start/build again
+
+Engine compile safety on HW changes:
+- build now writes a compile stamp (`.run/bin/deepseek_engine.build.env`)
+- if selected HW/arch/quant/engine source changed, rebuild is forced automatically
+- manual `FORCE_REBUILD=1` is still supported
 
 If you already have an HRM index at `./model_index` (`router_index.bin` + `index.sqlite`), run:
 
@@ -51,8 +120,8 @@ Success marker:
 - `E2E PASS: DeepSeek stack started and mode checks passed.`
 
 Default E2E assumptions:
-- `EXPECTED_GPUS=3`
-- `TOPOLOGY_MODE=max_model_fast`
+- `EXPECTED_GPUS` derived from selected HW pool (`.hw_selection.env`)
+- `TOPOLOGY_MODE` derived from selected HW pool (`max_model_fast` or `single_lane`)
 - `ROUTER_MODE=mixed`
 - `RUN_MODE_MATRIX=1`
 
@@ -61,19 +130,20 @@ Default E2E assumptions:
 One-command startup with fixed profiles:
 
 ```bash
-# Usage: scripts/start_easy.sh <hrm_model_dir> [A|B|C|D] [q8|q4]
+# Usage: scripts/start_easy.sh <hrm_model_dir> [A|B|C|D] [q8]
 bash scripts/start_easy.sh ./model_index A q8
 ```
+
+`start_easy.sh` writes the matching hardware selection automatically before stack startup.
 
 Preset matrix:
 - `A`: `22GB + 11GB + 11GB`, no NVLink required, no dedicated 3080 lane
 - `B`: `22GB + 11GB + 11GB + 10GB`, no NVLink required, dedicated 3080 lane enabled
-- `C`: `22GB + 11GB + 11GB + 10GB`, NVLink required on 11GB pair, dedicated 3080 lane enabled
+- `C`: same GPU pool as `B`, but startup enforces NVLink pair (`REQUIRE_NVLINK=1`)
 - `D`: `22GB + 22GB + 11GB + 11GB`, no dedicated 3080 lane
 
-Quant defaults:
-- `q8` -> defaults to 32B (`DeepSeek-R1-Distill-Qwen-32B`)
-- `q4` -> defaults to 70B (`DeepSeek-R1-Distill-Llama-70B`)
+Quant:
+- `q8` only (native q4 is not enabled in production mainline)
 
 ## Topology Behavior (Production Defaults)
 
@@ -184,10 +254,10 @@ Bootstrap once (optional but recommended on fresh host):
 PROFILE=deepseek_int8 bash scripts/bootstrap.sh
 ```
 
-Preflight (default production expectation is 3 GPUs):
+Preflight (expected GPU count derives from selected HW pool):
 
 ```bash
-bash scripts/prod_preflight.sh ./model_index 3
+bash scripts/prod_preflight.sh ./model_index
 ```
 
 Start stack:
@@ -226,7 +296,7 @@ Outputs:
 - `summary.txt`
 
 For reproducibility across runs, keep these fixed:
-- same model quant (`q8` or `q4`)
+- same model quant (`q8`)
 - same hardware profile (`A|B|C|D`)
 - same route hints/scenarios/repeats
 - same running stack revision
@@ -238,6 +308,17 @@ Fast mode logic checks:
 ```bash
 python -m unittest tests.test_modes tests.test_serve_modes tests.test_router_logic tests.test_router_source_transparency
 ```
+
+Full Python suite (includes `tests.test_hrm_api` integration, no skip path):
+
+```bash
+python -m unittest discover -s tests -p "test*.py" -v
+```
+
+`tests.test_hrm_api` now auto-builds missing prerequisites:
+- `hrm_core/build/libhrm_api.so`
+- `.run/test_artifacts/model_min/router_index.bin`
+- `.run/test_artifacts/model_min/index.sqlite`
 
 Full repo test script:
 

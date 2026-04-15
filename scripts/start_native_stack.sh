@@ -10,12 +10,13 @@ set -euo pipefail
 #
 # Important env vars (optional):
 #   BACKEND (default: deepseek_int8)
-#   TOPOLOGY_MODE (default: max_model_fast; supported: max_model_fast, hetero_3lane)
+#   TOPOLOGY_MODE (derived from mandatory hw selection; supported: max_model_fast, hetero_3lane, single_lane)
 #   MODEL_PROFILE (default: max_vram_hetero for auto mode)
 #   HW_BASE_PROFILE (default: auto; auto|A|B|C|D hardware presets)
 #   LLM_MODEL_SOLO_22GB / LLM_MODEL_NVLINK_PAIR / LLM_MODEL_SOLO_3080
 #   LLM_MODEL_TRIPLE_MAX
 #   ENABLE_SOLO_3080 (default: derived from HW_BASE_PROFILE; set 1 to force dedicated 3080 lane)
+#   REQUIRE_NVLINK (default: derived from hardware selection; set 1 to fail startup if no NVLink pair is detected)
 #   STRICT_GPU_TOPOLOGY (default: 1, enforced by start_native_topology.sh)
 #   PORT_SOLO_22GB, PORT_NVLINK_PAIR, PORT_SOLO_3080
 #   ROUTER_HOST, ROUTER_PORT
@@ -43,15 +44,22 @@ DEFAULT_LLM_MODEL="${2:-auto}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+HW_LIB="$ROOT_DIR/scripts/hw_profile_lib.sh"
+
+if [[ ! -f "$HW_LIB" ]]; then
+  echo "ERR: missing hardware profile helper: $HW_LIB" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$HW_LIB"
+load_hw_selection_or_die
+derive_hw_runtime_flags
 
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/.run/services}"
 mkdir -p "$LOG_DIR"
 BACKEND="${BACKEND:-deepseek_int8}"
-TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"
 PREPARE_MODELS="${PREPARE_MODELS:-1}"
 MODEL_PROFILE="${MODEL_PROFILE:-max_vram_hetero}"
-HW_BASE_PROFILE="${HW_BASE_PROFILE:-auto}"
-MODEL_QUANT="${MODEL_QUANT:-q8}"
 STRICT_GPU_TOPOLOGY="${STRICT_GPU_TOPOLOGY:-1}"
 STARTUP_WAIT_TIMEOUT_S="${STARTUP_WAIT_TIMEOUT_S:-240}"
 STARTUP_POLL_INTERVAL_S="${STARTUP_POLL_INTERVAL_S:-2}"
@@ -64,16 +72,39 @@ if [[ -z "${STARTUP_POLL_INTERVAL_S:-}" || "$STARTUP_POLL_INTERVAL_S" -lt 1 ]]; 
   STARTUP_POLL_INTERVAL_S=2
 fi
 
+TOPOLOGY_MODE="${TOPOLOGY_MODE:-$HW_DERIVED_TOPOLOGY_MODE}"
+if [[ "$TOPOLOGY_MODE" != "$HW_DERIVED_TOPOLOGY_MODE" ]]; then
+  echo "ERR: TOPOLOGY_MODE=$TOPOLOGY_MODE conflicts with selected hardware pool ($HW_DERIVED_TOPOLOGY_MODE)." >&2
+  exit 2
+fi
+HW_BASE_PROFILE="${HW_BASE_PROFILE:-$HW_DERIVED_HW_BASE_PROFILE}"
+if [[ "$HW_BASE_PROFILE" != "$HW_DERIVED_HW_BASE_PROFILE" ]]; then
+  echo "ERR: HW_BASE_PROFILE=$HW_BASE_PROFILE conflicts with selected hardware pool ($HW_DERIVED_HW_BASE_PROFILE)." >&2
+  exit 2
+fi
+MODEL_QUANT="${MODEL_QUANT:-$HW_DERIVED_MODEL_QUANT}"
+ENABLE_SOLO_3080="${ENABLE_SOLO_3080:-$HW_DERIVED_ENABLE_SOLO_3080}"
+REQUIRE_NVLINK="${REQUIRE_NVLINK:-$HW_DERIVED_REQUIRE_NVLINK}"
+if [[ "$ENABLE_SOLO_3080" != "$HW_DERIVED_ENABLE_SOLO_3080" ]]; then
+  echo "ERR: ENABLE_SOLO_3080=$ENABLE_SOLO_3080 conflicts with selected hardware pool ($HW_DERIVED_ENABLE_SOLO_3080)." >&2
+  exit 2
+fi
+if [[ "$REQUIRE_NVLINK" != "$HW_DERIVED_REQUIRE_NVLINK" ]]; then
+  echo "ERR: REQUIRE_NVLINK=$REQUIRE_NVLINK conflicts with selected hardware pool ($HW_DERIVED_REQUIRE_NVLINK)." >&2
+  exit 2
+fi
+print_hw_selection_summary
+
 if [[ "$BACKEND" != "deepseek_int8" ]]; then
   echo "ERR: BACKEND=$BACKEND is not supported in production mainline. Use deepseek_int8." >&2
   exit 2
 fi
-if [[ "$MODEL_QUANT" != "q8" && "$MODEL_QUANT" != "q4" ]]; then
-  echo "ERR: unsupported MODEL_QUANT=$MODEL_QUANT (supported: q8, q4)." >&2
+if [[ "$MODEL_QUANT" != "q8" ]]; then
+  echo "ERR: unsupported MODEL_QUANT=$MODEL_QUANT (supported: q8 only in production mainline)." >&2
   exit 2
 fi
-if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" ]]; then
-  echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane)." >&2
+if [[ "$TOPOLOGY_MODE" != "max_model_fast" && "$TOPOLOGY_MODE" != "hetero_3lane" && "$TOPOLOGY_MODE" != "single_lane" ]]; then
+  echo "ERR: unsupported TOPOLOGY_MODE=$TOPOLOGY_MODE (supported: max_model_fast, hetero_3lane, single_lane)." >&2
   exit 2
 fi
 
@@ -127,13 +158,8 @@ RECO_MODEL_SOLO_22GB="${RECO_MODEL_SOLO_22GB:-deepseek-ai/DeepSeek-R1-Distill-Qw
 RECO_MODEL_NVLINK_PAIR="${RECO_MODEL_NVLINK_PAIR:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
 RECO_MODEL_SOLO_3080="${RECO_MODEL_SOLO_3080:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
 RECO_MODEL_TRIPLE_MAX_Q8="${RECO_MODEL_TRIPLE_MAX_Q8:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"
-RECO_MODEL_TRIPLE_MAX_Q4="${RECO_MODEL_TRIPLE_MAX_Q4:-deepseek-ai/DeepSeek-R1-Distill-Llama-70B}"
 if [[ -z "${RECO_MODEL_TRIPLE_MAX:-}" ]]; then
-  if [[ "$MODEL_QUANT" == "q4" ]]; then
-    RECO_MODEL_TRIPLE_MAX="$RECO_MODEL_TRIPLE_MAX_Q4"
-  else
-    RECO_MODEL_TRIPLE_MAX="$RECO_MODEL_TRIPLE_MAX_Q8"
-  fi
+  RECO_MODEL_TRIPLE_MAX="$RECO_MODEL_TRIPLE_MAX_Q8"
 fi
 
 use_profile=0
@@ -160,10 +186,17 @@ if [[ "$use_profile" == "1" ]]; then
     LLM_MODEL_SOLO_22GB="$LLM_MODEL_TRIPLE_MAX"
     LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_TRIPLE_MAX"
     DEFAULT_LLM_MODEL="$LLM_MODEL_TRIPLE_MAX"
-  else
+  elif [[ "$TOPOLOGY_MODE" == "hetero_3lane" ]]; then
     LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$RECO_MODEL_SOLO_22GB}"
     LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$RECO_MODEL_NVLINK_PAIR}"
     LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$RECO_MODEL_SOLO_3080}"
+    DEFAULT_LLM_MODEL="$LLM_MODEL_SOLO_22GB"
+  else
+    LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$RECO_MODEL_SOLO_22GB}"
+    LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_SOLO_22GB"
+    LLM_MODEL_SOLO_3080="$LLM_MODEL_SOLO_22GB"
+    PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
+    PORT_SOLO_3080="$PORT_SOLO_22GB"
     DEFAULT_LLM_MODEL="$LLM_MODEL_SOLO_22GB"
   fi
 else
@@ -173,10 +206,16 @@ else
     PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
     LLM_MODEL_SOLO_22GB="$LLM_MODEL_TRIPLE_MAX"
     LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_TRIPLE_MAX"
-  else
+  elif [[ "$TOPOLOGY_MODE" == "hetero_3lane" ]]; then
     LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}"
     LLM_MODEL_NVLINK_PAIR="${LLM_MODEL_NVLINK_PAIR:-$DEFAULT_LLM_MODEL}"
     LLM_MODEL_SOLO_3080="${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}"
+  else
+    LLM_MODEL_SOLO_22GB="${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}"
+    LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_SOLO_22GB"
+    LLM_MODEL_SOLO_3080="$LLM_MODEL_SOLO_22GB"
+    PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
+    PORT_SOLO_3080="$PORT_SOLO_22GB"
   fi
 fi
 
@@ -188,20 +227,17 @@ case "${HW_BASE_PROFILE,,}" in
     ;;
 esac
 
-if [[ -z "${ENABLE_SOLO_3080+x}" ]]; then
-  case "${HW_BASE_PROFILE,,}" in
-    b|option_b|c|option_c)
-      ENABLE_SOLO_3080="1"
-      ;;
-    *)
-      ENABLE_SOLO_3080="0"
-      ;;
-  esac
-fi
 case "$ENABLE_SOLO_3080" in
   0|1) ;;
   *)
     echo "ERR: ENABLE_SOLO_3080 must be 0 or 1 (got: $ENABLE_SOLO_3080)." >&2
+    exit 2
+    ;;
+esac
+case "$REQUIRE_NVLINK" in
+  0|1) ;;
+  *)
+    echo "ERR: REQUIRE_NVLINK must be 0 or 1 (got: $REQUIRE_NVLINK)." >&2
     exit 2
     ;;
 esac
@@ -232,11 +268,13 @@ validate_supported_model() {
 
 if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
   validate_supported_model "LLM_MODEL_TRIPLE_MAX" "$LLM_MODEL_SOLO_22GB"
-else
+elif [[ "$TOPOLOGY_MODE" == "hetero_3lane" ]]; then
   validate_supported_model "LLM_MODEL_SOLO_22GB" "$LLM_MODEL_SOLO_22GB"
   validate_supported_model "LLM_MODEL_NVLINK_PAIR" "$LLM_MODEL_NVLINK_PAIR"
+else
+  validate_supported_model "LLM_MODEL_SOLO_22GB" "$LLM_MODEL_SOLO_22GB"
 fi
-if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
+if [[ "$TOPOLOGY_MODE" != "single_lane" && "$ENABLE_SOLO_3080" == "1" ]]; then
   validate_supported_model "LLM_MODEL_SOLO_3080" "$LLM_MODEL_SOLO_3080"
 fi
 
@@ -244,14 +282,21 @@ if [[ "$ENABLE_SOLO_3080" == "0" ]]; then
   # Keep router fast lane alive without forcing a <32B model on 10GB.
   PORT_SOLO_3080="$PORT_SOLO_22GB"
 fi
+if [[ "$TOPOLOGY_MODE" == "single_lane" ]]; then
+  PORT_NVLINK_PAIR="$PORT_SOLO_22GB"
+  PORT_SOLO_3080="$PORT_SOLO_22GB"
+fi
 
 echo "[stack] backend=$BACKEND topology_mode=$TOPOLOGY_MODE profile=$MODEL_PROFILE hw_base_profile=${HW_BASE_PROFILE,,} auto_profile=$use_profile quant=$MODEL_QUANT"
+echo "[stack] nvlink requirement: REQUIRE_NVLINK=$REQUIRE_NVLINK"
 if [[ "$TOPOLOGY_MODE" == "max_model_fast" ]]; then
   if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
     echo "[stack] max_model_fast: route default targets max-model lane; route_hint=fast uses dedicated 3080 lane"
   else
     echo "[stack] max_model_fast: route default targets max-model lane; route_hint=fast aliases to max-model lane (solo_3080 disabled)"
   fi
+elif [[ "$TOPOLOGY_MODE" == "single_lane" ]]; then
+  echo "[stack] single_lane: all logical routes alias to solo_22gb"
 fi
 echo "[stack] models: solo_22gb=$LLM_MODEL_SOLO_22GB nvlink_pair=$LLM_MODEL_NVLINK_PAIR solo_3080=$LLM_MODEL_SOLO_3080"
 
@@ -317,12 +362,14 @@ if [[ "$BACKEND" == "deepseek_int8" && "$PREPARE_MODELS" == "1" ]]; then
     if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
       build_one "${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_3080:-}"
     fi
-  else
+  elif [[ "$TOPOLOGY_MODE" == "hetero_3lane" ]]; then
     build_one "${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_22GB:-}"
     build_one "${LLM_MODEL_NVLINK_PAIR:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_NVLINK_PAIR:-}"
     if [[ "$ENABLE_SOLO_3080" == "1" ]]; then
       build_one "${LLM_MODEL_SOLO_3080:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_3080:-}"
     fi
+  else
+    build_one "${LLM_MODEL_SOLO_22GB:-$DEFAULT_LLM_MODEL}" "${MODEL_BIN_SOLO_22GB:-}"
   fi
 fi
 
@@ -332,6 +379,7 @@ HW_BASE_PROFILE="$HW_BASE_PROFILE" \
 TOPOLOGY_MODE="$TOPOLOGY_MODE" \
 MODEL_QUANT="$MODEL_QUANT" \
 ENABLE_SOLO_3080="$ENABLE_SOLO_3080" \
+REQUIRE_NVLINK="$REQUIRE_NVLINK" \
 STRICT_GPU_TOPOLOGY="$STRICT_GPU_TOPOLOGY" \
 LLM_MODEL_SOLO_22GB="$LLM_MODEL_SOLO_22GB" \
 LLM_MODEL_NVLINK_PAIR="$LLM_MODEL_NVLINK_PAIR" \
@@ -413,9 +461,13 @@ Logs: $LOG_DIR
 
 Services:
   solo_22gb   -> http://127.0.0.1:$PORT_SOLO_22GB/v1/health
-  nvlink_pair -> http://127.0.0.1:$PORT_NVLINK_PAIR/v1/health
+  nvlink_pair -> http://127.0.0.1:$PORT_NVLINK_PAIR/v1/health$(
+if [[ "$TOPOLOGY_MODE" == "single_lane" ]]; then
+  printf ' (alias to solo_22gb)'
+fi
+)
   solo_3080   -> http://127.0.0.1:$PORT_SOLO_3080/v1/health$(
-if [[ "$ENABLE_SOLO_3080" == "0" ]]; then
+if [[ "$TOPOLOGY_MODE" == "single_lane" || "$ENABLE_SOLO_3080" == "0" ]]; then
   printf ' (alias to max-model lane)'
 fi
 )

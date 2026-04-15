@@ -22,11 +22,6 @@ Default production mode (`TOPOLOGY_MODE=max_model_fast`) prioritizes model size:
 - fast lane (`solo_3080`): `world=1` on `10GB`
 - `nvlink_pair` remains a logical router lane alias to the same max-model endpoint
 
-Optional compatibility mode (`TOPOLOGY_MODE=hetero_3lane`):
-- `solo_22gb` (`world=1`)
-- `nvlink_pair` (`world=2`)
-- `solo_3080` (`world=1`)
-
 This repo already includes helper scripts:
 - `scripts/start_native_topology.sh`
 - `scripts/stop_native_topology.sh`
@@ -40,7 +35,7 @@ You can set per-service model overrides in `start_native_topology.sh`:
 
 Default `auto` profile (`MODEL_PROFILE=max_vram_hetero`, `TOPOLOGY_MODE=max_model_fast`):
 - max-model lane: `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
-- fast lane: `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`
+- fast lane: `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`
 
 GPU mapping is dynamically inferred (no static ordering assumptions):
 - Detect NVLink pair from `nvidia-smi topo -m`
@@ -51,16 +46,18 @@ GPU mapping is dynamically inferred (no static ordering assumptions):
 
 ## One-command startup
 
+Select hardware first (mandatory):
+
+```bash
+bash scripts/hw_select.sh
+```
+
+Default writes: `11gb=2`, `22gb=1`, `3080_10gb=0`, `require_nvlink_11gb_pair=1`, `quant=q8`.
+
 Start full topology plus router:
 
 ```bash
 bash scripts/start_native_stack.sh ./model_index auto
-```
-
-Optional legacy split:
-
-```bash
-TOPOLOGY_MODE=hetero_3lane bash scripts/start_native_stack.sh ./model_index auto
 ```
 
 Build/export native DeepSeek assets explicitly (optional, done automatically by
@@ -68,7 +65,7 @@ Build/export native DeepSeek assets explicitly (optional, done automatically by
 
 ```bash
 bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
-bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+bash scripts/build_deepseek_native.sh deepseek-ai/DeepSeek-R1-Distill-Llama-70B
 ```
 
 Engine binary default output:

@@ -15,7 +15,21 @@ if [[ $# -lt 1 ]]; then
 fi
 
 HRM_MODEL="$1"
-EXPECTED_GPUS="${2:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+HW_LIB="$ROOT_DIR/scripts/hw_profile_lib.sh"
+
+if [[ ! -f "$HW_LIB" ]]; then
+  echo "ERR: missing hardware profile helper: $HW_LIB" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$HW_LIB"
+load_hw_selection_or_die
+derive_hw_runtime_flags
+print_hw_selection_summary
+
+EXPECTED_GPUS="${2:-$HW_GPU_TOTAL}"
 
 fail() {
   echo "ERR: $*" >&2
@@ -90,8 +104,49 @@ if [[ "$gpu_count" -lt "$EXPECTED_GPUS" ]]; then
 fi
 echo "[preflight] gpu_count=$gpu_count"
 
-echo "[preflight] checking python deps (lean + server)..."
+echo "[preflight] validating selected GPU pool against live hardware..."
+HW11_EXPECT="$HW_GPU_2080TI_11GB_COUNT" \
+HW22_EXPECT="$HW_GPU_2080TI_22GB_COUNT" \
+HW10_EXPECT="$HW_GPU_3080TI_10GB_COUNT" \
 python3 - <<'PY'
+import os
+import subprocess
+
+exp11 = int(os.environ["HW11_EXPECT"])
+exp22 = int(os.environ["HW22_EXPECT"])
+exp10 = int(os.environ["HW10_EXPECT"])
+
+out = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
+    text=True,
+)
+mem = []
+for ln in out.splitlines():
+    ln = ln.strip()
+    if not ln:
+        continue
+    parts = [p.strip() for p in ln.split(",")]
+    if len(parts) < 2:
+        continue
+    mem.append(int(parts[1]))
+
+have22 = sum(1 for m in mem if m >= 20000)
+have11 = sum(1 for m in mem if 10500 <= m < 20000)
+have10 = sum(1 for m in mem if 9000 <= m < 10500)
+
+print(f"detected_pool: 11gb={have11} 22gb={have22} 10gb={have10}")
+print(f"selected_pool: 11gb={exp11} 22gb={exp22} 10gb={exp10}")
+if (have11, have22, have10) != (exp11, exp22, exp10):
+    raise SystemExit(
+        "selected hardware pool does not match detected GPUs; rerun scripts/hw_select.sh for the active machine config"
+    )
+PY
+
+if [[ "${SKIP_PY_DEPS_CHECK:-0}" == "1" ]]; then
+  echo "[preflight] skipping python deps check (SKIP_PY_DEPS_CHECK=1)"
+else
+  echo "[preflight] checking python deps (lean + server)..."
+  python3 - <<'PY'
 import importlib
 mods = ["numpy", "huggingface_hub", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic"]
 missing = []
@@ -104,6 +159,7 @@ if missing:
     raise SystemExit("missing python modules: " + ", ".join(missing))
 print("python deps OK")
 PY
+fi
 
 echo "[preflight] checking CLI entrypoints..."
 python3 -m hrm_flash.cli --help >/dev/null

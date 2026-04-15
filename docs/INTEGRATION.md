@@ -10,6 +10,12 @@ This repository is production-focused on:
 From repo root:
 
 ```bash
+bash scripts/hw_select.sh
+```
+
+Default writes: `11gb=2`, `22gb=1`, `3080_10gb=0`, `require_nvlink_11gb_pair=1`, `quant=q8`.
+
+```bash
 bash scripts/prod_live_e2e.sh ./model_index "Bitte antworte kurz und präzise."
 ```
 
@@ -23,12 +29,9 @@ After startup (`scripts/start_native_stack.sh`):
 - `solo_3080`: `http://127.0.0.1:8083/v1/health`
 - router: `http://127.0.0.1:8090/v1/health`
 
-Default mode is `TOPOLOGY_MODE=max_model_fast`:
-- max-model lane: DeepSeek 32B on `22GB + 11GB + 11GB` (world=3)
-- fast lane: DeepSeek 7B on `10GB` (world=1)
-
-Optional:
-- `TOPOLOGY_MODE=hetero_3lane` for explicit separate `22GB` / `11+11 NVLink` / `10GB` lanes.
+`TOPOLOGY_MODE` is derived from selected hardware:
+- `max_model_fast` for full pool lanes
+- `single_lane` for reduced pools
 
 Inference entrypoint:
 

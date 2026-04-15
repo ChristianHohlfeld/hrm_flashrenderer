@@ -5,9 +5,19 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "${ROOT_DIR}/.run/test_prod_preflight.XXXXXX")"
 FAKE_BIN="$TMP_DIR/bin"
 MODEL_DIR="$TMP_DIR/model"
+HW_FILE="$TMP_DIR/hw_selection.env"
 
 mkdir -p "$FAKE_BIN" "$MODEL_DIR"
 touch "$MODEL_DIR/router_index.bin" "$MODEL_DIR/index.sqlite"
+cat > "$HW_FILE" <<'EOF'
+HW_POOL_VERSION=1
+HW_CPU_PLATFORM="xeon_e5-2680_v4_256gb_ddr4"
+HW_GPU_2080TI_11GB_COUNT=2
+HW_GPU_2080TI_22GB_COUNT=1
+HW_GPU_3080TI_10GB_COUNT=1
+HW_REQUIRE_NVLINK_11GB_PAIR=1
+HW_MODEL_QUANT="q8"
+EOF
 
 cleanup() {
   rm -rf "$TMP_DIR" || true
@@ -65,7 +75,10 @@ EOF
 chmod +x "$FAKE_BIN/hrm"
 
 run_preflight() {
-  PATH="$FAKE_BIN:$PATH" bash "$ROOT_DIR/scripts/prod_preflight.sh" "$MODEL_DIR" "$1"
+  PATH="$FAKE_BIN:$PATH" \
+  HW_SELECTION_FILE="$HW_FILE" \
+  SKIP_PY_DEPS_CHECK=1 \
+  bash "$ROOT_DIR/scripts/prod_preflight.sh" "$MODEL_DIR" "$1"
 }
 
 echo "[test] preflight happy path"

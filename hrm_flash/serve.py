@@ -137,8 +137,8 @@ def main():
     ap.add_argument("--hrm_bin", default=None)
     ap.add_argument("--max_concurrent", type=int, default=1)
     ap.add_argument("--backend", type=str, choices=["deepseek_int8"], default="deepseek_int8")
-    ap.add_argument("--model_quant", type=str, choices=["q8", "q4"], default="q8", help="Native model quantization mode")
-    ap.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek model bin path (q8/q4)")
+    ap.add_argument("--model_quant", type=str, choices=["q8"], default="q8", help="Native model quantization mode (q8 only)")
+    ap.add_argument("--model_bin", type=str, default=None, help="Native DeepSeek model bin path (q8)")
     ap.add_argument("--tokenizer_model", type=str, default=None, help="Tokenizer source for deepseek_int8 backend")
     ap.add_argument("--native_engine_bin", type=str, default=None, help="Path to deepseek_engine binary")
     ap.add_argument("--native_startup_timeout_s", type=float, default=120.0)
@@ -315,4 +315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -160,18 +160,32 @@ class TestNativeProdRegressions(unittest.TestCase):
         stack_txt = _read_text(REPO_ROOT / "scripts" / "start_native_stack.sh")
         topo_txt = _read_text(REPO_ROOT / "scripts" / "start_native_topology.sh")
         e2e_txt = _read_text(REPO_ROOT / "scripts" / "prod_live_e2e.sh")
+        engine_txt = _read_text(REPO_ROOT / "scripts" / "deepseek_native_engine.sh")
 
-        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', stack_txt)
+        self.assertIn('source "$HW_LIB"', stack_txt)
+        self.assertIn('load_hw_selection_or_die', stack_txt)
+        self.assertIn('derive_hw_runtime_flags', stack_txt)
+        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-$HW_DERIVED_TOPOLOGY_MODE}"', stack_txt)
+        self.assertIn('REQUIRE_NVLINK="${REQUIRE_NVLINK:-$HW_DERIVED_REQUIRE_NVLINK}"', stack_txt)
         self.assertIn('RECO_MODEL_TRIPLE_MAX_Q8="${RECO_MODEL_TRIPLE_MAX_Q8:-deepseek-ai/DeepSeek-R1-Distill-Qwen-32B}"', stack_txt)
-        self.assertIn('RECO_MODEL_TRIPLE_MAX_Q4="${RECO_MODEL_TRIPLE_MAX_Q4:-deepseek-ai/DeepSeek-R1-Distill-Llama-70B}"', stack_txt)
+        self.assertIn('unsupported MODEL_QUANT=$MODEL_QUANT (supported: q8 only in production mainline).', stack_txt)
         self.assertIn('PORT_NVLINK_PAIR="$PORT_SOLO_22GB"', stack_txt)
-        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', topo_txt)
+        self.assertIn('source "$HW_LIB"', topo_txt)
+        self.assertIn('load_hw_selection_or_die', topo_txt)
+        self.assertIn('derive_hw_runtime_flags', topo_txt)
+        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-$HW_DERIVED_TOPOLOGY_MODE}"', topo_txt)
+        self.assertIn('REQUIRE_NVLINK="${REQUIRE_NVLINK:-$HW_DERIVED_REQUIRE_NVLINK}"', topo_txt)
         self.assertIn('MAX_SEQ_TRIPLE_MAX="${MAX_SEQ_TRIPLE_MAX:-3072}"', topo_txt)
         self.assertIn('PREFILL_TRIPLE_MAX="${PREFILL_TRIPLE_MAX:-512}"', topo_txt)
         self.assertIn('TRIPLE_DEVICES="$GPU_22GB,$GPU_NVLINK_PAIR"', topo_txt)
         self.assertIn('ALLOW_PCIE_PAIR_FALLBACK="${ALLOW_PCIE_PAIR_FALLBACK:-1}"', topo_txt)
-        self.assertIn('REQUIRE_NVLINK="${REQUIRE_NVLINK:-0}"', topo_txt)
-        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-max_model_fast}"', e2e_txt)
+        self.assertIn('REQUIRE_NVLINK="${REQUIRE_NVLINK:-$HW_DERIVED_REQUIRE_NVLINK}"', topo_txt)
+        self.assertIn('source "$HW_LIB"', e2e_txt)
+        self.assertIn('TOPOLOGY_MODE="${TOPOLOGY_MODE:-$HW_DERIVED_TOPOLOGY_MODE}"', e2e_txt)
+        self.assertIn('source "$HW_LIB"', engine_txt)
+        self.assertIn('load_hw_selection_or_die', engine_txt)
+        self.assertIn('CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-$HW_DERIVED_CUDA_ARCH_LIST}"', engine_txt)
+        self.assertIn('MODEL_QUANT="${MODEL_QUANT:-$HW_DERIVED_MODEL_QUANT}"', engine_txt)
 
     def test_silent_mode_defaults_are_enabled(self):
         cli_txt = _read_text(REPO_ROOT / "hrm_flash" / "cli.py")
@@ -195,6 +209,7 @@ class TestNativeProdRegressions(unittest.TestCase):
         topo_txt = _read_text(REPO_ROOT / "scripts" / "start_native_topology.sh")
         serve_txt = _read_text(REPO_ROOT / "scripts" / "serve.sh")
         gen_txt = _read_text(REPO_ROOT / "scripts" / "hrm_flash_generate.sh")
+        easy_txt = _read_text(REPO_ROOT / "scripts" / "start_easy.sh")
 
         self.assertIn('if [[ -n "${HRM_FLASH_BIN:-}" ]]; then', stack_txt)
         self.assertIn('HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)', stack_txt)
@@ -208,6 +223,9 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('if [[ -n "${HRM_FLASH_BIN:-}" ]]; then', gen_txt)
         self.assertIn('HRM_FLASH_CMD=("$PYTHON_BIN" -m hrm_flash.cli)', gen_txt)
         self.assertIn('"${HRM_FLASH_CMD[@]}" generate', gen_txt)
+        self.assertIn('bash "$SCRIPT_DIR/hw_select.sh"', easy_txt)
+        self.assertIn('--gpu-2080ti-11gb "$GPU11_COUNT"', easy_txt)
+        self.assertIn('--require-nvlink-11gb-pair "$REQUIRE_NVLINK"', easy_txt)
 
     def test_three_modes_are_wired_in_mainline(self):
         cli_txt = _read_text(REPO_ROOT / "hrm_flash" / "cli.py")
@@ -238,6 +256,12 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('modes = ["mixed", "retrieval", "deepseek_only"]', e2e_txt)
         self.assertIn('DEFAULT_MODE = "mixed"', prompt_txt)
         self.assertIn('SUPPORTED_MODES = {"retrieval", "mixed", "deepseek_only"}', prompt_txt)
+
+    def test_python_native_builder_prefers_hw_guarded_build_script(self):
+        native_txt = _read_text(REPO_ROOT / "hrm_flash" / "deepseek_native.py")
+        self.assertIn('build_sh = repo_root / "scripts" / "build_deepseek_native.sh"', native_txt)
+        self.assertIn('["bash", str(build_sh), model_source, str(model_bin)]', native_txt)
+        self.assertIn("enforces mandatory HW selection", native_txt)
 
 
 if __name__ == "__main__":
