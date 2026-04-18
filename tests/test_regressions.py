@@ -263,6 +263,15 @@ class TestNativeProdRegressions(unittest.TestCase):
         self.assertIn('["bash", str(build_sh), model_source, str(model_bin)]', native_txt)
         self.assertIn("enforces mandatory HW selection", native_txt)
 
+    def test_first_user_onboarding_script_wires_mandatory_flow(self):
+        txt = _read_text(REPO_ROOT / "scripts" / "first_user_start.sh")
+        self.assertIn('bash "$ROOT_DIR/scripts/hw_select.sh"', txt)
+        self.assertIn('bash "$ROOT_DIR/scripts/build.sh"', txt)
+        self.assertIn('bash "$ROOT_DIR/scripts/make_model.sh" "$seed_file" "$MODEL_DIR" 8', txt)
+        self.assertIn('bash "$ROOT_DIR/scripts/prod_preflight.sh" "$MODEL_DIR"', txt)
+        self.assertIn('bash "$ROOT_DIR/scripts/start_native_stack.sh" "$MODEL_DIR" "$DEFAULT_LLM_MODEL"', txt)
+        self.assertIn('bash $ROOT_DIR/scripts/stop_native_stack.sh', txt)
+
 
 if __name__ == "__main__":
     unittest.main()

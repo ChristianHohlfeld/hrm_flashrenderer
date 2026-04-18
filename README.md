@@ -34,6 +34,20 @@ Python dependencies are kept lean:
 - `requirements.prod.txt`: `numpy`, `huggingface_hub`, `transformers`, `safetensors`
 - `requirements.server.txt`: `fastapi`, `uvicorn`, `pydantic`
 
+## One-Command First Start
+
+For new users, this is the easiest path:
+
+```bash
+bash scripts/first_user_start.sh
+```
+
+What it does:
+- ensures `.hw_selection.env` exists (applies default selection if missing)
+- auto-creates a minimal local HRM model index if missing
+- runs production preflight
+- starts the native stack and waits for health
+
 ## Quick Start (3 Commands)
 
 If your machine is the default target (`1x22GB + 2x11GB NVLink`):
@@ -381,6 +395,7 @@ Jobs:
 - `scripts/bootstrap.sh`
 - `scripts/prod_preflight.sh`
 - `scripts/start_easy.sh`
+- `scripts/first_user_start.sh`
 - `scripts/start_native_stack.sh`
 - `scripts/stop_native_stack.sh`
 - `scripts/prod_live_e2e.sh`
