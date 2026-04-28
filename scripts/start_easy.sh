@@ -75,6 +75,12 @@ esac
 echo "[easy] profile=$PROFILE quant=$MODEL_QUANT pool=(11gb:$GPU11_COUNT,22gb:$GPU22_COUNT,3080_10gb:$GPU3080_COUNT) require_nvlink=$REQUIRE_NVLINK"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -z "${PYTHON_BIN:-}" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+fi
+export PYTHON_BIN="${PYTHON_BIN:-python3}"
+
 HW_SELECTION_FILE="${HW_SELECTION_FILE:-}" \
   bash "$SCRIPT_DIR/hw_select.sh" \
     --gpu-2080ti-11gb "$GPU11_COUNT" \

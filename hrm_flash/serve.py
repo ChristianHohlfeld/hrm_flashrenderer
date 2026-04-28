@@ -1,8 +1,6 @@
 ﻿# Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
 # https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
 # ALL RIGHTS RESERVED. No license granted without prior written permission.
-from __future__ import annotations
-
 import argparse
 import asyncio
 from pathlib import Path
@@ -20,10 +18,10 @@ from hrm_flash.utils import find_hrm_binary
 
 def _require_fastapi():
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse
         from pydantic import BaseModel
-        return FastAPI, HTTPException, JSONResponse, BaseModel
+        return FastAPI, HTTPException, Request, JSONResponse, BaseModel
     except Exception as e:
         raise SystemExit(
             "ERR: Missing server dependencies. Install with:\n"
@@ -114,7 +112,7 @@ def _build_prompt(prompt: str, mode: str) -> tuple[str, list[Any], str, bool]:
 
 
 def main():
-    FastAPI, HTTPException, JSONResponse, BaseModel = _require_fastapi()
+    FastAPI, HTTPException, Request, JSONResponse, BaseModel = _require_fastapi()
 
     ap = argparse.ArgumentParser(prog="hrm-flash-serve", description="HRM FlashRenderer HTTP service (HRM retrieval + native DeepSeek inference).")
     ap.add_argument("--hrm_model", required=True)
@@ -235,7 +233,8 @@ def main():
         }
 
     @app.post("/v1/generate")
-    async def generate(req: GenerateReq):
+    async def generate(request: Request):
+        req = GenerateReq(**(await request.json()))
         if not req.prompt:
             raise HTTPException(status_code=400, detail="prompt required")
         try:

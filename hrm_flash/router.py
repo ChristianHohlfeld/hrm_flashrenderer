@@ -1,8 +1,6 @@
 # Copyright (c) 2026 Christian Heinrich Hohlfeld (Konstanz, Germany)
 # https://christianhohlfeld.com | ORCID: https://orcid.org/0009-0003-6634-9045
 # ALL RIGHTS RESERVED. No license granted without prior written permission.
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
@@ -17,10 +15,10 @@ from hrm_flash.prompt_builder import SUPPORTED_MODES, normalize_mode
 
 def _require_fastapi():
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse
         from pydantic import BaseModel
-        return FastAPI, HTTPException, JSONResponse, BaseModel
+        return FastAPI, HTTPException, Request, JSONResponse, BaseModel
     except Exception as e:
         raise SystemExit(
             "ERR: Missing server dependencies. Install with:\n"
@@ -148,24 +146,25 @@ def _collapsed_max_model_mode() -> bool:
     fast = STATE.backends.get("solo_3080")
     if solo is None or pair is None or fast is None:
         return False
-    return bool(
-        solo.base_url == pair.base_url
-        and solo.base_url != fast.base_url
-    )
+    return bool(solo.base_url == pair.base_url)
 
 
 def _primary_backend(prompt_tokens: int, requested_max_new_tokens: int, route_hint: Optional[str], prefer_backend: Optional[str]) -> str:
+    collapsed = _collapsed_max_model_mode()
     preferred = _normalize_backend_name(prefer_backend)
     if preferred in STATE.backends:
+        if collapsed and preferred == "solo_3080":
+            return "nvlink_pair"
         return preferred
 
     hint = _normalize_backend_name(route_hint)
     if hint in STATE.backends:
+        if collapsed and hint == "solo_3080":
+            return "nvlink_pair"
         return hint
 
-    # In collapsed max-model mode (quality + balanced share same endpoint),
-    # default to that max-model lane unless caller explicitly requested "fast".
-    if _collapsed_max_model_mode():
+    # In collapsed max-model mode, all logical lanes point at the max-model endpoint.
+    if collapsed:
         return "nvlink_pair"
 
     if prompt_tokens <= STATE.short_prompt_tokens and requested_max_new_tokens <= STATE.short_max_new_tokens:
@@ -186,12 +185,17 @@ def _max_new_limit_for_backend(backend_name: str) -> int:
 def _candidate_order(primary: str, allow_failover: bool) -> list[str]:
     if not allow_failover:
         return [primary]
+    if _collapsed_max_model_mode():
+        order = ["nvlink_pair", "solo_22gb"]
+    else:
+        order = []
     order_map = {
         "solo_3080": ["solo_3080", "nvlink_pair", "solo_22gb"],
         "nvlink_pair": ["nvlink_pair", "solo_22gb", "solo_3080"],
         "solo_22gb": ["solo_22gb", "nvlink_pair", "solo_3080"],
     }
-    order = order_map.get(primary, [primary, "nvlink_pair", "solo_22gb", "solo_3080"])
+    if not order:
+        order = order_map.get(primary, [primary, "nvlink_pair", "solo_22gb", "solo_3080"])
     out: list[str] = []
     for name in order:
         if name in STATE.backends and name not in out:
@@ -224,7 +228,7 @@ def _resolve_show_sources(show_sources: Optional[bool], mode: str) -> bool:
 
 
 def main():
-    FastAPI, HTTPException, JSONResponse, BaseModel = _require_fastapi()
+    FastAPI, HTTPException, Request, JSONResponse, BaseModel = _require_fastapi()
 
     ap = argparse.ArgumentParser(prog="hrm-flash-router", description="Heterogeneous router for hrm-flash native services.")
     ap.add_argument("--host", type=str, default="0.0.0.0")
@@ -326,7 +330,8 @@ def main():
         }
 
     @app.post("/v1/generate")
-    async def generate(req: GenerateReq):
+    async def generate(request: Request):
+        req = GenerateReq(**(await request.json()))
         if not req.prompt or not req.prompt.strip():
             raise HTTPException(status_code=400, detail="prompt required")
         try:
