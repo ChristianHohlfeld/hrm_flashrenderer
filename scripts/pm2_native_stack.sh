@@ -16,6 +16,34 @@ PORT_SOLO_22GB="${PORT_SOLO_22GB:-8081}"
 LOCK_FILE="${LOCK_FILE:-/tmp/hrm_flashrenderer_native_stack.lock}"
 HEALTH_INTERVAL_S="${HEALTH_INTERVAL_S:-20}"
 HEALTH_FAIL_LIMIT="${HEALTH_FAIL_LIMIT:-3}"
+# The native engine reads DSI8_TGEN once at process startup. Keep the PM2
+# stack responsive for agent/API traffic; callers can still request fewer
+# tokens and the wrapper trims to that count.
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
+export NATIVE_REQUEST_TIMEOUT_S="${NATIVE_REQUEST_TIMEOUT_S:-90}"
+export DSI8_MAX_PROMPT_TOKENS="${DSI8_MAX_PROMPT_TOKENS:-768}"
+export ROUTER_MAX_PROMPT_CHARS="${ROUTER_MAX_PROMPT_CHARS:-3000}"
+
+case "$(printf '%s' "$PROFILE" | tr '[:lower:]' '[:upper:]')" in
+  A|B|C|D) ;;
+  *)
+    echo "WARN: ignoring invalid PROFILE='$PROFILE'; using A" >&2
+    PROFILE="A"
+    ;;
+esac
+case "$MODEL_QUANT" in
+  q8) ;;
+  *)
+    echo "WARN: ignoring invalid MODEL_QUANT='$MODEL_QUANT'; using q8" >&2
+    MODEL_QUANT="q8"
+    ;;
+esac
+
+if [[ "${PM2_NATIVE_ALLOW_MODEL_ENV:-0}" != "1" ]]; then
+  unset LLM_MODEL_SOLO_22GB LLM_MODEL_NVLINK_PAIR LLM_MODEL_SOLO_3080 LLM_MODEL_TRIPLE_MAX
+  unset MODEL_BIN_SOLO_22GB MODEL_BIN_NVLINK_PAIR MODEL_BIN_SOLO_3080 MODEL_BIN_TRIPLE_MAX
+  unset TOKENIZER_MODEL_SOLO_22GB TOKENIZER_MODEL_NVLINK_PAIR TOKENIZER_MODEL_SOLO_3080 TOKENIZER_MODEL_TRIPLE_MAX
+fi
 
 if [[ -z "${PYTHON_BIN:-}" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"

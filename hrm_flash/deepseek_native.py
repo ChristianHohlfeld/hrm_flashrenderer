@@ -159,6 +159,7 @@ class DeepSeekNativeEngine:
         runtime_name: str,
         local_files_only: bool = False,
         max_new_tokens: int = 256,
+        max_prompt_tokens: int | None = None,
         startup_timeout_s: float = 120.0,
         request_timeout_s: float = 180.0,
     ):
@@ -168,6 +169,13 @@ class DeepSeekNativeEngine:
         self.engine_bin = Path(engine_bin).resolve()
         self.local_files_only = bool(local_files_only)
         self.max_new_tokens = max(1, int(max_new_tokens))
+        env_max_prompt = os.environ.get("DSI8_MAX_PROMPT_TOKENS")
+        if max_prompt_tokens is None and env_max_prompt:
+            try:
+                max_prompt_tokens = int(env_max_prompt)
+            except Exception:
+                max_prompt_tokens = None
+        self.max_prompt_tokens = max(128, int(max_prompt_tokens or 2048))
         self.startup_timeout_s = max(1.0, float(startup_timeout_s))
         self.request_timeout_s = max(1.0, float(request_timeout_s))
 
@@ -259,23 +267,26 @@ class DeepSeekNativeEngine:
 
     def stop(self) -> None:
         with self._lock:
-            p = self._proc
-            if p is not None and p.poll() is None:
+            self._stop_unlocked()
+
+    def _stop_unlocked(self) -> None:
+        p = self._proc
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
                 try:
-                    p.terminate()
-                    p.wait(timeout=5)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-            self._proc = None
-            if self._log_fh is not None:
-                try:
-                    self._log_fh.close()
+                    p.kill()
                 except Exception:
                     pass
-                self._log_fh = None
+        self._proc = None
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
 
     def _write_lines_atomic(self, path: Path, lines: Iterable[str]) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -331,6 +342,8 @@ class DeepSeekNativeEngine:
                 bos = self._tokenizer.bos_token_id
                 fallback = bos if bos is not None else eos
                 ids = [int(fallback)] if fallback is not None else [0]
+            if len(ids) > self.max_prompt_tokens:
+                ids = ids[-self.max_prompt_tokens:]
 
             self._write_lines_atomic(self.paths.prompt_tokens_file, [str(int(i)) for i in ids])
             self._write_lines_atomic(self.paths.prompt_file, [prompt])
@@ -345,6 +358,7 @@ class DeepSeekNativeEngine:
                 time.sleep(0.05)
             else:
                 tail = self._tail_log()
+                self._stop_unlocked()
                 raise RuntimeError(f"DeepSeek generation timeout after {timeout:.1f}s.\n{tail}")
 
             out_ids = self._read_token_ids()

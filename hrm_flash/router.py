@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -16,9 +17,9 @@ from hrm_flash.prompt_builder import SUPPORTED_MODES, normalize_mode
 def _require_fastapi():
     try:
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
         from pydantic import BaseModel
-        return FastAPI, HTTPException, Request, JSONResponse, BaseModel
+        return FastAPI, HTTPException, Request, JSONResponse, StreamingResponse, BaseModel
     except Exception as e:
         raise SystemExit(
             "ERR: Missing server dependencies. Install with:\n"
@@ -49,6 +50,7 @@ class _RouterState:
         self.tokenizer: Any = None
         self.tokenizer_name: str | None = None
         self.default_mode: str = "mixed"
+        self.max_prompt_chars: int = 3000
 
 
 STATE = _RouterState()
@@ -228,7 +230,7 @@ def _resolve_show_sources(show_sources: Optional[bool], mode: str) -> bool:
 
 
 def main():
-    FastAPI, HTTPException, Request, JSONResponse, BaseModel = _require_fastapi()
+    FastAPI, HTTPException, Request, JSONResponse, StreamingResponse, BaseModel = _require_fastapi()
 
     ap = argparse.ArgumentParser(prog="hrm-flash-router", description="Heterogeneous router for hrm-flash native services.")
     ap.add_argument("--host", type=str, default="0.0.0.0")
@@ -249,6 +251,7 @@ def main():
     ap.add_argument("--local_files_only", action="store_true")
     ap.add_argument("--disable_tokenizer", action="store_true")
     ap.add_argument("--default_mode", type=str, choices=["retrieval", "mixed", "deepseek_only"], default="mixed")
+    ap.add_argument("--max_prompt_chars", type=int, default=int(os.environ.get("ROUTER_MAX_PROMPT_CHARS", "3000")))
     args = ap.parse_args()
 
     STATE.backends = {
@@ -267,6 +270,7 @@ def main():
     STATE.max_concurrent = max(1, int(args.max_concurrent))
     STATE.sem = asyncio.Semaphore(STATE.max_concurrent)
     STATE.default_mode = normalize_mode(str(args.default_mode))
+    STATE.max_prompt_chars = max(1024, int(args.max_prompt_chars))
 
     if not bool(args.disable_tokenizer) and args.tokenizer_model:
         try:
@@ -296,44 +300,30 @@ def main():
         prefer_backend: Optional[str] = None
         allow_failover: bool = True
 
-    @app.get("/v1/health")
-    async def health():
-        checks = await asyncio.gather(
-            asyncio.to_thread(_check_backend_health, STATE.backends["solo_22gb"], STATE.health_timeout_s),
-            asyncio.to_thread(_check_backend_health, STATE.backends["nvlink_pair"], STATE.health_timeout_s),
-            asyncio.to_thread(_check_backend_health, STATE.backends["solo_3080"], STATE.health_timeout_s),
-        )
-        backend_health = {
-            "solo_22gb": checks[0],
-            "nvlink_pair": checks[1],
-            "solo_3080": checks[2],
-        }
-        all_ok = bool(backend_health["solo_22gb"]["ok"] or backend_health["nvlink_pair"]["ok"] or backend_health["solo_3080"]["ok"])
-        return {
-            "ok": all_ok,
-            "router": {
-                "tokenizer": STATE.tokenizer_name,
-                "collapsed_max_model_mode": _collapsed_max_model_mode(),
-                "request_timeout_s": STATE.request_timeout_s,
-                "max_concurrent": STATE.max_concurrent,
-                "default_mode": STATE.default_mode,
-                "supported_modes": sorted(SUPPORTED_MODES),
-                "thresholds": {
-                    "short_prompt_tokens": STATE.short_prompt_tokens,
-                    "medium_prompt_tokens": STATE.medium_prompt_tokens,
-                    "short_max_new_tokens": STATE.short_max_new_tokens,
-                    "medium_max_new_tokens": STATE.medium_max_new_tokens,
-                    "long_max_new_tokens": STATE.long_max_new_tokens,
-                },
-            },
-            "backends": backend_health,
-        }
+    def _last_user_prompt(prompt: str) -> str:
+        text = str(prompt or "").strip()
+        markers = ["\nuser:", "\nUser:", "\nUSER:", "<｜User｜>", "<|User|>", "### User:", "\nHuman:"]
+        best_at = -1
+        best_marker = ""
+        for marker in markers:
+            at = text.rfind(marker)
+            if at > best_at:
+                best_at = at
+                best_marker = marker
+        if best_at >= 0:
+            return text[best_at + len(best_marker):].strip()
+        return text
 
-    @app.post("/v1/generate")
-    async def generate(request: Request):
-        req = GenerateReq(**(await request.json()))
+    def _truncate_prompt(prompt: str) -> str:
+        text = str(prompt or "").strip()
+        if len(text) <= STATE.max_prompt_chars:
+            return text
+        return text[-STATE.max_prompt_chars:]
+
+    async def _run_generate(req: GenerateReq) -> Dict[str, Any]:
         if not req.prompt or not req.prompt.strip():
             raise HTTPException(status_code=400, detail="prompt required")
+        prompt = _truncate_prompt(req.prompt)
         try:
             mode = _resolve_mode(req.mode, default_mode=STATE.default_mode)
         except ValueError as e:
@@ -342,7 +332,7 @@ def main():
         async with STATE.sem:
             requested_max_new_tokens = int(req.max_new_tokens) if req.max_new_tokens is not None else 256
             requested_max_new_tokens = max(1, min(4096, requested_max_new_tokens))
-            prompt_tokens, estimator = _estimate_prompt_tokens(req.prompt)
+            prompt_tokens, estimator = _estimate_prompt_tokens(prompt)
             if mode == "deepseek_only":
                 print("[router] mode=deepseek_only HRM disabled (no retrieval)", file=sys.stderr, flush=True)
 
@@ -361,7 +351,7 @@ def main():
                 backend = STATE.backends[backend_name]
                 backend_max_new_tokens = min(requested_max_new_tokens, _max_new_limit_for_backend(backend_name))
                 payload = {
-                    "prompt": req.prompt,
+                    "prompt": prompt,
                     "max_new_tokens": int(backend_max_new_tokens),
                     "mode": mode,
                     "show_sources": show_sources,
@@ -387,7 +377,7 @@ def main():
                         "backend_max_new_tokens": backend_max_new_tokens,
                         "latency_ms": latency_ms,
                     }
-                    return JSONResponse(out)
+                    return out
                 except Exception as e:
                     errors.append(f"{backend_name}: {e}")
 
@@ -400,6 +390,193 @@ def main():
                     "backend_errors": errors,
                 },
             )
+
+    def _chat_messages_to_prompt(messages: Any) -> str:
+        if not isinstance(messages, list):
+            return ""
+        parts: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "user")
+            content = msg.get("content")
+            if isinstance(content, list):
+                text = " ".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+            else:
+                text = str(content or "")
+            if text.strip() and role.lower() == "user":
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+
+    def _openai_usage(prompt: str, text: str) -> Dict[str, int]:
+        prompt_tokens, _ = _estimate_prompt_tokens(prompt)
+        completion_tokens, _ = _estimate_prompt_tokens(text)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+    async def _stream_openai_response(task: asyncio.Task, *, model: str, prompt: str, chat: bool):
+        while not task.done():
+            yield ": keepalive\n\n"
+            await asyncio.sleep(5)
+        result = await task
+        text = str(result.get("text") or "")
+        now = int(time.time())
+        if chat:
+            chunk = {
+                "id": f"chatcmpl-{int(time.time() * 1000)}",
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            }
+            done = {
+                "id": chunk["id"],
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": _openai_usage(prompt, text),
+            }
+        else:
+            chunk = {
+                "id": f"cmpl-{int(time.time() * 1000)}",
+                "object": "text_completion",
+                "created": now,
+                "model": model,
+                "choices": [{"index": 0, "text": text, "finish_reason": None}],
+            }
+            done = {
+                "id": chunk["id"],
+                "object": "text_completion",
+                "created": now,
+                "model": model,
+                "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                "usage": _openai_usage(prompt, text),
+            }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield f"data: {json.dumps(done)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    @app.get("/v1/health")
+    async def health():
+        checks = await asyncio.gather(
+            asyncio.to_thread(_check_backend_health, STATE.backends["solo_22gb"], STATE.health_timeout_s),
+            asyncio.to_thread(_check_backend_health, STATE.backends["nvlink_pair"], STATE.health_timeout_s),
+            asyncio.to_thread(_check_backend_health, STATE.backends["solo_3080"], STATE.health_timeout_s),
+        )
+        backend_health = {
+            "solo_22gb": checks[0],
+            "nvlink_pair": checks[1],
+            "solo_3080": checks[2],
+        }
+        all_ok = bool(backend_health["solo_22gb"]["ok"] or backend_health["nvlink_pair"]["ok"] or backend_health["solo_3080"]["ok"])
+        return {
+            "ok": all_ok,
+            "router": {
+                "tokenizer": STATE.tokenizer_name,
+                "collapsed_max_model_mode": _collapsed_max_model_mode(),
+                "request_timeout_s": STATE.request_timeout_s,
+                "max_concurrent": STATE.max_concurrent,
+                "max_prompt_chars": STATE.max_prompt_chars,
+                "default_mode": STATE.default_mode,
+                "supported_modes": sorted(SUPPORTED_MODES),
+                "thresholds": {
+                    "short_prompt_tokens": STATE.short_prompt_tokens,
+                    "medium_prompt_tokens": STATE.medium_prompt_tokens,
+                    "short_max_new_tokens": STATE.short_max_new_tokens,
+                    "medium_max_new_tokens": STATE.medium_max_new_tokens,
+                    "long_max_new_tokens": STATE.long_max_new_tokens,
+                },
+            },
+            "backends": backend_health,
+        }
+
+    @app.post("/v1/generate")
+    async def generate(request: Request):
+        req = GenerateReq(**(await request.json()))
+        return JSONResponse(await _run_generate(req))
+
+    @app.get("/v1/models")
+    async def models():
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "deepseek-r1-distill-qwen-32b-local",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "hrm-flashrenderer",
+                }
+            ],
+        }
+
+    @app.post("/v1/completions")
+    async def completions(request: Request):
+        body = await request.json()
+        prompt = body.get("prompt", "")
+        if isinstance(prompt, list):
+            prompt = "\n".join(str(item) for item in prompt)
+        prompt = _truncate_prompt(_last_user_prompt(str(prompt)))
+        model = str(body.get("model") or "deepseek-r1-distill-qwen-32b-local")
+        req = GenerateReq(
+            prompt=prompt,
+            mode=str(body.get("mode") or "deepseek_only"),
+            max_new_tokens=body.get("max_tokens") or body.get("max_new_tokens"),
+            route_hint=body.get("route_hint"),
+            prefer_backend=body.get("prefer_backend"),
+        )
+        if bool(body.get("stream")):
+            task = asyncio.create_task(_run_generate(req))
+            return StreamingResponse(_stream_openai_response(task, model=model, prompt=prompt, chat=False), media_type="text/event-stream")
+        result = await _run_generate(req)
+        text = str(result.get("text") or "")
+        return JSONResponse(
+            {
+                "id": f"cmpl-{int(time.time() * 1000)}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+                "usage": _openai_usage(prompt, text),
+            }
+        )
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        body = await request.json()
+        prompt = _truncate_prompt(_last_user_prompt(_chat_messages_to_prompt(body.get("messages"))))
+        model = str(body.get("model") or "deepseek-r1-distill-qwen-32b-local")
+        req = GenerateReq(
+            prompt=prompt,
+            mode=str(body.get("mode") or "deepseek_only"),
+            max_new_tokens=body.get("max_tokens") or body.get("max_completion_tokens") or body.get("max_new_tokens"),
+            route_hint=body.get("route_hint"),
+            prefer_backend=body.get("prefer_backend"),
+        )
+        if bool(body.get("stream")):
+            task = asyncio.create_task(_run_generate(req))
+            return StreamingResponse(_stream_openai_response(task, model=model, prompt=prompt, chat=True), media_type="text/event-stream")
+        result = await _run_generate(req)
+        text = str(result.get("text") or "")
+        return JSONResponse(
+            {
+                "id": f"chatcmpl-{int(time.time() * 1000)}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": _openai_usage(prompt, text),
+            }
+        )
 
     import uvicorn
 
