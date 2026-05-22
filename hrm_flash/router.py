@@ -155,14 +155,10 @@ def _primary_backend(prompt_tokens: int, requested_max_new_tokens: int, route_hi
     collapsed = _collapsed_max_model_mode()
     preferred = _normalize_backend_name(prefer_backend)
     if preferred in STATE.backends:
-        if collapsed and preferred == "solo_3080":
-            return "nvlink_pair"
         return preferred
 
     hint = _normalize_backend_name(route_hint)
     if hint in STATE.backends:
-        if collapsed and hint == "solo_3080":
-            return "nvlink_pair"
         return hint
 
     # In collapsed max-model mode, all logical lanes point at the max-model endpoint.
